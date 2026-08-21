@@ -1,0 +1,120 @@
+# =============================================================================
+# Nemotron 3.5 Nano — Amplified Dolphin RLVR on the SingleController path
+# =============================================================================
+# Overlay on rlvr.yaml (the amplified-dolphin baseline) that swaps the legacy
+# async-GRPO driver for SingleController: streaming forward/backward, the
+# TransferQueue data plane, gated in-order rollout sampling, and shard-to-shard
+# NCCL-reshard weight refit.
+#
+# Model, parallelism, batch shape, sequence length, node split, MTP settings and
+# the Gym blend are all inherited unchanged, so a run of this config is directly
+# comparable against a rlvr.yaml run on the same 86 nodes.
+#
+# Entrypoint: examples/run_grpo_single_controller.py, NOT run_grpo_nemo_gym.py.
+# Pass TRAIN_ENTRYPOINT=./examples/run_grpo_single_controller.py to
+# nano35_launch.sh, which otherwise defaults to the async-GRPO driver.
+#
+# Group vs sample units: async_rl counts PROMPT GROUPS, not generations. One
+# optimizer cohort here is num_prompts_per_step = 512 groups, which at
+# num_generations_per_prompt=16 is 8192 sequences.
+# =============================================================================
+defaults: rlvr.yaml
+
+# =============================================================================
+# Checkpointing — ten eval rungs at steps 10, 20, ..., 100
+# =============================================================================
+checkpointing:
+  # SC has no validation loop, so a "val:" metric is never collected and
+  # validate_single_controller_config rejects the inherited
+  # "val:total_reward/mean" outright. null makes retention recency-based.
+  metric_name: null
+  # Restated at the reference's own values, not changed. remove_old_checkpoints
+  # treats save_period-aligned steps as periodic, so this cadence is what puts
+  # eval rungs at steps 10, 20, ..., 100, and a keep_top_k far above the step
+  # count retains all ten.
+  save_period: 10
+  keep_top_k: 1000000
+  # Inherited cadence: a full checkpoint every step, one retained, so a crash
+  # costs at most one step. Fault-tolerance retention is a separate rule from
+  # keep_top_k, so these saves cannot evict a periodic rung.
+  ft_save_period: 1
+  ft_keep_latest_k: 1
+  save_optimizer: true
+
+# =============================================================================
+# GRPO
+# =============================================================================
+grpo:
+  # Whole-campaign target: compared against the RESTORED step count, so a
+  # requeued job continues toward 100 rather than running 100 more steps.
+  max_num_steps: 100
+  # SC has no validation loop.
+  val_period: 0
+  # The legacy async-GRPO driver is not used on this path.
+  async_grpo: null
+
+policy:
+  generation:
+    refit_transport: nccl_reshard
+
+# =============================================================================
+# SingleController async RL
+# =============================================================================
+async_rl:
+  # in_order at lag 1 is the SC analogue of the baseline's
+  # async_grpo.max_trajectory_age_steps: 1 — generation may run at most one
+  # dispatch batch ahead of the trainer, and a step closes only on the cohort
+  # stamped for it.
+  #
+  # in_order reads max_lookahead_versions. max_staleness_versions belongs to
+  # ready_first/windowed, and SamplerConfig is extra="allow", so the wrong key
+  # here is silently inert rather than a validation error.
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  recompute_kv_cache_after_weight_updates: false
+  # 512 / 32 = 16 streaming chunks per optimizer step. Safe on this commit:
+  # begin_train_step nulls finalize_model_grads_func for the whole step, and the
+  # train pump passes keep_train_buffers=step_open so the per-chunk logprob
+  # detour no longer frees accumulated gradients.
+  min_groups_for_streaming_train: 32
+  # num_prompts_per_step * (lag + 1) = 512 * 2.
+  max_inflight_prompts: 1024
+  max_buffered_rollouts: 1024
+  rollout_failure:
+    max_infra_attempts_per_prompt: 5
+    max_data_attempts_per_prompt: 2
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    max_consecutive_dropped_prompts: 32
+    max_skipped_prompts: 32
+    on_dropped_prompt: replace
+    max_replacement_attempts: 1
+    replacement_reserve_prompts: 1
+    min_step_batch_fraction: 0.9
+    nemo_gym:
+      rollout_timeout_s: 1800.0
+  watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 2400.0
+    stall_action: warn
+    gym_subprocess_check: true
+
+# =============================================================================
+# TransferQueue data plane
+# =============================================================================
+# Every key below is required by DataPlaneConfig, and rlvr.yaml carries no
+# data_plane block to inherit them from, so the whole schema is spelled out
+# here rather than overriding a base like the in-tree SC recipes do.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"
+  storage_capacity: 1000000
+  num_storage_units: 16
+  claim_meta_poll_interval_s: 0.5
+  # Read only when backend == "mooncake_cpu"; the simple backend ignores both.
+  # Carried at their 64-node dolphin values so switching backends needs no
+  # resizing pass.
+  global_segment_size: 549755813888  # 512 GiB
+  local_buffer_size: 68719476736     # 64 GiB
