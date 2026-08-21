@@ -62,6 +62,10 @@ grpo:
   val_period: 10000000
   val_at_start: false
   val_at_end: false
+  # Added when porting to main: grpo_train and async_grpo_train read this by
+  # direct index, so the v1 entrypoint KeyErrors without it. -1 is the exemplar
+  # default and disables the delay. Inert on the SingleController path.
+  val_start_at: -1
   overlong_filtering: false
   max_val_samples: null
   val_batch_size: 256
