@@ -29,6 +29,7 @@ import json
 import tempfile
 import uuid
 from copy import deepcopy
+from typing import cast
 
 import pytest
 import torch
@@ -38,7 +39,13 @@ from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.failures import GenerationUnavailable
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+    Completion,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     RolloutManager,
@@ -120,8 +127,12 @@ class _FakeImpl:
     def __init__(self, record="sentinel-record", on_run=None) -> None:
         self._record = record
         self._on_run = on_run
+        self.rollout_group_ids: list[str | None] = []
 
-    async def run_rollout(self, input_sample):
+    async def run_rollout(
+        self, input_sample, *, rollout_group_id: str | None = None
+    ):
+        self.rollout_group_ids.append(rollout_group_id)
         if self._on_run is not None:
             await self._on_run(input_sample)
         return self._record
@@ -188,6 +199,7 @@ class TestGenerateAndPushFlow:
 
         assert len(buf.reserve_calls) == 1
         assert len(buf.remove_calls) == 1
+        assert mgr._impl.rollout_group_ids == buf.remove_calls
         assert buf._slots == []
         assert buf.commit_calls == []
         assert registry == {}
@@ -241,9 +253,34 @@ class TestGenerateAndPushFlow:
         assert len(buf.commit_calls) == 1
         gid, record, start_v, end_v = buf.commit_calls[0]
         assert gid in buf._slots
+        assert impl.rollout_group_ids == [gid]
         assert record == "r0"
         assert start_v == 0
         assert end_v == 0
+
+    def test_redispatch_gets_fresh_group_id(self):
+        attempts = 0
+
+        async def _fail_first_attempt(_sample):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise GenerationUnavailable("injected first-attempt failure")
+
+        buf = _FakeBuffer()
+        impl = _FakeImpl(record="recovered", on_run=_fail_first_attempt)
+        policy = RolloutRetryPolicy.single_attempt(
+            max_infra_attempts=2,
+            backoff_base_s=0.0,
+        )
+        mgr = _make_manager(buf, impl, retry_policy=policy)
+
+        _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert len(impl.rollout_group_ids) == 2
+        assert impl.rollout_group_ids[0] != impl.rollout_group_ids[1]
+        assert buf.remove_calls == [impl.rollout_group_ids[0]]
+        assert [call[0] for call in buf.commit_calls] == [impl.rollout_group_ids[1]]
 
     def test_start_weight_version_pinned_at_reserve_time(self):
         """If set_weight_version is called mid-rollout, start != end."""
@@ -379,20 +416,94 @@ def test_rollout_manager_forwards_mask_env_flagged_samples():
     assert manager._impl._mask_env_flagged_samples is False
 
 
-def _nemo_gym_impl(mask_env_flagged_samples):
+def _nemo_gym_impl(
+    mask_env_flagged_samples: bool, num_generations_per_prompt: int = 1
+) -> AsyncNemoGymRolloutImpl:
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
         task_to_env={},
-        num_generations_per_prompt=1,
+        num_generations_per_prompt=num_generations_per_prompt,
         max_seq_len=100,
         max_rollout_turns=1,
         generation_config={
             "stop_strings": None,
             "stop_token_ids": None,
             "top_k": None,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_new_tokens": 64,
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
     )
+
+
+def test_nemo_gym_inputs_use_attempt_identity_without_mutating_source():
+    rollout_group_id = "12345678-1234-5678-1234-567812345678"
+    source_task_index = 17
+    input_sample = cast(
+        DatumSpec,
+        {
+            "message_log": [],
+            "extra_env_info": {
+                "agent_ref": {"name": "test_agent"},
+                "responses_create_params": {"max_output_tokens": 100},
+                NEMO_GYM_TASK_INDEX_KEY: source_task_index,
+                NEMO_GYM_ROLLOUT_INDEX_KEY: 99,
+            },
+            "task_name": "nemo_gym",
+            "idx": 0,
+        },
+    )
+    original = deepcopy(input_sample)
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True, num_generations_per_prompt=3
+    )
+
+    rows = impl._build_inputs(input_sample, rollout_group_id=rollout_group_id)
+
+    task_indices = [row[NEMO_GYM_TASK_INDEX_KEY] for row in rows]
+    assert len(set(task_indices)) == 1
+    assert isinstance(task_indices[0], int)
+    assert task_indices[0] != source_task_index
+    assert 0 <= task_indices[0] < 1 << 63
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
+    assert [row["_rowidx"] for row in rows] == [0, 1, 2]
+    assert input_sample == original
+
+
+def test_nemo_gym_inputs_reject_invalid_attempt_identity():
+    input_sample = cast(
+        DatumSpec,
+        {"extra_env_info": {"responses_create_params": {}}},
+    )
+    impl = _nemo_gym_impl(mask_env_flagged_samples=True)
+
+    with pytest.raises(ValueError, match="rollout_group_id must be a valid UUID"):
+        impl._build_inputs(input_sample, rollout_group_id="not-a-uuid")
+
+
+def test_nemo_gym_inputs_isolate_repeated_attempts():
+    input_sample = cast(
+        DatumSpec,
+        {
+            "extra_env_info": {
+                "responses_create_params": {},
+                NEMO_GYM_TASK_INDEX_KEY: None,
+            },
+        },
+    )
+    impl = _nemo_gym_impl(mask_env_flagged_samples=True)
+
+    first = impl._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000001",
+    )
+    second = impl._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000002",
+    )
+
+    assert first[0][NEMO_GYM_TASK_INDEX_KEY] != second[0][NEMO_GYM_TASK_INDEX_KEY]
 
 
 def _mask_gate_result():

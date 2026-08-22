@@ -85,8 +85,10 @@ class _ScriptedImpl:
         self._failures = list(failures)
         self.attempts = 0
 
-    async def run_rollout(self, input_sample):
-        del input_sample
+    async def run_rollout(
+        self, input_sample, *, rollout_group_id: str | None = None
+    ):
+        del input_sample, rollout_group_id
         index = self.attempts
         self.attempts += 1
         if index < len(self._failures):

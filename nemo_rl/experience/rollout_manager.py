@@ -16,6 +16,7 @@ import asyncio
 import copy
 import enum
 import json
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -38,7 +39,12 @@ from nemo_rl.experience.failures import (
     RolloutTimeout,
     classify_rollout_failure,
 )
-from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+    Completion,
+    PromptGroupRecord,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollouts import (
     _attach_routed_experts_to_message_log_prefix,
@@ -56,6 +62,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+_NEMO_GYM_TASK_INDEX_MASK = (1 << 63) - 1
 
 
 class RolloutOutcome(str, enum.Enum):
@@ -374,15 +381,23 @@ class AsyncRolloutImpl:
         self._policy_generation = policy_generation
         self._timeouts = timeouts
 
-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
+    async def run_rollout(
+        self,
+        input_sample: DatumSpec,
+        *,
+        rollout_group_id: Optional[str] = None,
+    ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
+            rollout_group_id: Opaque identity for this rollout attempt. The native
+                rollout path does not use it.
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
         """
+        del rollout_group_id
         timer = Timer()
         timer_prefix = "timing/rollout"
         timer.start(f"{timer_prefix}/total")
@@ -768,11 +783,19 @@ class AsyncNemoGymRolloutImpl:
 
         self._validate_init_params()
 
-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
+    async def run_rollout(
+        self,
+        input_sample: DatumSpec,
+        *,
+        rollout_group_id: Optional[str] = None,
+    ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
+            rollout_group_id: UUID identifying this rollout attempt. All generated
+                rows share it as their NeMo-Gym task identity. Direct callers that
+                do not reserve through TransferQueue receive a fresh UUID here.
 
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
@@ -781,7 +804,11 @@ class AsyncNemoGymRolloutImpl:
         timer_prefix = "timing/rollout"
         timer.start(f"{timer_prefix}/total")
 
-        rollout_inputs = self._build_inputs(input_sample)
+        if rollout_group_id is None:
+            rollout_group_id = str(uuid.uuid4())
+        rollout_inputs = self._build_inputs(
+            input_sample, rollout_group_id=rollout_group_id
+        )
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs, timer, timer_prefix
         )
@@ -816,10 +843,34 @@ class AsyncNemoGymRolloutImpl:
             "Please set `max_rollout_turns` to 1."
         )
 
-    def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
-        """Build N row dicts from input_sample, applying generation config params."""
+    def _build_inputs(
+        self, input_sample: DatumSpec, *, rollout_group_id: str
+    ) -> list[dict]:
+        """Build and identify N NeMo-Gym rows for one rollout attempt."""
+        try:
+            group_uuid_int = uuid.UUID(rollout_group_id).int
+        except (AttributeError, ValueError) as error:
+            raise ValueError(
+                f"rollout_group_id must be a valid UUID, got {rollout_group_id!r}"
+            ) from error
+
+        # Gym models this field as an integer and serializes requests with
+        # orjson, which rejects integers outside the 64-bit range. Fold both
+        # UUID halves into a non-negative signed-int64 value rather than sending
+        # the raw 128-bit UUID integer.
+        task_index = (
+            group_uuid_int ^ (group_uuid_int >> 64)
+        ) & _NEMO_GYM_TASK_INDEX_MASK
+
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
+
+        # NeMo-Gym groups cohort rewards by _ng_task_index. Dataset-provided
+        # indices may be absent or repeat across epochs, and a failed attempt
+        # may still have requests alive inside Gym. The TQ reservation UUID is
+        # already unique per attempt, so use it to isolate this cohort without
+        # changing the source DatumSpec retained in PromptGroupRecord.
+        template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
 
         # We do not translate max_seq_len into row-level max_tokens here because that would
         # change semantics from "total sequence length" to "max new tokens".
@@ -841,6 +892,7 @@ class AsyncNemoGymRolloutImpl:
         for i in range(self._num_generations_per_prompt):
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
+            row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
             rows.append(row)
         return rows
 
@@ -1192,8 +1244,16 @@ class RolloutManager:
         """
         self._weight_version = int(version)
 
-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
-        return await self._impl.run_rollout(input_sample)
+    async def run_rollout(
+        self,
+        input_sample: DatumSpec,
+        *,
+        rollout_group_id: Optional[str] = None,
+    ) -> PromptGroupRecord:
+        """Run one prompt group, optionally under a caller-owned attempt ID."""
+        return await self._impl.run_rollout(
+            input_sample, rollout_group_id=rollout_group_id
+        )
 
     async def generate_and_push(
         self,
@@ -1264,7 +1324,9 @@ class RolloutManager:
                     inflight_registry[group_id] = (current_task, start_version)
                 # Unregister before commit so cancellation cannot interrupt it.
                 try:
-                    record = await self.run_rollout(input_sample)
+                    record = await self.run_rollout(
+                        input_sample, rollout_group_id=group_id
+                    )
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(group_id, None)
