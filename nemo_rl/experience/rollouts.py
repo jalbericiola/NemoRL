@@ -58,7 +58,10 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     get_pad_dynamic_image_shapes,
 )
-from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_RESERVED_KEY_PREFIX,
+    NEMO_GYM_TASK_INDEX_KEY,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
@@ -2727,6 +2730,8 @@ def _postprocess_single_nemo_gym_group(
         for agent_name, agent_results in agent_to_results.items():
             keys = agent_results[0].keys()
             for key in keys:
+                if key.startswith(NEMO_GYM_RESERVED_KEY_PREFIX):
+                    continue
                 values = [
                     float(r[key])
                     for r in agent_results

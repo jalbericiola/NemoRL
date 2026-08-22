@@ -32,16 +32,29 @@ def calculate_single_metric(
         key_name: Prefix for the returned metric keys (e.g. "total_reward").
 
     Returns:
-        Dict mapping "{key_name}/{stat}" to its value for stat in mean, max, min, median, stddev (nan for a single value), and histogram (a wandb.Histogram).
+        Dict mapping "{key_name}/{stat}" to its value for stat in mean, max, min, median, stddev (nan for a single value), and histogram (a wandb.Histogram). The histogram key is omitted when the values cannot be binned.
     """
-    return {
+    metrics = {
         f"{key_name}/mean": sum(values) / batch_size,
         f"{key_name}/max": max(values),
         f"{key_name}/min": min(values),
         f"{key_name}/median": statistics.median(values),
         f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
-        f"{key_name}/histogram": Histogram(values),
     }
+
+    try:
+        histogram = Histogram(values)
+    except ValueError:
+        # wandb bins into 64 equal intervals, which numpy rejects when the
+        # values are large enough that the range collapses under float64
+        # spacing (an id-like value repeated across a group, say). Callers run
+        # inside a rollout, so raising here fails the rollout and eventually the
+        # run over a chart that was never load-bearing.
+        pass
+    else:
+        metrics[f"{key_name}/histogram"] = histogram
+
+    return metrics
 
 
 def pct(values: Sequence[float | int], p: float) -> float:

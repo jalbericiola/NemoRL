@@ -17,6 +17,10 @@ from typing import Any, Optional
 
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 
+# Gym reserves this prefix for its own row bookkeeping (task/rollout/attempt
+# ids, failure flags). The values are identifiers, not measurements, so they are
+# excluded from the agent metrics aggregated out of env_extras.
+NEMO_GYM_RESERVED_KEY_PREFIX = "_ng_"
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"

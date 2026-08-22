@@ -40,6 +40,7 @@ from nemo_rl.experience.failures import (
     classify_rollout_failure,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_RESERVED_KEY_PREFIX,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
@@ -1139,6 +1140,8 @@ class AsyncNemoGymRolloutImpl:
         # Agent-level metrics.
         agent_extras = [c.env_extras for c in completions]
         for key in agent_extras[0].keys():
+            if key.startswith(NEMO_GYM_RESERVED_KEY_PREFIX):
+                continue
             values = [
                 float(r[key])  # type: ignore
                 for r in agent_extras
