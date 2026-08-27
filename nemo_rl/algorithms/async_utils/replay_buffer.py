@@ -25,6 +25,10 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_GROUP_ID,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
@@ -725,11 +729,14 @@ class TQReplayBuffer:
         *,
         pad_value_dict: Mapping[str, int],
         require_routed_experts: bool = False,
+        include_shared_prefix_metadata: bool = False,
     ):
+        """Create the replay buffer and configure its opt-in payload schema."""
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
         self._require_routed_experts = require_routed_experts
+        self._include_shared_prefix_metadata = include_shared_prefix_metadata
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
@@ -795,9 +802,24 @@ class TQReplayBuffer:
                 f"commit called with unknown group_id={group_id!r}; "
                 f"reserve() must precede commit() (or the slot was already removed)"
             )
-        train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
+        shared_prefix_kwargs = (
+            {"include_shared_prefix_metadata": True}
+            if self._include_shared_prefix_metadata
+            else {}
+        )
+        # Keep the disabled call shape identical to the legacy API. Besides
+        # preserving the default path, this avoids breaking deployments that
+        # wrap the converter/packer with the old keyword-only signature.
+        train_batch = record_to_train_batch(
+            record,
+            pad_value_dict=self._pad_value_dict,
+            **shared_prefix_kwargs,
+        )
         sample_ids, fields, tags = pack_payload(
-            train_batch, weight_version=start_weight_version, group_id=group_id
+            train_batch,
+            weight_version=start_weight_version,
+            group_id=group_id,
+            **shared_prefix_kwargs,
         )
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
@@ -1034,6 +1056,10 @@ class TQReplayBuffer:
             "fields_data",
         }
         seen_sample_ids: set[str] = set()
+        shared_prefix_fields = {
+            SHARED_PREFIX_GROUP_ID,
+            SHARED_PREFIX_PROMPT_LENGTHS,
+        }
         for group in groups:
             missing_group_keys = group_keys - set(group)
             if missing_group_keys:
@@ -1053,6 +1079,20 @@ class TQReplayBuffer:
                     f"sample_ids={len(meta.sample_ids)}, tags={num_tags}, "
                     f"sequence_lengths={num_lengths}, "
                     f"expected_group_size={expected_group_size}"
+                )
+            present_shared_prefix_fields = shared_prefix_fields.intersection(
+                meta.fields or ()
+            )
+            expected_shared_prefix_fields = (
+                shared_prefix_fields if self._include_shared_prefix_metadata else set()
+            )
+            if present_shared_prefix_fields != expected_shared_prefix_fields:
+                raise ValueError(
+                    "Replay buffer checkpoint shared-prefix schema mismatch: "
+                    f"checkpoint_fields={sorted(present_shared_prefix_fields)}, "
+                    f"expected_fields={sorted(expected_shared_prefix_fields)}. "
+                    "Resume with the same policy.shared_prefix_training.mode or "
+                    "delete replay_buffer.pt to start with an empty buffer."
                 )
             for sid in meta.sample_ids:
                 if sid in seen_sample_ids:

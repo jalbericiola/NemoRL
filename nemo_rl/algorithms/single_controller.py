@@ -43,8 +43,10 @@ from collections import deque
 from functools import partial
 from typing import Any, Awaitable, Callable, Optional, Union
 
+import numpy as np
 import ray
 import torch
+from tensordict import NonTensorData, NonTensorStack, TensorDict
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.grpo import (
@@ -53,6 +55,11 @@ from nemo_rl.algorithms.grpo import (
     compute_and_apply_seq_logprob_error_masking,
 )
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.shared_prefix_metrics import (
+    SharedPrefixOpportunity,
+    combine_shared_prefix_opportunities,
+    observe_shared_prefix_opportunity,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
@@ -68,6 +75,11 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_GROUP_ID,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
+from nemo_rl.data_plane.codec import unwrap_wire_stripped_payload
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -76,6 +88,7 @@ from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.models.policy import get_shared_prefix_training_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
 from nemo_rl.utils.logger import Logger
@@ -86,6 +99,153 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
 log = logging.getLogger(__name__)
+
+
+def _resolve_train_dispatch_group_multiple(
+    *,
+    shared_prefix_mode: str,
+    num_prompts_per_step: int,
+    data_parallel_size: int,
+) -> int:
+    """Return the prompt-group quantum required by the active train path."""
+    if shared_prefix_mode != "train":
+        return 1
+    if data_parallel_size < 1:
+        raise ValueError(
+            f"shared-prefix train mode requires positive DP size, got {data_parallel_size}"
+        )
+    if num_prompts_per_step % data_parallel_size != 0:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train requires "
+            "grpo.num_prompts_per_step to be divisible by the trainer data-parallel "
+            f"size; got {num_prompts_per_step} prompt groups and DP="
+            f"{data_parallel_size}."
+        )
+    return data_parallel_size
+
+
+def _train_selection_group_bounds(
+    *,
+    remaining_groups: int,
+    configured_min_groups: int,
+    group_multiple: int,
+) -> tuple[int, int]:
+    """Choose sampler bounds, forcing exact DP-width chunks when required.
+
+    Ordinary execution retains the historical greedy ``[min, remaining]``
+    bounds. Shared-prefix train mode passes its DP size as ``group_multiple``;
+    there, exact ``min == max`` bounds prevent a greedy sampler from claiming a
+    currently available but non-divisible group count.
+    """
+    if remaining_groups < 1:
+        raise ValueError(f"remaining_groups must be positive, got {remaining_groups}")
+    if configured_min_groups < 1:
+        raise ValueError(
+            f"configured_min_groups must be positive, got {configured_min_groups}"
+        )
+    if group_multiple < 1:
+        raise ValueError(f"group_multiple must be positive, got {group_multiple}")
+
+    historical_minimum = min(configured_min_groups, remaining_groups)
+    if group_multiple == 1:
+        return historical_minimum, remaining_groups
+    if remaining_groups % group_multiple != 0:
+        raise RuntimeError(
+            "shared-prefix streaming train cannot dispatch the remaining prompt "
+            f"groups evenly across DP ranks: remaining={remaining_groups}, "
+            f"DP={group_multiple}. A dropped-prompt shortfall must preserve a "
+            "DP-divisible step size; use replacement handling or reduce the step "
+            "by a whole DP-width of prompt groups."
+        )
+
+    rounded_minimum = (
+        (historical_minimum + group_multiple - 1) // group_multiple
+    ) * group_multiple
+    exact_groups = min(rounded_minimum, remaining_groups)
+    return exact_groups, exact_groups
+
+
+def _validate_train_dispatch_buffer_capacity(
+    *,
+    num_prompts_per_step: int,
+    configured_min_groups: int,
+    group_multiple: int,
+    max_buffered_rollouts: int,
+) -> None:
+    """Reject backpressure caps that cannot fill one required train claim."""
+    required_groups, _ = _train_selection_group_bounds(
+        remaining_groups=num_prompts_per_step,
+        configured_min_groups=configured_min_groups,
+        group_multiple=group_multiple,
+    )
+    if max_buffered_rollouts < required_groups:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train rounds the streaming "
+            f"claim to {required_groups} prompt groups for DP={group_multiple}, "
+            "but async_rl.max_buffered_rollouts="
+            f"{max_buffered_rollouts}. Increase the buffer cap to at least "
+            f"{required_groups}; otherwise backpressure prevents one claim from "
+            "ever becoming ready."
+        )
+
+
+def _reduce_shared_prefix_step_metrics(
+    opportunities: list[SharedPrefixOpportunity],
+    *,
+    expected_total_tokens: float | int | None = None,
+) -> dict[str, float | int]:
+    """Reduce disjoint streaming chunks into exact step-level metrics."""
+    if not opportunities:
+        return {}
+    combined = combine_shared_prefix_opportunities(opportunities)
+    if combined.total_sequences <= 0:
+        raise RuntimeError(
+            "shared-prefix observation produced a step with no sequences"
+        )
+    if expected_total_tokens is not None and float(expected_total_tokens) != float(
+        combined.total_tokens
+    ):
+        raise RuntimeError(
+            "shared-prefix observation did not cover the exact optimizer step: "
+            f"observed total_num_tokens={combined.total_tokens}, "
+            f"step total_num_tokens={expected_total_tokens}"
+        )
+    metrics = combined.as_metrics()
+    # SingleController historically omitted these two standard GRPO metrics.
+    # Emit exact sample-weighted values so W&B can compare the original V/T
+    # ceiling with exact prompt accounting on the same optimizer step.
+    metrics["total_num_tokens"] = combined.total_tokens
+    metrics["mean_prompt_length"] = combined.prompt_tokens / combined.total_sequences
+    return metrics
+
+
+def _string_object_field(data: TensorDict, field_name: str) -> list[str]:
+    """Decode a TQ object column and require one non-empty string per row."""
+    value: Any = None
+    # pyrefly: inference cycle on tensordict.items() loop vars.
+    for key, item in data.items(include_nested=False):  # type: ignore[bad-assignment]
+        if str(key) == field_name:
+            value = item
+            break
+    if isinstance(value, NonTensorStack):
+        items = value.tolist()
+    elif isinstance(value, NonTensorData):
+        items = [value.data]
+    elif isinstance(value, np.ndarray) and value.dtype == object:
+        items = value.tolist()
+    else:
+        raise TypeError(
+            f"expected object field {field_name!r}; got {type(value).__name__}"
+        )
+    decoded: list[str] = []
+    for raw_item in items:
+        decoded_item = unwrap_wire_stripped_payload(raw_item)
+        if not isinstance(decoded_item, str) or not decoded_item:
+            raise TypeError(
+                f"object field {field_name!r} must contain non-empty strings"
+            )
+        decoded.append(decoded_item)
+    return decoded
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -126,6 +286,9 @@ class SingleControllerActor:
         self._partition_id: str = actor_args.partition_id
 
         self._master_config = master_config
+        self._shared_prefix_training_config = get_shared_prefix_training_config(
+            master_config.policy
+        )
         self._async_cfg = master_config.async_rl
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
@@ -137,6 +300,24 @@ class SingleControllerActor:
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
+        self._train_dispatch_group_multiple = _resolve_train_dispatch_group_multiple(
+            shared_prefix_mode=self._shared_prefix_training_config.mode,
+            num_prompts_per_step=master_config.grpo.num_prompts_per_step,
+            data_parallel_size=(
+                int(self._trainer.data_parallel_size)
+                if self._shared_prefix_training_config.mode == "train"
+                else 1
+            ),
+        )
+        if self._shared_prefix_training_config.mode == "train":
+            _validate_train_dispatch_buffer_capacity(
+                num_prompts_per_step=master_config.grpo.num_prompts_per_step,
+                configured_min_groups=(
+                    master_config.async_rl.min_groups_for_streaming_train
+                ),
+                group_multiple=self._train_dispatch_group_multiple,
+                max_buffered_rollouts=master_config.async_rl.max_buffered_rollouts,
+            )
         self._dataloader = actor_args.dataloader
         self._weight_synchronizer = actor_args.weight_synchronizer
         self._advantage_estimator = actor_args.advantage_estimator
@@ -262,6 +443,7 @@ class SingleControllerActor:
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
         }
+        self._step_shared_prefix_opportunities: list[SharedPrefixOpportunity] = []
 
         print(
             f"SingleControllerActor: "
@@ -901,15 +1083,31 @@ class SingleControllerActor:
                         max_prompt_groups = target_groups - groups_dispatched
                         if max_prompt_groups <= 0:
                             break
-                        min_prompt_groups = min(
-                            self._async_cfg.min_groups_for_streaming_train,
-                            max_prompt_groups,
+                        min_prompt_groups, max_prompt_groups = (
+                            _train_selection_group_bounds(
+                                remaining_groups=max_prompt_groups,
+                                configured_min_groups=(
+                                    self._async_cfg.min_groups_for_streaming_train
+                                ),
+                                group_multiple=self._train_dispatch_group_multiple,
+                            )
                         )
                         train_meta, num_groups = await self._sampler.select(
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
                             max_prompt_groups=max_prompt_groups,
                         )
+
+                        if (
+                            train_meta is not None
+                            and self._train_dispatch_group_multiple > 1
+                            and num_groups != min_prompt_groups
+                        ):
+                            raise RuntimeError(
+                                "shared-prefix train sampler violated its exact "
+                                "DP-divisible claim: requested "
+                                f"{min_prompt_groups} prompt groups, got {num_groups}."
+                            )
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
@@ -993,7 +1191,11 @@ class SingleControllerActor:
                                 train_meta,
                             )
 
-                    if train_meta.sequence_lengths:
+                    # Keep token accounting scoped to the exact optimizer step.
+                    # A fully filtered streaming chunk is consumed but never enters
+                    # F/B, and _advantage_stage intentionally records no shared-prefix
+                    # opportunity for it either.
+                    if has_valid_training_tokens and train_meta.sequence_lengths:
                         self._step_log_dict["sequence_lengths"].extend(
                             int(s) for s in train_meta.sequence_lengths
                         )
@@ -1074,6 +1276,14 @@ class SingleControllerActor:
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
+                if self._step_shared_prefix_opportunities:
+                    step_metrics.update(
+                        _reduce_shared_prefix_step_metrics(
+                            self._step_shared_prefix_opportunities,
+                            expected_total_tokens=step_metrics.get("total_num_tokens"),
+                        )
+                    )
+                    self._step_shared_prefix_opportunities = []
 
                 self._trainer_version += 1
                 self._train_steps += 1
@@ -1775,6 +1985,24 @@ class SingleControllerActor:
         # is the exact mask used when global_valid_toks and the loss are built.
         has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
         if has_valid_training_tokens:
+            if self._shared_prefix_training_config.mode != "disabled":
+                self._step_shared_prefix_opportunities.append(
+                    observe_shared_prefix_opportunity(
+                        group_ids=_string_object_field(data, SHARED_PREFIX_GROUP_ID),
+                        prompt_token_ids=prompt_ids,
+                        prompt_lengths=squeeze_trailing_unit_dim(
+                            tensor_field(data, SHARED_PREFIX_PROMPT_LENGTHS)
+                        ),
+                        input_lengths=squeeze_trailing_unit_dim(
+                            tensor_field(data, "input_lengths")
+                        ),
+                        token_mask=token_mask,
+                        sample_mask=sample_mask,
+                        expected_group_size=(
+                            self._master_config.grpo.num_generations_per_prompt
+                        ),
+                    )
+                )
             advantages = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
@@ -1816,6 +2044,14 @@ class SingleControllerActor:
             adv_cfg.sample_mask_field,
             *adv_cfg.repeated_batch_fields,
         ]
+        if self._shared_prefix_training_config.mode != "disabled":
+            fields.extend(
+                [
+                    "input_lengths",
+                    SHARED_PREFIX_GROUP_ID,
+                    SHARED_PREFIX_PROMPT_LENGTHS,
+                ]
+            )
         if self._policy_logprobs_required:
             fields.append(adv_cfg.policy_logprobs_field)
         if self._policy_logprobs_required:

@@ -22,6 +22,30 @@ from nemo_rl.data.packing.algorithms import (
     get_packer,
 )
 from nemo_rl.data.packing.metrics import PackingMetrics
+from nemo_rl.data.packing.shared_prefix import (
+    SharedPrefixFallback,
+    SharedPrefixFallbackReason,
+    SharedPrefixLayout,
+    SharedPrefixPlan,
+    SharedPrefixRow,
+    build_shared_prefix_layout,
+    plan_shared_prefix_bins,
+)
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    FixedExecutionSlotPlan,
+    GroupCoherentShardPlan,
+    SHARED_PREFIX_EXECUTION_SLOT,
+    plan_fixed_execution_slots,
+    plan_group_coherent_shards,
+)
+from nemo_rl.data.packing.shared_prefix_tensors import (
+    SharedPrefixTensorBin,
+    SharedPrefixTensorIndices,
+    SharedPrefixTensorPlan,
+    build_shared_prefix_tensor_plan,
+    build_star_attention_allow_mask,
+    materialize_shared_prefix_layout,
+)
 
 __all__ = [
     "PackingAlgorithm",
@@ -29,7 +53,25 @@ __all__ = [
     "ConcatenativePacker",
     "FirstFitDecreasingPacker",
     "FirstFitShufflePacker",
+    "FixedExecutionSlotPlan",
+    "GroupCoherentShardPlan",
     "ModifiedFirstFitDecreasingPacker",
     "get_packer",
     "PackingMetrics",
+    "SharedPrefixFallback",
+    "SharedPrefixFallbackReason",
+    "SharedPrefixLayout",
+    "SharedPrefixPlan",
+    "SharedPrefixRow",
+    "SharedPrefixTensorBin",
+    "SharedPrefixTensorIndices",
+    "SharedPrefixTensorPlan",
+    "SHARED_PREFIX_EXECUTION_SLOT",
+    "build_shared_prefix_layout",
+    "build_shared_prefix_tensor_plan",
+    "build_star_attention_allow_mask",
+    "materialize_shared_prefix_layout",
+    "plan_fixed_execution_slots",
+    "plan_group_coherent_shards",
+    "plan_shared_prefix_bins",
 ]

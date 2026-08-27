@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from typing import Any, Literal, NotRequired, TypedDict, Union, cast
+
+from pydantic import BaseModel
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
@@ -218,6 +220,18 @@ class SequencePackingConfig(TypedDict):
     # Preserve the packer's order (or omit for backward compatibility), or
     # execute each DP rank's assigned bins largest-first for allocator reuse.
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
+
+
+class SharedPrefixTrainingConfig(BaseModel, extra="allow"):
+    """Controls prompt-prefix sharing in policy training forwards.
+
+    ``disabled`` preserves the existing packing and model execution. ``observe``
+    may report prefix-reuse opportunity metrics but must not alter execution.
+    ``train`` requests the experimental shared-prefix execution path and is
+    guarded by :func:`validate_shared_prefix_training_config`.
+    """
+
+    mode: Literal["disabled", "observe", "train"] = "disabled"
 
 
 class RewardModelConfig(TypedDict):
@@ -579,6 +593,7 @@ class PolicyConfig(TypedDict):
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
+    shared_prefix_training: NotRequired[SharedPrefixTrainingConfig]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
@@ -602,3 +617,117 @@ class PolicyConfig(TypedDict):
     disable_modelopt_layer_spec: NotRequired[bool]
 
     is_vlm: NotRequired[bool]
+
+
+def get_shared_prefix_training_config(
+    config: PolicyConfig,
+) -> SharedPrefixTrainingConfig:
+    """Return the validated shared-prefix block, including its legacy default.
+
+    ``PolicyConfig`` is still a legacy ``TypedDict``, so older configs may omit
+    this newly introduced block. The default remains centralized on
+    :class:`SharedPrefixTrainingConfig`; callers should use this accessor rather
+    than inventing an absence fallback.
+    """
+    shared_prefix_config = config.get("shared_prefix_training")
+    if shared_prefix_config is None:
+        return SharedPrefixTrainingConfig()
+    return SharedPrefixTrainingConfig.model_validate(shared_prefix_config)
+
+
+def validate_shared_prefix_training_config(
+    config: PolicyConfig,
+) -> SharedPrefixTrainingConfig:
+    """Validate the topology supported by the first training implementation.
+
+    Observation mode is deliberately backend-neutral and execution-neutral.
+    Model capability is validated later, after Megatron Bridge resolves the
+    concrete model provider.
+    """
+    shared_prefix_config = get_shared_prefix_training_config(config)
+    if shared_prefix_config.mode != "train":
+        return shared_prefix_config
+
+    megatron_config = config.get("megatron_cfg")
+    if megatron_config is None or megatron_config["enabled"] is not True:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train requires "
+            "policy.megatron_cfg.enabled=true. Observation mode remains "
+            "available with policy.shared_prefix_training.mode=observe."
+        )
+    megatron_config = cast(MegatronConfig, megatron_config)
+
+    sequence_packing_config = config.get("sequence_packing")
+    if sequence_packing_config is None or not sequence_packing_config["enabled"]:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train requires "
+            "policy.sequence_packing.enabled=true."
+        )
+
+    if megatron_config["context_parallel_size"] != 1:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train currently requires "
+            "policy.megatron_cfg.context_parallel_size=1."
+        )
+
+    if megatron_config["pipeline_model_parallel_size"] != 1:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train currently requires "
+            "policy.megatron_cfg.pipeline_model_parallel_size=1."
+        )
+
+    if megatron_config["tensor_model_parallel_size"] != 1:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train currently requires "
+            "policy.megatron_cfg.tensor_model_parallel_size=1."
+        )
+
+    if megatron_config["sequence_parallel"]:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train currently requires "
+            "policy.megatron_cfg.sequence_parallel=false."
+        )
+
+    recompute_granularity = megatron_config.get("recompute_granularity")
+    if (
+        megatron_config["activation_checkpointing"]
+        and recompute_granularity != "selective"
+    ):
+        resolved_granularity = recompute_granularity or "full (default)"
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train does not support full-layer "
+            "activation recomputation: policy.megatron_cfg.activation_checkpointing=true "
+            f"resolves policy.megatron_cfg.recompute_granularity to {resolved_granularity!r}. "
+            "Set policy.megatron_cfg.activation_checkpointing=false or use "
+            "policy.megatron_cfg.recompute_granularity=selective."
+        )
+
+    mtp_num_layers = megatron_config.get("mtp_num_layers")
+    if mtp_num_layers is not None and mtp_num_layers > 0:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train currently requires "
+            "policy.megatron_cfg.mtp_num_layers=0."
+        )
+
+    cuda_graph_impl = megatron_config.get("cuda_graph_impl")
+    if cuda_graph_impl is not None and cuda_graph_impl != "none":
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train currently requires training "
+            "CUDA graphs to be disabled with policy.megatron_cfg.cuda_graph_impl='none'."
+        )
+
+    fp8_config = megatron_config.get("fp8_cfg")
+    if fp8_config is not None and fp8_config["enabled"]:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train currently requires "
+            "policy.megatron_cfg.fp8_cfg.enabled=false."
+        )
+
+    if config.get("quant_cfg") is not None:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train currently requires "
+            "policy.quant_cfg=null; FP4 and other ModelOpt training quantization "
+            "are not supported."
+        )
+
+    return shared_prefix_config

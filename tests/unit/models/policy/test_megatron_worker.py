@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -44,6 +44,94 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
 pytestmark = pytest.mark.mcore
+
+
+def test_shared_prefix_logprobs_restore_original_row_order():
+    from nemo_rl.models.megatron.data import SHARED_PREFIX_SOURCE_ROW_INDEX
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _restore_logprobs_in_source_order,
+    )
+
+    outputs = [
+        {
+            "logprobs": torch.tensor([[20.0, 21.0], [0.0, 1.0]]),
+            SHARED_PREFIX_SOURCE_ROW_INDEX: torch.tensor([2, 0]),
+        },
+        {
+            "logprobs": torch.tensor([[10.0, 11.0, 12.0]]),
+            SHARED_PREFIX_SOURCE_ROW_INDEX: torch.tensor([1]),
+        },
+    ]
+
+    restored = _restore_logprobs_in_source_order(
+        outputs,
+        sequence_length=3,
+        expected_rows=3,
+    )
+
+    torch.testing.assert_close(
+        restored,
+        torch.tensor(
+            [
+                [0.0, 1.0, 0.0],
+                [10.0, 11.0, 12.0],
+                [20.0, 21.0, 0.0],
+            ]
+        ),
+    )
+
+
+def test_shared_prefix_execution_count_rejects_uneven_model_world():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _require_equal_shared_prefix_execution_count,
+    )
+
+    def emulate_uneven_all_reduce(count_bounds, *, op):
+        assert op is torch.distributed.ReduceOp.MAX
+        count_bounds.copy_(torch.tensor([3, -2]))
+
+    with patch(
+        "nemo_rl.models.policy.workers.megatron_policy_worker."
+        "torch.distributed.all_reduce",
+        side_effect=emulate_uneven_all_reduce,
+    ):
+        with pytest.raises(RuntimeError, match="min=2, max=3"):
+            _require_equal_shared_prefix_execution_count(
+                2,
+                stage="train",
+                device="cpu",
+            )
+
+
+def test_shared_prefix_tq_worker_attaches_driver_execution_slots():
+    from nemo_rl.data.packing.shared_prefix_metadata import (
+        SHARED_PREFIX_EXECUTION_SLOT,
+        SHARED_PREFIX_GROUP_ID,
+    )
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorker,
+    )
+
+    worker = MegatronPolicyWorker.__new__(MegatronPolicyWorker)
+    worker.cfg = {"shared_prefix_training": {"mode": "train"}}
+    worker._shared_prefix_training_enabled = True
+    data = BatchedDataDict(
+        {
+            "input_lengths": torch.tensor([4, 5]),
+            SHARED_PREFIX_GROUP_ID: np.asarray(["g", "g"], dtype=object),
+        }
+    )
+    meta = SimpleNamespace(
+        extra_info={SHARED_PREFIX_EXECUTION_SLOT: [1, 0]},
+    )
+
+    attached = worker._attach_or_repack_pack_metadata(data, meta)
+
+    assert attached[SHARED_PREFIX_GROUP_ID] == ["g", "g"]
+    torch.testing.assert_close(
+        attached[SHARED_PREFIX_EXECUTION_SLOT],
+        torch.tensor([1, 0]),
+    )
 
 
 def test_model_owned_packing_capability_is_detected():

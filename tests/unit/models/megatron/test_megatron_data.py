@@ -25,6 +25,7 @@ focusing on:
 
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import ray
 import torch
@@ -78,6 +79,232 @@ class TestProcessedMicrobatchDataclass:
         assert torch.equal(microbatch.cu_seqlens_padded, mock_cu_seqlens_padded)
         assert microbatch.routed_experts is None
         assert microbatch.routed_experts_cp_sharded is None
+        assert microbatch.shared_prefix_train_mode is False
+
+
+def test_shared_prefix_microbatch_materializes_one_star_without_dense_mask():
+    from nemo_rl.data.packing.shared_prefix_metadata import (
+        SHARED_PREFIX_EXECUTION_SLOT,
+        SHARED_PREFIX_GROUP_ID,
+        SHARED_PREFIX_PROMPT_LENGTHS,
+    )
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron.data import (
+        SHARED_PREFIX_SOURCE_ROW_INDEX,
+        process_shared_prefix_microbatch,
+    )
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [
+                    [10, 11, 12, 20, 21, 0],
+                    [10, 11, 12, 30, 31, 32],
+                ]
+            ),
+            "input_lengths": torch.tensor([5, 6]),
+            SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([3, 3]),
+            SHARED_PREFIX_GROUP_ID: ["g", "g"],
+            SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0]),
+            SHARED_PREFIX_SOURCE_ROW_INDEX: torch.tensor([0, 1]),
+        }
+    )
+    cfg = {
+        "make_sequence_length_divisible_by": 1,
+        "sequence_packing": {"enabled": True, "algorithm": "ffd"},
+    }
+
+    processed = list(
+        process_shared_prefix_microbatch(
+            data_dict=batch,
+            cfg=cfg,
+            bin_capacity=16,
+            seq_length_key="input_lengths",
+            pad_individual_seqs_to_multiple_of=1,
+            pad_packed_seq_to_multiple_of=1,
+            pad_full_seq_to=None,
+            straggler_timer=None,
+        )
+    )
+
+    assert len(processed) == 1
+    microbatch = processed[0]
+    torch.testing.assert_close(
+        microbatch.input_ids_cp_sharded,
+        torch.tensor([[10, 11, 12, 30, 31, 32, 20, 21]]),
+    )
+    torch.testing.assert_close(
+        microbatch.data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX],
+        torch.tensor([1, 0]),
+    )
+    assert microbatch.shared_prefix is not None
+    assert microbatch.shared_prefix_train_mode is True
+    assert microbatch.shared_prefix.tensor_bin.attention_allow_mask is None
+    assert microbatch.packed_seq_params is None
+
+
+def test_shared_prefix_microbatch_mixes_star_and_fallback_without_row_loss():
+    """Every source row must appear exactly once across expanded forwards."""
+    from nemo_rl.data.packing.shared_prefix_metadata import (
+        SHARED_PREFIX_EXECUTION_SLOT,
+        SHARED_PREFIX_GROUP_ID,
+        SHARED_PREFIX_PROMPT_LENGTHS,
+    )
+    from nemo_rl.models.megatron.data import (
+        SHARED_PREFIX_SOURCE_ROW_INDEX,
+        ProcessedInputs,
+        _get_shared_prefix_execution_shape,
+        process_shared_prefix_microbatch,
+    )
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [
+                    [10, 11, 12, 20, 21, 0],
+                    [10, 11, 12, 30, 31, 32],
+                    [40, 41, 42, 43, 0, 0],
+                ]
+            ),
+            "input_lengths": torch.tensor([5, 6, 4]),
+            SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([3, 3, 2]),
+            SHARED_PREFIX_GROUP_ID: np.asarray(
+                ["shared", "shared", "singleton"], dtype=object
+            ),
+            SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0, 0]),
+            SHARED_PREFIX_SOURCE_ROW_INDEX: torch.arange(3),
+        }
+    )
+    cfg = {
+        "make_sequence_length_divisible_by": 1,
+        "sequence_packing": {
+            "enabled": True,
+            "algorithm": "FIRST_FIT_DECREASING",
+        },
+    }
+
+    def mock_process_microbatch(*, data_dict, **_kwargs):
+        return ProcessedInputs(
+            input_ids=data_dict["input_ids"],
+            input_ids_cp_sharded=data_dict["input_ids"],
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=MagicMock(),
+            cu_seqlens_padded=None,
+        )
+
+    execution_count, max_execution_length = _get_shared_prefix_execution_shape(
+        batch,
+        cfg=cfg,
+        bin_capacity=16,
+    )
+
+    with patch(
+        "nemo_rl.models.megatron.data.process_microbatch",
+        side_effect=mock_process_microbatch,
+    ) as fallback_processor:
+        processed = list(
+            process_shared_prefix_microbatch(
+                data_dict=batch,
+                cfg=cfg,
+                bin_capacity=16,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=1,
+                pad_packed_seq_to_multiple_of=1,
+                pad_full_seq_to=None,
+                straggler_timer=None,
+            )
+        )
+
+    assert execution_count == len(processed) == 2
+    assert max_execution_length == 8
+    assert processed[0].shared_prefix is not None
+    assert processed[1].shared_prefix is None
+    assert all(item.shared_prefix_train_mode for item in processed)
+    fallback_processor.assert_called_once()
+
+    execution_rows = torch.cat(
+        [item.data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX] for item in processed]
+    )
+    torch.testing.assert_close(execution_rows.sort().values, torch.arange(3))
+    assert execution_rows.numel() == execution_rows.unique().numel()
+    torch.testing.assert_close(
+        processed[1].data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX],
+        torch.tensor([2]),
+    )
+    assert isinstance(batch[SHARED_PREFIX_GROUP_ID], np.ndarray)
+
+
+def test_prescribed_slot_prompt_mismatch_falls_back_as_one_real_forward():
+    from nemo_rl.data.packing.shared_prefix_metadata import (
+        SHARED_PREFIX_EXECUTION_SLOT,
+        SHARED_PREFIX_GROUP_ID,
+        SHARED_PREFIX_PROMPT_LENGTHS,
+    )
+    from nemo_rl.models.megatron.data import (
+        SHARED_PREFIX_SOURCE_ROW_INDEX,
+        ProcessedInputs,
+        process_shared_prefix_microbatch,
+    )
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [
+                    [10, 11, 12, 20, 21],
+                    [10, 99, 12, 30, 31],
+                ]
+            ),
+            "input_lengths": torch.tensor([5, 5]),
+            SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([3, 3]),
+            SHARED_PREFIX_GROUP_ID: ["g", "g"],
+            SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0]),
+            SHARED_PREFIX_SOURCE_ROW_INDEX: torch.arange(2),
+        }
+    )
+    cfg = {
+        "make_sequence_length_divisible_by": 1,
+        "sequence_packing": {
+            "enabled": True,
+            "algorithm": "FIRST_FIT_DECREASING",
+        },
+    }
+
+    def mock_process_microbatch(*, data_dict, **_kwargs):
+        return ProcessedInputs(
+            input_ids=data_dict["input_ids"],
+            input_ids_cp_sharded=data_dict["input_ids"],
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=MagicMock(),
+            cu_seqlens_padded=None,
+        )
+
+    with patch(
+        "nemo_rl.models.megatron.data.process_microbatch",
+        side_effect=mock_process_microbatch,
+    ) as fallback_processor:
+        processed = list(
+            process_shared_prefix_microbatch(
+                data_dict=batch,
+                cfg=cfg,
+                bin_capacity=12,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=1,
+                pad_packed_seq_to_multiple_of=1,
+                pad_full_seq_to=None,
+                straggler_timer=None,
+            )
+        )
+
+    assert len(processed) == 1
+    assert processed[0].shared_prefix is None
+    assert processed[0].shared_prefix_train_mode is True
+    fallback_processor.assert_called_once()
+    torch.testing.assert_close(
+        processed[0].data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX],
+        torch.arange(2),
+    )
 
 
 @pytest.mark.mcore

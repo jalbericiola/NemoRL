@@ -24,6 +24,12 @@ from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_EXECUTION_SLOT,
+    SHARED_PREFIX_GROUP_ID,
+    plan_fixed_execution_slots,
+    plan_group_coherent_shards,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -38,7 +44,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import (
+    PolicyConfig,
+    validate_shared_prefix_training_config,
+)
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -104,6 +113,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         skip_weight_load: bool = False,
     ):
         self.debug_payload_metrics = False
+        self.shared_prefix_training_config = validate_shared_prefix_training_config(
+            config
+        )
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
@@ -457,6 +469,59 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     # DRY for Policy's logprob/train methods only. The data-plane sibling
     # TQPolicy shards KVBatchMeta via ``shard_meta_for_dp``; the
     # driver-on-data vs driver-on-meta split is by design.
+    def _shard_shared_prefix_data(
+        self,
+        data: BatchedDataDict[Any],
+        *,
+        bin_capacity: int,
+        batch_size: Optional[int] = None,
+    ) -> tuple[list["SlicedDataDict"], Optional[list[int]]]:
+        """Assign complete prompt groups to DP ranks before worker planning."""
+        if SHARED_PREFIX_GROUP_ID not in data or "input_lengths" not in data:
+            raise ValueError(
+                "shared-prefix train mode requires group IDs and input_lengths "
+                "before data-parallel sharding"
+            )
+        raw_group_ids = data[SHARED_PREFIX_GROUP_ID]
+        group_ids = list(raw_group_ids)
+        raw_lengths = data["input_lengths"]
+        sequence_lengths = (
+            [int(length) for length in raw_lengths.detach().cpu().tolist()]
+            if isinstance(raw_lengths, torch.Tensor)
+            else [int(length) for length in raw_lengths]
+        )
+        if SHARED_PREFIX_EXECUTION_SLOT in data:
+            raise ValueError(
+                "input batch contains reserved shared-prefix execution-slot field"
+            )
+        slot_plan = plan_fixed_execution_slots(
+            group_ids=group_ids,
+            sequence_lengths=sequence_lengths,
+            bin_capacity=bin_capacity,
+            batch_size=batch_size,
+            sequence_length_pad_multiple=self.cfg["make_sequence_length_divisible_by"],
+        )
+        plan = plan_group_coherent_shards(
+            group_ids=group_ids,
+            sequence_lengths=sequence_lengths,
+            num_shards=self.data_parallel_size,
+            batch_size=batch_size,
+        )
+        sharded_data: list[SlicedDataDict] = []
+        for indices in plan.shard_indices:
+            shard = data.select_indices(list(indices))
+            shard[SHARED_PREFIX_EXECUTION_SLOT] = torch.tensor(
+                [slot_plan.row_slot_ids[index] for index in indices],
+                dtype=torch.long,
+            )
+            sharded_data.append(SlicedDataDict(shard.get_dict()))
+        rank_order = (
+            list(plan.rank_order_permutation)
+            if plan.rank_order_permutation is not None
+            else None
+        )
+        return sharded_data, rank_order
+
     def _shard_for_logprob(
         self,
         data: BatchedDataDict[Any],
@@ -464,10 +529,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Shard inputs for ``get_logprobs`` / ``get_reference_policy_logprobs``.
 
         Mirrors the legacy shard block (lines 426-450 / 503-530). Returns
-        ``(sharded_data, unsorted_data_indices)`` where the second element
-        is the inverse permutation needed to undo seqpack/dynbatch reorder
-        (``None`` when neither is enabled).
+        ``(sharded_data, unsorted_data_indices)`` where the second element is
+        the original-row indices in DP-rank concatenation order, matching the
+        input contract of :meth:`BatchedDataDict.reorder_data` (``None`` when
+        neither sharding path reorders rows).
         """
+        if self.shared_prefix_training_config.mode == "train":
+            return self._shard_shared_prefix_data(
+                data,
+                bin_capacity=self.cfg["sequence_packing"]["logprob_mb_tokens"],
+            )
+
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
@@ -509,6 +581,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         does not return ``unsorted_data_indices`` because train returns
         scalar metrics (no per-row outputs to reorder).
         """
+        if self.shared_prefix_training_config.mode == "train":
+            sharded_data, _ = self._shard_shared_prefix_data(
+                data,
+                bin_capacity=self.cfg["sequence_packing"]["train_mb_tokens"],
+                batch_size=batch_size,
+            )
+            return sharded_data
+
         dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[

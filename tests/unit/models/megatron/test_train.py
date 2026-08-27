@@ -36,6 +36,140 @@ from nemo_rl.algorithms.loss.interfaces import LossInputType
 pytestmark = pytest.mark.mcore
 
 
+def test_shared_prefix_logprobs_are_chunked_ordered_and_differentiable():
+    """Scalar fan-out must match dense logits without allocating dense vocab rows."""
+    from nemo_rl.data.packing import build_shared_prefix_tensor_plan
+    from nemo_rl.models.megatron.data import SharedPrefixForwardMetadata
+    from nemo_rl.models.megatron.train import (
+        shared_prefix_next_token_logprobs,
+    )
+
+    input_ids = torch.tensor(
+        [
+            [10, 11, 12, 20, 21, 0],
+            [10, 11, 12, 30, 31, 32],
+        ]
+    )
+    tensor_bin = build_shared_prefix_tensor_plan(
+        input_ids=input_ids,
+        input_lengths=torch.tensor([5, 6]),
+        prompt_lengths=torch.tensor([3, 3]),
+        group_ids=["g", "g"],
+        bin_capacity=16,
+        materialize_attention_mask=False,
+    ).shared_bins[0]
+    metadata = SharedPrefixForwardMetadata(
+        tensor_bin=tensor_bin,
+        source_sequence_length=6,
+    )
+    torch.manual_seed(7)
+    packed_logits = torch.randn(1, 8, 40, requires_grad=True)
+    reference_logits = packed_logits.detach().clone().requires_grad_(True)
+
+    real_log_softmax = torch.nn.functional.log_softmax
+    with patch(
+        "torch.nn.functional.log_softmax", wraps=real_log_softmax
+    ) as mock_log_softmax:
+        restored = shared_prefix_next_token_logprobs(
+            packed_logits,
+            metadata,
+            chunk_size=2,
+            temperature=2.0,
+        )
+
+    # Production vocabulary work is always 2-D and bounded by the configured
+    # token chunk. In particular, no [branches, sequence, vocab] call exists.
+    vocab_work_shapes = [call.args[0].shape for call in mock_log_softmax.call_args_list]
+    assert vocab_work_shapes
+    assert all(len(shape) == 2 and shape[0] <= 2 for shape in vocab_work_shapes)
+    assert restored.shape == (2, 5)
+
+    # Build the former dense fan-out only as a small test oracle. The planner
+    # orders the longer completion first, hence local rows map to sources (1, 0).
+    layout = tensor_bin.layout
+    scaled_reference_logits = reference_logits / 2.0
+    dense_logits = scaled_reference_logits.new_zeros((2, 6, 40))
+    dense_logits[:, :2] = scaled_reference_logits[:, :2].expand(2, -1, -1)
+    source_to_local = {
+        source_row: local_row for local_row, source_row in enumerate(layout.row_indices)
+    }
+    scatter_rows = torch.tensor(
+        [source_to_local[row] for row in layout.completion_scatter_rows]
+    )
+    scatter_columns = tensor_bin.indices.completion_scatter_columns
+    dense_logits[scatter_rows, scatter_columns] = scaled_reference_logits[
+        0, tensor_bin.indices.predecessor_positions
+    ]
+    local_input_ids = input_ids[list(layout.row_indices)]
+    dense_logprobs = (
+        real_log_softmax(dense_logits[:, :-1], dim=-1)
+        .gather(
+            dim=-1,
+            index=local_input_ids[:, 1:].unsqueeze(-1),
+        )
+        .squeeze(-1)
+    )
+    valid_predictions = torch.zeros_like(restored, dtype=torch.bool)
+    valid_predictions[:, :2] = True
+    valid_predictions[scatter_rows, scatter_columns] = True
+    expected = torch.where(valid_predictions, dense_logprobs, 0.0)
+    torch.testing.assert_close(restored, expected)
+
+    weights = torch.arange(1, restored.numel() + 1, dtype=restored.dtype).view_as(
+        restored
+    )
+    (restored * weights).sum().backward()
+    (expected * weights).sum().backward()
+    torch.testing.assert_close(packed_logits.grad, reference_logits.grad)
+
+
+def test_shared_prefix_model_forward_lowers_outer_layout_to_hybrid_adapter():
+    from nemo_rl.data.packing import build_shared_prefix_tensor_plan
+    from nemo_rl.models.megatron.data import SharedPrefixForwardMetadata
+    from nemo_rl.models.megatron.train import model_forward
+
+    input_ids = torch.tensor(
+        [
+            [10, 11, 12, 20, 21, 0],
+            [10, 11, 12, 30, 31, 32],
+        ]
+    )
+    tensor_bin = build_shared_prefix_tensor_plan(
+        input_ids=input_ids,
+        input_lengths=torch.tensor([5, 6]),
+        prompt_lengths=torch.tensor([3, 3]),
+        group_ids=["g", "g"],
+        bin_capacity=16,
+        materialize_attention_mask=False,
+    ).shared_bins[0]
+    metadata = SharedPrefixForwardMetadata(
+        tensor_bin=tensor_bin,
+        source_sequence_length=6,
+    )
+    model = MagicMock(return_value=torch.randn(1, 8, 4))
+    data_dict = MagicMock()
+    data_dict.get_multimodal_dict.return_value = {}
+
+    model_forward(
+        model=model,
+        data_dict=data_dict,
+        input_ids_cp_sharded=tensor_bin.packed_input_ids.unsqueeze(0),
+        position_ids=tensor_bin.position_ids.unsqueeze(0),
+        attention_mask=None,
+        packed_seq_params=None,
+        defer_fp32_logits=True,
+        shared_prefix=metadata,
+        shared_prefix_train_mode=True,
+    )
+
+    call_kwargs = model.call_args.kwargs
+    assert call_kwargs["attention_mask"] is None
+    assert "fp32_output" not in call_kwargs
+    assert "packed_seq_params" not in call_kwargs
+    assert call_kwargs["shared_prefix_layout"].prefix_len == 3
+    assert tuple(call_kwargs["shared_prefix_layout"].completion_lens) == (3, 2)
+
+
 class TestModelForward:
     """Tests for model_forward function."""
 
@@ -143,6 +277,36 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert call_kwargs["fp32_output"] is False
 
+    def test_shared_prefix_fallback_does_not_pass_gpt_only_fp32_output(self):
+        """Hybrid fallback units keep the raw HybridModel forward contract."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        class StrictHybridForward:
+            def __call__(
+                self,
+                *,
+                input_ids,
+                position_ids,
+                attention_mask,
+                packed_seq_params=None,
+            ):
+                return torch.randn(1, input_ids.shape[1], 8)
+
+        mock_data_dict = MagicMock()
+        mock_data_dict.get_multimodal_dict.return_value = {}
+        output = model_forward(
+            model=StrictHybridForward(),
+            data_dict=mock_data_dict,
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            position_ids=torch.tensor([[0, 1, 2]]),
+            attention_mask=None,
+            packed_seq_params=MagicMock(),
+            defer_fp32_logits=True,
+            shared_prefix_train_mode=True,
+        )
+
+        assert output.shape == (1, 3, 8)
+
     def test_model_forward_clears_position_ids_for_multimodal(self):
         """Test model_forward sets position_ids to None for multimodal data."""
         from nemo_rl.models.megatron.train import model_forward
@@ -210,6 +374,110 @@ class TestApplyTemperatureScaling:
 
 class TestForwardWithPostProcessingFn:
     """Tests for forward_with_post_processing_fn function."""
+
+    @patch("nemo_rl.models.megatron.train.shared_prefix_next_token_logprobs")
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_shared_prefix_loss_uses_scalar_logprobs_without_packed_wrapper(
+        self,
+        mock_model_forward,
+        mock_extract_logprobs,
+    ):
+        """Shared stars must discard vocab logits before loss dispatch."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LossPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        packed_logits = torch.randn(1, 8, 4) * 2
+        original_packed_logits = packed_logits.clone()
+        scalar_logprobs = torch.randn(2, 5)
+        shared_prefix = MagicMock()
+        mock_model_forward.return_value = packed_logits
+        mock_extract_logprobs.return_value = scalar_logprobs
+
+        processed_mb = ProcessedMicrobatch(
+            data_dict=MagicMock(),
+            input_ids=torch.tensor([[1, 2, 3], [1, 2, 4]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=None,
+            position_ids=torch.tensor([[0, 1, 2, 2]]),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+            shared_prefix=shared_prefix,
+        )
+
+        class RecordingLossPostProcessor(LossPostProcessor):
+            def __call__(
+                self,
+                *,
+                packed_seq_params,
+                input_is_next_token_logprobs,
+                **_kwargs,
+            ):
+                self.seen_packed_seq_params = packed_seq_params
+                self.seen_precomputed_flag = input_is_next_token_logprobs
+                return MagicMock()
+
+        loss_fn = MagicMock()
+        loss_fn.input_type = LossInputType.LOGPROB
+        post_processor = RecordingLossPostProcessor(
+            loss_fn=loss_fn,
+            cfg={
+                "sequence_packing": {"enabled": True},
+                "logprob_chunk_size": 2,
+            },
+        )
+        output, wrapped_fn = forward_with_post_processing_fn(
+            data_iterator=iter([processed_mb]),
+            model=MagicMock(),
+            post_processing_fn=post_processor,
+            sampling_params=TrainingSamplingParams(temperature=2.0),
+        )
+
+        mock_extract_logprobs.assert_called_once_with(
+            packed_logits,
+            shared_prefix,
+            chunk_size=2,
+            temperature=2.0,
+        )
+        torch.testing.assert_close(packed_logits, original_packed_logits)
+        assert output is scalar_logprobs
+        assert post_processor.seen_packed_seq_params is None
+        assert post_processor.seen_precomputed_flag is True
+        assert callable(wrapped_fn)
+
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_shared_prefix_rejects_topk_before_model_forward(self, mock_model_forward):
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LogprobsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        processed_mb = ProcessedMicrobatch(
+            data_dict={"input_ids": torch.tensor([[1, 2], [1, 3]])},
+            input_ids=torch.tensor([[1, 2], [1, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=None,
+            position_ids=torch.tensor([[0, 1, 1]]),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+            shared_prefix=MagicMock(),
+        )
+        post_processor = LogprobsPostProcessor(
+            cfg={"sequence_packing": {"enabled": True}}
+        )
+
+        with pytest.raises(NotImplementedError, match="top-k/top-p"):
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=post_processor,
+                sampling_params=TrainingSamplingParams(top_k=4),
+            )
+
+        mock_model_forward.assert_not_called()
 
     @patch(
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
@@ -1119,6 +1387,41 @@ class TestLossPostProcessor:
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
+    )
+    def test_loss_post_processor_consumes_precomputed_scalar_logprobs(
+        self, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
+    ):
+        """The shared path must not reinterpret [batch, sequence-1] as logits."""
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        precomputed = torch.randn(2, 4, requires_grad=True)
+        mock_loss_fn = MagicMock(return_value=(precomputed.sum(), {"loss": 1.0}))
+        mock_loss_fn.input_type = LossInputType.LOGPROB
+        processor = LossPostProcessor(
+            loss_fn=mock_loss_fn,
+            cfg={"sequence_packing": {"enabled": True}},
+            cp_normalize=False,
+        )
+        wrapped_fn = processor(
+            data_dict={"input_ids": torch.tensor([[1, 2, 3, 4, 5]] * 2)},
+            packed_seq_params=None,
+            input_is_next_token_logprobs=True,
+        )
+
+        loss, metrics = wrapped_fn(precomputed)
+
+        assert loss is not None
+        assert metrics == {"loss": 1.0}
+        assert mock_loss_fn.call_args.kwargs["next_token_logprobs"] is precomputed
+        assert "logits" not in mock_loss_fn.call_args.kwargs
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
         "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=2
     )
     def test_loss_post_processor_with_cp_normalize(
@@ -1224,6 +1527,31 @@ class TestLogprobsPostProcessor:
         assert "logprobs" in result
         # Logprobs should be prepended with a 0
         assert result["logprobs"].shape[1] == 5
+
+    @patch("nemo_rl.models.megatron.train.from_parallel_logits_to_logprobs")
+    def test_logprobs_post_processor_consumes_precomputed_scalar_logprobs(
+        self, mock_from_logits
+    ):
+        """Observation returns scalar shared logprobs in exact local-row order."""
+        from nemo_rl.models.megatron.train import LogprobsPostProcessor
+
+        precomputed = torch.tensor([[-1.0, -2.0, -3.0, -4.0], [-5.0, -6.0, -7.0, 0.0]])
+        processor = LogprobsPostProcessor(cfg={"sequence_packing": {"enabled": True}})
+        wrapped_fn = processor(
+            data_dict={"input_ids": torch.tensor([[1, 2, 3, 4, 5]] * 2)},
+            input_ids=torch.tensor([[1, 2, 3, 4, 5]] * 2),
+            cu_seqlens_padded=None,
+            input_is_next_token_logprobs=True,
+        )
+
+        loss, result = wrapped_fn(precomputed)
+
+        assert loss.item() == 0.0
+        torch.testing.assert_close(
+            result["logprobs"],
+            torch.tensor([[0.0, -1.0, -2.0, -3.0, -4.0], [0.0, -5.0, -6.0, -7.0, 0.0]]),
+        )
+        mock_from_logits.assert_not_called()
 
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(

@@ -44,7 +44,7 @@ from nemo_rl.algorithms.loss import (
     prepare_packed_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
@@ -54,7 +54,11 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
 )
 from nemo_rl.models.megatron.config import MegatronModule
-from nemo_rl.models.megatron.data import ProcessedMicrobatch
+from nemo_rl.models.megatron.data import (
+    SHARED_PREFIX_SOURCE_ROW_INDEX,
+    ProcessedMicrobatch,
+    SharedPrefixForwardMetadata,
+)
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
@@ -120,14 +124,16 @@ def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
     input_ids_cp_sharded: torch.Tensor,
-    position_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
     mtp_loss_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
     media_token_validity_mask: Optional[torch.Tensor] = None,
+    shared_prefix: Optional[SharedPrefixForwardMetadata] = None,
+    shared_prefix_train_mode: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -147,6 +153,10 @@ def model_forward(
         media_token_validity_mask: Which media-token positions actually anchor a
             projected feature, already in this model's token layout. Only passed
             when the model accepts it; otherwise the model derives its own.
+        shared_prefix: Structured Hybrid star layout for the explicit CP1/TP1
+            shared-prefix model path.
+        shared_prefix_train_mode: Whether the forward is part of a
+            shared-prefix train schedule, including conventional fallback units.
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -158,6 +168,34 @@ def model_forward(
         position_ids = None
 
     additional_kwargs = {}
+    if shared_prefix is not None:
+        if packed_seq_params is not None:
+            raise ValueError(
+                "shared-prefix Hybrid forward cannot also use packed_seq_params"
+            )
+        if mtp_loss_mask is not None:
+            raise NotImplementedError(
+                "shared-prefix Hybrid forward does not support MTP"
+            )
+        if multimodal_data or media_token_validity_mask is not None:
+            raise NotImplementedError(
+                "shared-prefix Hybrid forward does not support multimodal inputs"
+            )
+        if use_fused_linear_logprobs:
+            raise NotImplementedError(
+                "shared-prefix Hybrid forward does not support fused linear logprobs"
+            )
+        # Optional until a shared-prefix run is selected: stock MCore installs
+        # do not provide this integration module, while disabled/observe modes
+        # must retain their existing import and execution behavior.
+        from megatron.core.models.hybrid.shared_prefix import (
+            SharedPrefixLayout as MCoreSharedPrefixLayout,
+        )
+
+        additional_kwargs["shared_prefix_layout"] = MCoreSharedPrefixLayout(
+            prefix_len=shared_prefix.tensor_bin.layout.prompt_length,
+            completion_lens=shared_prefix.tensor_bin.layout.completion_lengths,
+        )
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
@@ -171,7 +209,11 @@ def model_forward(
     if media_token_validity_mask is not None:
         additional_kwargs["media_token_validity_mask"] = media_token_validity_mask
 
-    if defer_fp32_logits:
+    # GPTModel accepts ``fp32_output`` to suppress its optional logits cast.
+    # Raw MCore HybridModel does not expose that keyword and already returns
+    # output-layer dtype, which is the representation required by the bounded
+    # shared-prefix log-probability gather below.
+    if defer_fp32_logits and not shared_prefix_train_mode:
         additional_kwargs["fp32_output"] = False
     if use_fused_linear_logprobs:
         additional_kwargs["labels"] = input_ids_cp_sharded
@@ -198,6 +240,130 @@ def model_forward(
         output_tensor = output_tensor[0]
 
     return output_tensor
+
+
+def shared_prefix_next_token_logprobs(
+    packed_logits: torch.Tensor,
+    shared_prefix: SharedPrefixForwardMetadata,
+    *,
+    chunk_size: Optional[int] = None,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Extract and scatter a star's next-token logprobs without logit fan-out.
+
+    The packed Hybrid forward returns ``[1, packed_tokens, vocab]``. Expanding
+    that tensor to conventional ``[branches, sequence, vocab]`` defeats most of
+    the shared-prefix memory saving, so this function gathers only the predictor
+    rows needed for next-token probabilities. Vocabulary work is bounded to
+    ``chunk_size`` predictor rows at a time, and only scalar logprobs are fanned
+    out to the conventional ``[branches, sequence - 1]`` loss layout.
+
+    Prompt predictions are evaluated once and broadcast as scalars. Completion
+    predictions follow the planner's predecessor/scatter metadata, including
+    the final prompt position as every branch's first-token predecessor. All
+    gathers and scatters remain differentiable, so branch gradients accumulate
+    into the one shared prompt exactly as in a dense conventional forward.
+    """
+    if packed_logits.ndim != 3 or packed_logits.shape[0] != 1:
+        raise ValueError(
+            "shared-prefix Hybrid logits must have shape [1, tokens, vocab], "
+            f"got {tuple(packed_logits.shape)}"
+        )
+    tensor_bin = shared_prefix.tensor_bin
+    layout = tensor_bin.layout
+    if packed_logits.shape[1] != layout.total_length:
+        raise ValueError(
+            "shared-prefix Hybrid output token count does not match its layout: "
+            f"{packed_logits.shape[1]} != {layout.total_length}"
+        )
+
+    row_count = len(layout.row_indices)
+    sequence_length = shared_prefix.source_sequence_length
+    if sequence_length < layout.prompt_length:
+        raise ValueError(
+            "source sequence width is shorter than the shared prompt length"
+        )
+    if chunk_size is not None and (
+        not isinstance(chunk_size, int)
+        or isinstance(chunk_size, bool)
+        or chunk_size <= 0
+    ):
+        raise ValueError("shared-prefix logprob_chunk_size must be a positive integer")
+
+    tensor_indices = tensor_bin.indices
+    device = packed_logits.device
+    prompt_prediction_count = layout.prompt_length - 1
+    prompt_predictors = torch.arange(
+        prompt_prediction_count,
+        dtype=torch.long,
+        device=device,
+    )
+    prompt_targets = torch.arange(
+        1,
+        layout.prompt_length,
+        dtype=torch.long,
+        device=device,
+    )
+    completion_predictors = tensor_indices.predecessor_positions.to(device=device)
+    completion_targets = tensor_indices.completion_positions.to(device=device)
+    if completion_predictors.numel() != completion_targets.numel():
+        raise ValueError(
+            "shared-prefix predecessor and completion-position counts differ"
+        )
+
+    predictor_positions = torch.cat((prompt_predictors, completion_predictors), dim=0)
+    target_positions = torch.cat((prompt_targets, completion_targets), dim=0)
+    target_tokens = tensor_bin.packed_input_ids.to(device=device).index_select(
+        0, target_positions
+    )
+
+    # Do not select every predictor row up front: even the packed [tokens, vocab]
+    # gather can create a large additional allocation. Each iteration owns at
+    # most ``policy.logprob_chunk_size`` vocabulary rows and emits only scalars.
+    prediction_count = predictor_positions.numel()
+    effective_chunk_size = prediction_count if chunk_size is None else chunk_size
+    selected_logprobs: list[torch.Tensor] = []
+    packed_logits_2d = packed_logits[0]
+    for start in range(0, prediction_count, effective_chunk_size):
+        end = min(start + effective_chunk_size, prediction_count)
+        predictor_chunk = predictor_positions[start:end]
+        logits_chunk = packed_logits_2d.index_select(0, predictor_chunk)
+        if temperature != 1.0:
+            # Match conventional temperature scaling in the model-output dtype,
+            # but only mutate the private chunk rather than the model's logits.
+            logits_chunk.div_(temperature)
+        logits_chunk = logits_chunk.to(torch.float32)
+        logprobs_chunk = torch.nn.functional.log_softmax(logits_chunk, dim=-1)
+        selected_logprobs.append(
+            logprobs_chunk.gather(
+                dim=-1,
+                index=target_tokens[start:end].to(torch.long).unsqueeze(-1),
+            ).squeeze(-1)
+        )
+    packed_logprobs = torch.cat(selected_logprobs, dim=0)
+
+    restored = packed_logprobs.new_zeros((row_count, sequence_length - 1))
+    if prompt_prediction_count > 0:
+        restored[:, :prompt_prediction_count] = packed_logprobs[
+            :prompt_prediction_count
+        ].unsqueeze(0)
+
+    source_to_local = {
+        source_row: local_row for local_row, source_row in enumerate(layout.row_indices)
+    }
+    scatter_rows = torch.tensor(
+        [
+            source_to_local[int(source_row)]
+            for source_row in layout.completion_scatter_rows
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+    scatter_columns = tensor_indices.completion_scatter_columns.to(device=device)
+    if bool(torch.any(scatter_columns >= sequence_length - 1).item()):
+        raise ValueError("shared-prefix completion scatter exceeds source width")
+    restored[scatter_rows, scatter_columns] = packed_logprobs[prompt_prediction_count:]
+    return restored
 
 
 def apply_temperature_scaling(
@@ -269,6 +435,31 @@ def forward_with_post_processing_fn(
     mtp_loss_mask = processed_mb.mtp_loss_mask
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
     media_token_validity_mask = processed_mb.media_token_validity_mask
+    shared_prefix = processed_mb.shared_prefix
+
+    if shared_prefix is not None:
+        if isinstance(post_processing_fn, TopkLogitsPostProcessor):
+            raise NotImplementedError(
+                "shared-prefix train mode does not support top-k-logit forwards"
+            )
+        if not isinstance(
+            post_processing_fn, (LossPostProcessor, LogprobsPostProcessor)
+        ):
+            raise TypeError(
+                f"Unknown post-processing function type: {type(post_processing_fn)}"
+            )
+        if isinstance(post_processing_fn, LossPostProcessor) and (
+            post_processing_fn.loss_fn.input_type is not LossInputType.LOGPROB
+        ):
+            raise NotImplementedError(
+                "shared-prefix train mode requires a LOGPROB loss, got "
+                f"{post_processing_fn.loss_fn.input_type!r}"
+            )
+        if need_top_k_or_top_p_filtering(sampling_params):
+            raise NotImplementedError(
+                "shared-prefix next-token logprob extraction does not support "
+                "top-k/top-p filtering"
+            )
 
     if use_router_replay:
         if routed_experts_cp_sharded is None:
@@ -293,6 +484,8 @@ def forward_with_post_processing_fn(
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 media_token_validity_mask=media_token_validity_mask,
+                shared_prefix=shared_prefix,
+                shared_prefix_train_mode=processed_mb.shared_prefix_train_mode,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -307,6 +500,16 @@ def forward_with_post_processing_fn(
             set_router_replay_backward(model)
         else:
             clear_router_replay(model)
+
+    if shared_prefix is not None:
+        output_tensor = shared_prefix_next_token_logprobs(
+            output_tensor,
+            shared_prefix,
+            chunk_size=post_processing_fn.cfg.get("logprob_chunk_size", None),
+            temperature=(
+                sampling_params.temperature if sampling_params is not None else 1.0
+            ),
+        )
 
     if capture is not None:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
@@ -324,9 +527,9 @@ def forward_with_post_processing_fn(
             attention_mask=attention_mask,
         )
 
-    # Apply temperature scaling only for sampling-oriented post-processors.
-    # Loss computation should use unscaled logits.
-    if isinstance(
+    # The shared-prefix path scaled its packed logits before discarding the
+    # vocabulary dimension. Keep the conventional/fallback path unchanged.
+    if shared_prefix is None and isinstance(
         post_processing_fn,
         (LossPostProcessor, LogprobsPostProcessor, TopkLogitsPostProcessor),
     ):
@@ -342,12 +545,14 @@ def forward_with_post_processing_fn(
             packed_seq_params=packed_seq_params,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            input_is_next_token_logprobs=shared_prefix is not None,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
+            input_is_next_token_logprobs=shared_prefix is not None,
         )
     elif isinstance(post_processing_fn, TopkLogitsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
@@ -440,6 +645,29 @@ def megatron_forward_backward(
                 clear_router_replay(model)
 
 
+def _prepare_precomputed_next_token_logprobs(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    loss_fn: LossFunction,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[dict[str, torch.Tensor], BatchedDataDict[Any]]:
+    """Adapt already-extracted ``[batch, sequence - 1]`` logprobs to a loss."""
+    del vocab_parallel_rank, vocab_parallel_group, context_parallel_group
+    if loss_fn.input_type is not LossInputType.LOGPROB:
+        raise NotImplementedError(
+            "precomputed next-token logprobs require LossInputType.LOGPROB"
+        )
+    expected_shape = (data["input_ids"].shape[0], data["input_ids"].shape[1] - 1)
+    if logits.ndim != 2 or tuple(logits.shape) != expected_shape:
+        raise ValueError(
+            "precomputed next-token logprobs must have shape "
+            f"{expected_shape}, got {tuple(logits.shape)}"
+        )
+    return {"next_token_logprobs": logits}, data
+
+
 class LossPostProcessor:
     def __init__(
         self,
@@ -484,6 +712,7 @@ class LossPostProcessor:
         packed_seq_params: Optional[PackedSeqParams] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
+        input_is_next_token_logprobs: bool = False,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -496,13 +725,37 @@ class LossPostProcessor:
             packed_seq_params: Parameters for packed sequences (optional)
             global_valid_seqs: Global valid sequence count for loss normalization
             global_valid_toks: Global valid token count for loss normalization
+            input_is_next_token_logprobs: Whether the model output was already
+                reduced to scalar next-token logprobs by shared-prefix extraction.
 
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
+        if input_is_next_token_logprobs:
+            if packed_seq_params is not None:
+                raise ValueError(
+                    "precomputed shared-prefix logprobs cannot use packed_seq_params"
+                )
+            if self.prepare_fn is not None:
+                raise NotImplementedError(
+                    "precomputed shared-prefix logprobs do not support a custom "
+                    "loss-input prepare function"
+                )
+            if need_top_k_or_top_p_filtering(self.sampling_params):
+                raise NotImplementedError(
+                    "shared-prefix next-token logprobs do not support top-k/top-p "
+                    "filtering"
+                )
+            if "student_logits" in data_dict:
+                raise NotImplementedError(
+                    "precomputed shared-prefix logprobs do not support draft loss"
+                )
+
         # A custom prepare_fn (e.g. value models) overrides the default logit prep.
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-        if self.prepare_fn is not None:
+        if input_is_next_token_logprobs:
+            prepare_loss_input_wrapped = _prepare_precomputed_next_token_logprobs
+        elif self.prepare_fn is not None:
             prepare_loss_input_wrapped = self.prepare_fn
         else:
             prepare_loss_input_wrapped = partial(
@@ -611,7 +864,8 @@ class LogprobsPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         input_ids: torch.Tensor,
-        cu_seqlens_padded: torch.Tensor,
+        cu_seqlens_padded: Optional[torch.Tensor],
+        input_is_next_token_logprobs: bool = False,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -622,18 +876,53 @@ class LogprobsPostProcessor:
             data_dict: Batched data dictionary containing input sequences
             input_ids: Processed input token IDs
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
+            input_is_next_token_logprobs: Whether the input was already reduced
+                to scalar next-token logprobs by shared-prefix extraction.
 
         Returns:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
         """
         unpacked_input_ids = data_dict["input_ids"]
         original_seq_length = unpacked_input_ids.shape[1]
+        if input_is_next_token_logprobs:
+            if self.use_fused_linear_logprobs:
+                raise NotImplementedError(
+                    "shared-prefix extraction cannot be combined with fused linear "
+                    "logprobs"
+                )
+            if cu_seqlens_padded is not None:
+                raise ValueError(
+                    "precomputed shared-prefix logprobs cannot use packed sequence "
+                    "metadata"
+                )
+            if need_top_k_or_top_p_filtering(self.sampling_params):
+                raise NotImplementedError(
+                    "shared-prefix next-token logprobs do not support top-k/top-p "
+                    "filtering"
+                )
 
         def processor_fn_inner(output_tensor):
-            if self.use_fused_linear_logprobs:
+            if input_is_next_token_logprobs:
+                expected_shape = (
+                    unpacked_input_ids.shape[0],
+                    original_seq_length - 1,
+                )
+                if (
+                    output_tensor.ndim != 2
+                    or tuple(output_tensor.shape) != expected_shape
+                ):
+                    raise ValueError(
+                        "precomputed next-token logprobs must have shape "
+                        f"{expected_shape}, got {tuple(output_tensor.shape)}"
+                    )
+                token_logprobs = output_tensor.to(torch.float32)
+            elif self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
-            elif self.cfg["sequence_packing"]["enabled"]:
+            elif (
+                self.cfg["sequence_packing"]["enabled"]
+                and cu_seqlens_padded is not None
+            ):
                 tp_grp = get_tensor_model_parallel_group()
                 tp_rank = get_tensor_model_parallel_rank()
                 logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
@@ -677,9 +966,12 @@ class LogprobsPostProcessor:
                     token_logprobs, mask, "prev_logprobs"
                 )
 
-            return torch.tensor(0.0, device=token_logprobs.device), {
-                "logprobs": token_logprobs
-            }
+            outputs = {"logprobs": token_logprobs}
+            if SHARED_PREFIX_SOURCE_ROW_INDEX in data_dict:
+                outputs[SHARED_PREFIX_SOURCE_ROW_INDEX] = data_dict[
+                    SHARED_PREFIX_SOURCE_ROW_INDEX
+                ]
+            return torch.tensor(0.0, device=token_logprobs.device), outputs
 
         return processor_fn_inner
 

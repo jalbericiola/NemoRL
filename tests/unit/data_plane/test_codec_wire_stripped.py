@@ -117,6 +117,28 @@ def test_materialize_preserves_real_nontensor_data() -> None:
     assert list(arr) == ["hello", "world", "!"]
 
 
+def test_materialize_preserves_batched_nontensor_data_vector() -> None:
+    """A homogeneous object column must not gain an extra batch dimension."""
+    values = np.asarray(["group", "group"], dtype=object)
+    td = TensorDict(
+        {
+            "group_id": NonTensorData(
+                data=values,
+                batch_size=[2],
+            )
+        },
+        batch_size=[2],
+    )
+
+    bdd = materialize(td, layout="padded")
+
+    group_ids = bdd["group_id"]
+    assert isinstance(group_ids, np.ndarray)
+    assert group_ids.dtype == object
+    assert group_ids.shape == (2,)
+    assert group_ids.tolist() == ["group", "group"]
+
+
 def test_materialize_decodes_nontensor_stack_with_tensor_field() -> None:
     """Per-field decode: tensor fields stay padded while object fields ride.
 

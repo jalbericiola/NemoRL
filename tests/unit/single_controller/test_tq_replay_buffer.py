@@ -26,6 +26,10 @@ from tensordict import TensorDict
 
 import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_GROUP_ID,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
@@ -35,16 +39,20 @@ _N_GENS = 2
 
 
 def _stub_record_to_train_batch(
-    record: PromptGroupRecord, *, pad_value_dict: Any
+    record: PromptGroupRecord,
+    *,
+    pad_value_dict: Any,
+    include_shared_prefix_metadata: bool = False,
 ) -> BatchedDataDict[Any]:
     del record, pad_value_dict
-    return BatchedDataDict[Any](
-        {
-            "input_ids": torch.ones((_N_GENS, 3), dtype=torch.long),
-            "input_lengths": torch.full((_N_GENS,), 3, dtype=torch.long),
-            "total_reward": torch.zeros(_N_GENS, dtype=torch.float32),
-        }
-    )
+    data = {
+        "input_ids": torch.ones((_N_GENS, 3), dtype=torch.long),
+        "input_lengths": torch.full((_N_GENS,), 3, dtype=torch.long),
+        "total_reward": torch.zeros(_N_GENS, dtype=torch.float32),
+    }
+    if include_shared_prefix_metadata:
+        data[SHARED_PREFIX_PROMPT_LENGTHS] = torch.full((_N_GENS,), 2, dtype=torch.long)
+    return BatchedDataDict[Any](data)
 
 
 @pytest.fixture(autouse=True)
@@ -157,12 +165,14 @@ def _make_buffer(
     dp: FakeDataPlaneClient,
     *,
     require_routed_experts: bool = False,
+    include_shared_prefix_metadata: bool = False,
 ) -> TQReplayBuffer:
     return TQReplayBuffer(
         dp,
         partition_id="rollout_data",
         pad_value_dict={"token_ids": 0},
         require_routed_experts=require_routed_experts,
+        include_shared_prefix_metadata=include_shared_prefix_metadata,
     )
 
 
@@ -186,6 +196,54 @@ def _add_group(
 
 
 class TestTQReplayBufferReserveCommit:
+    def test_disabled_commit_keeps_legacy_converter_call_shape(self, monkeypatch):
+        def legacy_converter(
+            record: PromptGroupRecord,
+            *,
+            pad_value_dict: Any,
+        ) -> BatchedDataDict[Any]:
+            return _stub_record_to_train_batch(
+                record,
+                pad_value_dict=pad_value_dict,
+            )
+
+        monkeypatch.setattr(
+            _replay_buffer_module,
+            "record_to_train_batch",
+            legacy_converter,
+        )
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+
+        meta = _add_group(buf, weight=3)
+
+        assert SHARED_PREFIX_GROUP_ID not in (meta.fields or [])
+        assert SHARED_PREFIX_PROMPT_LENGTHS not in (meta.fields or [])
+
+    def test_enabled_commit_writes_stable_group_and_scalar_prompt_metadata(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp, include_shared_prefix_metadata=True)
+        group_id = buf.reserve(weight_version=3, group_id="stable-group")
+
+        meta = _run(
+            buf.commit(
+                group_id,
+                _make_record(),
+                start_weight_version=3,
+                end_weight_version=4,
+            )
+        )
+
+        assert SHARED_PREFIX_GROUP_ID in (meta.fields or [])
+        assert SHARED_PREFIX_PROMPT_LENGTHS in (meta.fields or [])
+        fields = dp.put_calls[0]["fields"]
+        assert fields[SHARED_PREFIX_GROUP_ID].tolist() == [
+            "stable-group",
+            "stable-group",
+        ]
+        assert fields[SHARED_PREFIX_PROMPT_LENGTHS].shape == (_N_GENS,)
+        assert fields[SHARED_PREFIX_PROMPT_LENGTHS].tolist() == [2, 2]
+
     def test_commit_clears_rows_when_put_raises_after_writing(self):
         dp = FailAfterPutDataPlaneClient()
         buf = _make_buffer(dp)
@@ -761,6 +819,43 @@ class TestTQReplayBufferLoadPreflight:
             "g1", weight=2, sample_ids=["g0_g0", "g1_g1"]
         )  # g0_g0 collides
         self._assert_rejected(_make_envelope([g0, g1]), match="duplicate sample_id")
+
+    def test_enabled_buffer_rejects_checkpoint_without_shared_prefix_fields(self):
+        state = _make_envelope([_make_group_entry("g0", weight=1)])
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp, include_shared_prefix_metadata=True)
+
+        with pytest.raises(ValueError, match="shared-prefix schema mismatch"):
+            _load(buf, state)
+
+        assert dp.put_calls == []
+        assert buf.size() == 0
+
+    def test_disabled_buffer_rejects_checkpoint_with_shared_prefix_fields(self):
+        group = _make_group_entry("g0", weight=1)
+        meta = group["meta"]
+        assert meta.fields is not None
+        meta.fields.extend([SHARED_PREFIX_GROUP_ID, SHARED_PREFIX_PROMPT_LENGTHS])
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+
+        with pytest.raises(ValueError, match="shared-prefix schema mismatch"):
+            _load(buf, _make_envelope([group]))
+
+        assert dp.put_calls == []
+        assert buf.size() == 0
+
+    def test_enabled_buffer_accepts_matching_checkpoint_schema(self):
+        group = _make_group_entry("g0", weight=1)
+        meta = group["meta"]
+        assert meta.fields is not None
+        meta.fields.extend([SHARED_PREFIX_GROUP_ID, SHARED_PREFIX_PROMPT_LENGTHS])
+        buf = _make_buffer(
+            FakeDataPlaneClient(),
+            include_shared_prefix_metadata=True,
+        )
+
+        assert _load(buf, _make_envelope([group])) == 1
 
 
 class TestTQReplayBufferLoadTruncation:

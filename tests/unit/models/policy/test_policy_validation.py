@@ -20,11 +20,17 @@ the world_size compatibility validation that prevents confusing reshape errors
 when the cluster size is insufficient for the specified parallelism configuration.
 """
 
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import (
+    PolicyConfig,
+    SharedPrefixTrainingConfig,
+    get_shared_prefix_training_config,
+    validate_shared_prefix_training_config,
+)
 from nemo_rl.models.policy.lm_policy import Policy
 
 
@@ -152,6 +158,8 @@ def create_megatron_config(
             "tensor_model_parallel_size": tp,
             "pipeline_model_parallel_size": pp,
             "context_parallel_size": cp,
+            "sequence_parallel": False,
+            "activation_checkpointing": False,
         },
         "dynamic_batching": {
             "enabled": pp == 1,  # Only enable for single pipeline parallel stage
@@ -169,6 +177,162 @@ def create_megatron_config(
             "betas": [0.9, 0.999],
         },
     }
+
+
+def create_shared_prefix_train_config(
+    *, tp: int = 1, pp: int = 1, cp: int = 1
+) -> PolicyConfig:
+    """Create the currently supported shared-prefix policy slice."""
+    config = create_megatron_config("test-model", tp=tp, pp=pp, cp=cp)
+    config["precision"] = "bfloat16"
+    config["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": 128,
+        "logprob_mb_tokens": 128,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+    config["shared_prefix_training"] = {"mode": "train"}
+    return config
+
+
+def test_shared_prefix_training_defaults_to_disabled_for_legacy_config() -> None:
+    config = create_dtensor_config("test-model", tp=1)
+
+    resolved_config = get_shared_prefix_training_config(config)
+
+    assert resolved_config == SharedPrefixTrainingConfig(mode="disabled")
+
+
+def test_shared_prefix_observe_mode_is_backend_neutral() -> None:
+    config = create_dtensor_config("test-model", tp=1, cp=2)
+    config["shared_prefix_training"] = {"mode": "observe"}
+
+    resolved_config = validate_shared_prefix_training_config(config)
+
+    assert resolved_config.mode == "observe"
+
+
+def test_shared_prefix_train_mode_accepts_first_slice_topology() -> None:
+    config = create_shared_prefix_train_config()
+
+    resolved_config = validate_shared_prefix_training_config(config)
+
+    assert resolved_config.mode == "train"
+
+
+@pytest.mark.parametrize(
+    "config,expected_config_path",
+    [
+        (
+            create_dtensor_config("test-model", tp=1),
+            "policy.megatron_cfg.enabled=true",
+        ),
+        (
+            create_megatron_config("test-model", tp=1),
+            "policy.sequence_packing.enabled=true",
+        ),
+        (
+            create_megatron_config("test-model", tp=1, cp=2),
+            "policy.megatron_cfg.context_parallel_size=1",
+        ),
+        (
+            create_megatron_config("test-model", tp=1, pp=2),
+            "policy.megatron_cfg.pipeline_model_parallel_size=1",
+        ),
+        (
+            create_megatron_config("test-model", tp=2),
+            "policy.megatron_cfg.tensor_model_parallel_size=1",
+        ),
+    ],
+)
+def test_shared_prefix_train_mode_rejects_unsupported_first_slice_topology(
+    config: PolicyConfig,
+    expected_config_path: str,
+) -> None:
+    config["shared_prefix_training"] = {"mode": "train"}
+    if "megatron_cfg" in config:
+        config["sequence_packing"] = {
+            "enabled": True,
+            "train_mb_tokens": 128,
+            "logprob_mb_tokens": 128,
+            "algorithm": "modified_first_fit_decreasing",
+        }
+    if expected_config_path == "policy.sequence_packing.enabled=true":
+        config["sequence_packing"] = {"enabled": False}
+
+    with pytest.raises(ValueError, match=expected_config_path):
+        validate_shared_prefix_training_config(config)
+
+
+@pytest.mark.parametrize(
+    "megatron_overrides,policy_overrides,expected_config_path",
+    [
+        (
+            {"sequence_parallel": True},
+            {},
+            "policy.megatron_cfg.sequence_parallel=false",
+        ),
+        (
+            {"activation_checkpointing": True},
+            {},
+            "policy.megatron_cfg.activation_checkpointing=false",
+        ),
+        (
+            {
+                "activation_checkpointing": True,
+                "recompute_granularity": "full",
+            },
+            {},
+            "policy.megatron_cfg.recompute_granularity",
+        ),
+        (
+            {"mtp_num_layers": 1},
+            {},
+            "policy.megatron_cfg.mtp_num_layers=0",
+        ),
+        (
+            {"cuda_graph_impl": "local"},
+            {},
+            "policy.megatron_cfg.cuda_graph_impl='none'",
+        ),
+        (
+            {"fp8_cfg": {"enabled": True}},
+            {},
+            "policy.megatron_cfg.fp8_cfg.enabled=false",
+        ),
+        (
+            {},
+            {"quant_cfg": "nvfp4"},
+            "policy.quant_cfg=null",
+        ),
+    ],
+)
+def test_shared_prefix_train_mode_rejects_unsupported_runtime_features_early(
+    megatron_overrides: dict[str, object],
+    policy_overrides: dict[str, object],
+    expected_config_path: str,
+) -> None:
+    config = create_shared_prefix_train_config()
+    cast(dict[str, Any], config["megatron_cfg"]).update(megatron_overrides)
+    cast(dict[str, Any], config).update(policy_overrides)
+
+    with pytest.raises(ValueError, match=expected_config_path):
+        validate_shared_prefix_training_config(config)
+
+
+def test_shared_prefix_train_mode_allows_selective_activation_recompute() -> None:
+    config = create_shared_prefix_train_config()
+    cast(dict[str, Any], config["megatron_cfg"]).update(
+        {
+            "activation_checkpointing": True,
+            "recompute_granularity": "selective",
+            "recompute_modules": ["core_attn"],
+        }
+    )
+
+    resolved_config = validate_shared_prefix_training_config(config)
+
+    assert resolved_config.mode == "train"
 
 
 @pytest.mark.parametrize(

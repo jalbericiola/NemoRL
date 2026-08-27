@@ -18,6 +18,7 @@ import asyncio
 import concurrent.futures
 import threading as _threading
 import time
+import uuid
 from collections import defaultdict
 from collections.abc import AsyncGenerator
 from typing import Any, Optional, cast
@@ -45,6 +46,7 @@ from nemo_rl.algorithms.ppo import (
 from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_GROUP_ID
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -58,6 +60,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout_groups,
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
+from nemo_rl.models.policy import get_shared_prefix_training_config
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
@@ -1082,6 +1085,12 @@ class AsyncTrajectoryCollector:
     ) -> None:
         """Push one prompt group to the replay buffer with bounded backoff."""
         final_batch_cpu = rollout_result.final_batch.to("cpu")
+        if (
+            get_shared_prefix_training_config(self.master_config.policy).mode
+            != "disabled"
+        ):
+            group_id = f"async:{uuid.uuid4().hex}"
+            final_batch_cpu[SHARED_PREFIX_GROUP_ID] = [group_id] * final_batch_cpu.size
         rollout_metrics = rollout_result.rollout_metrics
 
         # Teacher inference is blocking. Keep it off this worker's event loop so

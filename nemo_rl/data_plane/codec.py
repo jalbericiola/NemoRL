@@ -307,7 +307,26 @@ def materialize(
             out[key] = arr
             continue
         if isinstance(val, NonTensorData):
-            out[key] = np.asarray([val.data], dtype=object)
+            payload = val.data
+            # TensorDict may represent a homogeneous per-row object column
+            # (for example the same stable rollout-group ID on every row) as
+            # one NonTensorData containing the entire vector, rather than a
+            # NonTensorStack. Preserve that outer batch dimension instead of
+            # wrapping it again into shape (1, N).
+            outer_batch_size = tuple(td.batch_size)
+            if (
+                len(outer_batch_size) == 1
+                and isinstance(payload, (list, tuple, np.ndarray))
+                and len(payload) == outer_batch_size[0]
+            ):
+                arr = np.empty(outer_batch_size[0], dtype=object)
+                for i, item in enumerate(payload):
+                    arr[i] = item
+                out[key] = arr
+            else:
+                arr = np.empty(1, dtype=object)
+                arr[0] = payload
+                out[key] = arr
             continue
         if not isinstance(val, torch.Tensor):
             raise TypeError(

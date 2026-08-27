@@ -19,6 +19,7 @@ import math
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
 import pytest
 import torch
 from tensordict import TensorDict
@@ -28,11 +29,22 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.shared_prefix_metrics import SharedPrefixOpportunity
+from nemo_rl.algorithms.single_controller import (
+    SingleControllerActor,
+    _reduce_shared_prefix_step_metrics,
+    _resolve_train_dispatch_group_multiple,
+    _train_selection_group_bounds,
+    _validate_train_dispatch_buffer_capacity,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
     MasterConfig,
+)
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_GROUP_ID,
+    SHARED_PREFIX_PROMPT_LENGTHS,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -347,6 +359,8 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
     )
+    ctrl._shared_prefix_training_config = SimpleNamespace(mode="disabled")
+    ctrl._step_shared_prefix_opportunities = []
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -365,6 +379,9 @@ def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
 
     assert has_valid_training_tokens
     assert data_plane.selected_fields is not None
+    assert "input_lengths" not in data_plane.selected_fields
+    assert SHARED_PREFIX_GROUP_ID not in data_plane.selected_fields
+    assert SHARED_PREFIX_PROMPT_LENGTHS not in data_plane.selected_fields
     assert "prev_logprobs" in data_plane.selected_fields
     assert "generation_logprobs" in data_plane.selected_fields
     assert data_plane.written_fields is not None
@@ -413,6 +430,8 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
+    ctrl._shared_prefix_training_config = SimpleNamespace(mode="disabled")
+    ctrl._step_shared_prefix_opportunities = []
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -473,6 +492,8 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=2.0)
     )
+    ctrl._shared_prefix_training_config = SimpleNamespace(mode="disabled")
+    ctrl._step_shared_prefix_opportunities = []
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -526,6 +547,8 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._master_config = SimpleNamespace(
         grpo=SimpleNamespace(seq_logprob_error_threshold=None)
     )
+    ctrl._shared_prefix_training_config = SimpleNamespace(mode="disabled")
+    ctrl._step_shared_prefix_opportunities = []
     ctrl._step_log_dict = {
         "rewards": [],
         "masked_advantages": [],
@@ -553,6 +576,124 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
         torch.zeros(batch_size, sequence_length),
     )
     assert "advantages" in (result_meta.fields or [])
+
+
+def test_advantage_stage_observes_exact_prompt_opportunity() -> None:
+    batch_size, sequence_length = 2, 5
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.tensor([[10, 11], [10, 11]]),
+            SHARED_PREFIX_GROUP_ID: np.asarray(
+                ["stable-group", "stable-group"], dtype=object
+            ),
+            SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([2, 2]),
+            "input_lengths": torch.tensor([5, 4]),
+            "total_reward": torch.tensor([1.0, 0.0]),
+            "token_mask": torch.tensor(
+                [
+                    [0.0, 0.0, 1.0, 1.0, 1.0],
+                    [0.0, 0.0, 1.0, 1.0, 0.0],
+                ]
+            ),
+            "sample_mask": torch.ones(batch_size),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = _MaskRecordingAdvantageEstimator()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(
+            seq_logprob_error_threshold=None,
+            num_generations_per_prompt=2,
+        )
+    )
+    ctrl._shared_prefix_training_config = SimpleNamespace(mode="observe")
+    ctrl._step_shared_prefix_opportunities = []
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["group_g0", "group_g1"],
+        fields=list(data.keys()),
+    )
+
+    _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert has_valid_training_tokens
+    assert data_plane.selected_fields is not None
+    assert "input_lengths" in data_plane.selected_fields
+    assert SHARED_PREFIX_GROUP_ID in data_plane.selected_fields
+    assert SHARED_PREFIX_PROMPT_LENGTHS in data_plane.selected_fields
+    assert len(ctrl._step_shared_prefix_opportunities) == 1
+    opportunity = ctrl._step_shared_prefix_opportunities[0]
+    assert opportunity.total_sequences == 2
+    assert opportunity.complete_groups == 1
+    assert opportunity.total_tokens == 9
+    assert opportunity.prompt_tokens == 4
+    assert opportunity.valid_loss_tokens == 5.0
+    assert opportunity.shareable_prompt_tokens == 2
+
+
+def test_reduce_shared_prefix_step_metrics_weights_streaming_chunks_exactly() -> None:
+    first = SharedPrefixOpportunity(
+        total_sequences=2,
+        eligible_sequences=2,
+        complete_groups=1,
+        fallback_sequences=0,
+        total_tokens=10,
+        prompt_tokens=4,
+        valid_loss_tokens=6.0,
+        non_loss_suffix_tokens=0.0,
+        shareable_prompt_tokens=2,
+        ideal_shared_token_work=8,
+        loss_ratio_upper_bound_saved_tokens=2.0,
+    )
+    second = SharedPrefixOpportunity(
+        total_sequences=2,
+        eligible_sequences=2,
+        complete_groups=1,
+        fallback_sequences=0,
+        total_tokens=14,
+        prompt_tokens=6,
+        valid_loss_tokens=8.0,
+        non_loss_suffix_tokens=0.0,
+        shareable_prompt_tokens=3,
+        ideal_shared_token_work=11,
+        loss_ratio_upper_bound_saved_tokens=3.0,
+    )
+
+    metrics = _reduce_shared_prefix_step_metrics(
+        [first, second],
+        expected_total_tokens=24.0,
+    )
+
+    assert metrics["total_num_tokens"] == 24
+    assert metrics["mean_prompt_length"] == pytest.approx(2.5)
+    assert metrics["shared_prefix/total_sequences"] == 4
+    assert metrics["shared_prefix/complete_groups"] == 2
+    assert metrics["shared_prefix/prompt_tokens"] == 10
+    assert metrics["shared_prefix/valid_loss_tokens"] == 14.0
+    assert metrics["shared_prefix/shareable_prompt_tokens"] == 5
+    assert metrics["shared_prefix/ideal_shared_token_work"] == 19
+    assert metrics["shared_prefix/ideal_token_work_speedup"] == pytest.approx(24 / 19)
+
+    with pytest.raises(RuntimeError, match="exact optimizer step"):
+        _reduce_shared_prefix_step_metrics(
+            [first, second],
+            expected_total_tokens=23,
+        )
 
 
 class _EmptySampler:
@@ -619,6 +760,23 @@ class _SequenceSampler(_EmptySampler):
         return self._metas.pop(0), 1
 
 
+class _ExactBoundsSampler(_EmptySampler):
+    def __init__(self, meta: KVBatchMeta, chunks: int) -> None:
+        self._meta = meta
+        self._remaining = chunks
+        self.bounds: list[tuple[int, int]] = []
+
+    async def select(self, **kwargs):
+        minimum = kwargs["min_prompt_groups"]
+        maximum = kwargs["max_prompt_groups"]
+        self.bounds.append((minimum, maximum))
+        if self._remaining == 0:
+            return None, 0
+        self._remaining -= 1
+        assert minimum == maximum
+        return self._meta, maximum
+
+
 class _EmptyBuffer:
     def __len__(self) -> int:
         return 0
@@ -683,6 +841,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._advantage_estimator = None
+    ctrl._shared_prefix_training_config = SimpleNamespace(mode="disabled")
+    ctrl._train_dispatch_group_multiple = 1
     ctrl._partition_id = "rollout_data"
     ctrl._sampler = sampler
     ctrl._buffer = _EmptyBuffer()
@@ -704,6 +864,7 @@ def _train_pump_controller(*, sampler) -> object:
         "masked_advantages": [],
         "sequence_lengths": [],
     }
+    ctrl._step_shared_prefix_opportunities = []
     return ctrl
 
 
@@ -713,6 +874,107 @@ def test_train_pump_stops_after_rollout_exhaustion_and_buffer_drain() -> None:
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._train_steps == 0
+
+
+@pytest.mark.parametrize("mode", ["disabled", "observe"])
+def test_non_train_mode_preserves_greedy_streaming_bounds(mode: str) -> None:
+    assert (
+        _resolve_train_dispatch_group_multiple(
+            shared_prefix_mode=mode,
+            num_prompts_per_step=5,
+            data_parallel_size=4,
+        )
+        == 1
+    )
+    assert _train_selection_group_bounds(
+        remaining_groups=8,
+        configured_min_groups=3,
+        group_multiple=1,
+    ) == (3, 8)
+
+
+def test_shared_prefix_train_rounds_streaming_minimum_to_exact_dp_width() -> None:
+    assert (
+        _resolve_train_dispatch_group_multiple(
+            shared_prefix_mode="train",
+            num_prompts_per_step=8,
+            data_parallel_size=2,
+        )
+        == 2
+    )
+    assert _train_selection_group_bounds(
+        remaining_groups=8,
+        configured_min_groups=3,
+        group_multiple=2,
+    ) == (4, 4)
+    assert _train_selection_group_bounds(
+        remaining_groups=2,
+        configured_min_groups=3,
+        group_multiple=2,
+    ) == (2, 2)
+
+
+def test_shared_prefix_train_rejects_non_dp_divisible_step_and_shortfall() -> None:
+    with pytest.raises(ValueError, match="num_prompts_per_step.*divisible"):
+        _resolve_train_dispatch_group_multiple(
+            shared_prefix_mode="train",
+            num_prompts_per_step=7,
+            data_parallel_size=2,
+        )
+    with pytest.raises(RuntimeError, match="remaining=3, DP=2"):
+        _train_selection_group_bounds(
+            remaining_groups=3,
+            configured_min_groups=1,
+            group_multiple=2,
+        )
+
+
+def test_shared_prefix_train_rejects_buffer_smaller_than_rounded_claim() -> None:
+    with pytest.raises(ValueError, match="rounds the streaming claim to 4"):
+        _validate_train_dispatch_buffer_capacity(
+            num_prompts_per_step=8,
+            configured_min_groups=3,
+            group_multiple=2,
+            max_buffered_rollouts=3,
+        )
+
+    _validate_train_dispatch_buffer_capacity(
+        num_prompts_per_step=8,
+        configured_min_groups=3,
+        group_multiple=2,
+        max_buffered_rollouts=4,
+    )
+
+
+def test_shared_prefix_train_pump_claims_only_exact_dp_divisible_chunks(
+    monkeypatch,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["a_g0", "a_g1", "b_g0", "b_g1"],
+        fields=[],
+        sequence_lengths=[1, 1, 1, 1],
+        tags=[{"weight_version": 0} for _ in range(4)],
+    )
+    sampler = _ExactBoundsSampler(meta, chunks=2)
+    ctrl = _train_pump_controller(sampler=sampler)
+    ctrl._master_config.grpo.num_prompts_per_step = 4
+    ctrl._shared_prefix_training_config = SimpleNamespace(mode="train")
+    ctrl._train_dispatch_group_multiple = 2
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    trainer = MagicMock(spec=_NoOpTrainer)
+    trainer.finish_train_step.return_value = {}
+    ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert sampler.bounds == [(2, 2), (2, 2)]
+    assert trainer.train_microbatches_from_meta.call_count == 2
+    assert ctrl._train_steps == 1
 
 
 def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:
@@ -927,6 +1189,63 @@ def test_train_pump_skips_empty_chunk_and_trains_later_valid_chunk(
     trainer.train_microbatches_from_meta.assert_called_once_with(valid_meta)
     trainer.finish_train_step.assert_called_once_with()
     assert ctrl._train_steps == 1
+
+
+def test_train_pump_observe_metrics_exclude_fully_filtered_chunk(
+    monkeypatch,
+) -> None:
+    """Observed token work must cover only chunks that entered the optimizer step."""
+    empty_meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["empty-sample"],
+        fields=[],
+        sequence_lengths=[5],
+        tags=[{"weight_version": 0}],
+    )
+    valid_meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["valid-sample"],
+        fields=[],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 0}],
+    )
+    ctrl = _train_pump_controller(sampler=_SequenceSampler([empty_meta, valid_meta]))
+    ctrl._shared_prefix_training_config = SimpleNamespace(mode="observe")
+    ctrl._advantage_stage = AsyncMock(
+        side_effect=[
+            (empty_meta, False),
+            (valid_meta, True),
+        ]
+    )
+    ctrl._step_shared_prefix_opportunities = [
+        SharedPrefixOpportunity(
+            total_sequences=1,
+            eligible_sequences=0,
+            complete_groups=0,
+            fallback_sequences=1,
+            total_tokens=3,
+            prompt_tokens=1,
+            valid_loss_tokens=2.0,
+            non_loss_suffix_tokens=0.0,
+            shareable_prompt_tokens=0,
+            ideal_shared_token_work=3,
+            loss_ratio_upper_bound_saved_tokens=0.0,
+        )
+    ]
+    trainer = MagicMock(spec=_NoOpTrainer)
+    trainer.finish_train_step.return_value = {}
+    ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["total_num_tokens"] == 3
+    assert train_metrics["shared_prefix/total_tokens"] == 3
 
 
 def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:

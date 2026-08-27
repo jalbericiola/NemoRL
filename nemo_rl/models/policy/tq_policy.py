@@ -38,6 +38,10 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_GROUP_ID,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -132,6 +136,17 @@ class TQPolicy(Policy):
             )
         )
 
+    def _with_shared_prefix_fields(
+        self, fields: tuple[str, ...] | list[str]
+    ) -> list[str]:
+        """Add opt-in metadata fields while preserving disabled-mode schemas."""
+        resolved = list(fields)
+        if self.shared_prefix_training_config.mode == "train":
+            for field in (SHARED_PREFIX_GROUP_ID, SHARED_PREFIX_PROMPT_LENGTHS):
+                if field not in resolved:
+                    resolved.append(field)
+        return resolved
+
     # ── lifecycle ──────────────────────────────────────────────────────
 
     def shutdown(self) -> bool:  # type: ignore[override]
@@ -160,8 +175,10 @@ class TQPolicy(Policy):
         """
         self.dp_client.register_partition(
             partition_id=self.tq_partition_id,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=self._with_shared_prefix_fields(
+                fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                )
             ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
@@ -291,9 +308,11 @@ class TQPolicy(Policy):
         spa, dba = self._packing_args("logprob_mb_tokens")
         lp_meta = replace(
             meta,
-            fields=fields_with_optional_routed_experts(
-                LP_SEED_FIELDS,
-                enabled=self._router_replay_enabled and include_router_replay,
+            fields=self._with_shared_prefix_fields(
+                fields_with_optional_routed_experts(
+                    LP_SEED_FIELDS,
+                    enabled=self._router_replay_enabled and include_router_replay,
+                )
             ),
             task_name=task_name,
         )
@@ -304,6 +323,9 @@ class TQPolicy(Policy):
                 batch_size=None,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
+                shared_prefix_groups=(
+                    self.shared_prefix_training_config.mode == "train"
+                ),
             )
         with timer.time(f"{timer_prefix}/submit_futures") if timer else nullcontext():
             futures = self.worker_group.run_all_workers_sharded_data(
@@ -399,8 +421,10 @@ class TQPolicy(Policy):
         # skipped this step (e.g. ``prev_logprobs`` under force_on_policy_ratio).
         train_meta = replace(
             meta,
-            fields=fields_with_optional_routed_experts(
-                train_fields, enabled=self._router_replay_enabled
+            fields=self._with_shared_prefix_fields(
+                fields_with_optional_routed_experts(
+                    train_fields, enabled=self._router_replay_enabled
+                )
             ),
             task_name="train",
         )
@@ -411,6 +435,9 @@ class TQPolicy(Policy):
                 batch_size=batch_size,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
+                shared_prefix_groups=(
+                    self.shared_prefix_training_config.mode == "train"
+                ),
             )
 
         if self.flops_tracker is not None:
@@ -523,8 +550,10 @@ class TQPolicy(Policy):
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = replace(
             meta,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=self._with_shared_prefix_fields(
+                fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                )
             ),
             task_name="train",
         )
@@ -535,6 +564,9 @@ class TQPolicy(Policy):
                 batch_size=None,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
+                shared_prefix_groups=(
+                    self.shared_prefix_training_config.mode == "train"
+                ),
             )
 
         if self.flops_tracker is not None:

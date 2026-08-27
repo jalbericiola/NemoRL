@@ -24,6 +24,10 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_GROUP_ID,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
 
@@ -32,12 +36,16 @@ def record_to_train_batch(
     record: PromptGroupRecord,
     *,
     pad_value_dict: Mapping[str, int],
+    include_shared_prefix_metadata: bool = False,
 ) -> BatchedDataDict[Any]:
     """Convert one prompt group's record into a packed BatchedDataDict of N rows.
 
     Args:
         record: Rollout's PromptGroupRecord with N completions to flatten into rows.
         pad_value_dict: Field-name → pad value used by batched_message_log_to_flat_message.
+        include_shared_prefix_metadata: Add the exact prompt length needed by
+            observation and shared-prefix training. Group identity is added by
+            :func:`pack_payload`, which owns the final sample-ID namespace.
 
     Returns:
         BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
@@ -93,6 +101,8 @@ def record_to_train_batch(
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
+    if include_shared_prefix_metadata:
+        train_data[SHARED_PREFIX_PROMPT_LENGTHS] = prompt_lengths
     return BatchedDataDict[Any](train_data)
 
 
@@ -101,6 +111,7 @@ def pack_payload(
     *,
     weight_version: int,
     group_id: str,
+    include_shared_prefix_metadata: bool = False,
 ) -> tuple[list[str], TensorDict, list[dict[str, Any]]]:
     """Pack a producer batch into (sample_ids, fields, tags) for put_samples.
 
@@ -108,6 +119,9 @@ def pack_payload(
         train_batch: Mapping with at least input_lengths plus the tensor/object fields to send.
         weight_version: Trainer weight version stamped on every row's tag.
         group_id: Per-group identifier used as the sample_id prefix; the caller owns uniqueness.
+        include_shared_prefix_metadata: Store the same stable group identity as
+            an object column for policy workers. Disabled mode keeps the legacy
+            payload schema byte-for-byte unchanged.
 
     Returns:
         sample_ids of the form {group_id}_g{i}, a jagged-packed TensorDict, and per-row tags.
@@ -120,6 +134,44 @@ def pack_payload(
         if isinstance(v, torch.Tensor)
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
+    if include_shared_prefix_metadata:
+        if not isinstance(lengths, torch.Tensor) or lengths.shape != (n,):
+            shape = (
+                tuple(lengths.shape)
+                if isinstance(lengths, (torch.Tensor, np.ndarray))
+                else None
+            )
+            raise ValueError(
+                "shared-prefix input lengths must be a dense tensor with "
+                f"shape ({n},), got {type(lengths).__name__} with shape {shape}"
+            )
+        prompt_lengths = tensor_fields.get(SHARED_PREFIX_PROMPT_LENGTHS)
+        if prompt_lengths is None:
+            raise ValueError(
+                "shared-prefix payload metadata requires prompt lengths from "
+                "record_to_train_batch"
+            )
+        if not isinstance(prompt_lengths, torch.Tensor) or prompt_lengths.shape != (n,):
+            shape = (
+                tuple(prompt_lengths.shape)
+                if isinstance(prompt_lengths, (torch.Tensor, np.ndarray))
+                else None
+            )
+            raise ValueError(
+                "shared-prefix prompt lengths must be a dense tensor with "
+                f"shape ({n},), got {type(prompt_lengths).__name__} with shape {shape}"
+            )
+        if torch.any(prompt_lengths < 0) or torch.any(prompt_lengths > lengths):
+            raise ValueError(
+                "shared-prefix prompt lengths must be nonnegative and no larger "
+                "than input_lengths"
+            )
+        if not group_id:
+            raise ValueError("shared-prefix group_id must be non-empty")
+        tensor_fields[SHARED_PREFIX_GROUP_ID] = np.asarray(
+            [group_id] * n,
+            dtype=object,
+        )
     fields_td = pack_jagged_fields(
         tensor_fields, lengths=lengths, token_aligned_fields=TOKEN_ALIGNED_FIELDS
     )

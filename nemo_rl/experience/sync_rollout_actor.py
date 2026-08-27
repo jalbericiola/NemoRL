@@ -43,6 +43,10 @@ import numpy as np
 import ray
 import torch
 
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_GROUP_ID,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
@@ -56,6 +60,7 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.policy import get_shared_prefix_training_config
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
@@ -397,6 +402,12 @@ class SyncRolloutActor:
         n_per_prompt = n_samples // n_prompts
         uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
         sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
+        if get_shared_prefix_training_config(cfg.policy).mode == "train":
+            bulk_batch[SHARED_PREFIX_GROUP_ID] = np.asarray(
+                [uid for uid in uids for _ in range(n_per_prompt)],
+                dtype=object,
+            )
+            bulk_batch[SHARED_PREFIX_PROMPT_LENGTHS] = length
         trace_rollout_payload(keys=sample_ids, data=bulk_batch)
         meta = kv_first_write(
             bulk_batch,

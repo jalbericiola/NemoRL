@@ -16,6 +16,7 @@ import json
 import os
 import time
 import warnings
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
@@ -56,6 +57,9 @@ from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
+from nemo_rl.algorithms.shared_prefix_metrics import (
+    observe_shared_prefix_opportunity,
+)
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
@@ -72,6 +76,11 @@ from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogT
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
+)
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_GROUP_ID,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+    stamp_repeated_group_ids,
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -120,7 +129,7 @@ from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import PolicyConfig, get_shared_prefix_training_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
@@ -2133,9 +2142,72 @@ def _preserve_router_replay_routed_experts(
         target["routed_experts"] = flat_messages["routed_experts"]
 
 
+def _stamp_shared_prefix_training_groups(
+    batch: BatchedDataDict[Any],
+    *,
+    policy_config: PolicyConfig,
+    group_size: int,
+    namespace: str,
+) -> None:
+    """Stamp stable IDs for exact observation and the training execution path."""
+    if get_shared_prefix_training_config(policy_config).mode == "disabled":
+        return
+    stamp_repeated_group_ids(
+        batch,
+        group_size=group_size,
+        namespace=namespace,
+    )
+
+
+def _preserve_shared_prefix_training_metadata(
+    target: BatchedDataDict[Any],
+    source: BatchedDataDict[Any],
+    policy_config: PolicyConfig,
+) -> None:
+    """Carry group identity and prompt boundaries through opt-in processing."""
+    if get_shared_prefix_training_config(policy_config).mode == "disabled":
+        return
+    if SHARED_PREFIX_GROUP_ID not in source:
+        raise ValueError(
+            "shared-prefix train mode requires stable prompt-group metadata, but "
+            f"the rollout batch is missing {SHARED_PREFIX_GROUP_ID!r}"
+        )
+    if "length" not in source:
+        raise ValueError(
+            "shared-prefix train mode requires rollout prompt lengths in 'length'"
+        )
+    target[SHARED_PREFIX_GROUP_ID] = source[SHARED_PREFIX_GROUP_ID]
+    target[SHARED_PREFIX_PROMPT_LENGTHS] = source["length"]
+
+
 def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
     """Resolve the configured policy precision to its matching torch dtype."""
     return getattr(torch, policy_config["precision"])
+
+
+def _get_shared_prefix_observation_metrics(
+    *,
+    policy_config: PolicyConfig,
+    expected_group_size: int,
+    group_ids: Sequence[str | None],
+    prompt_token_ids: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    input_lengths: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> dict[str, float | int]:
+    """Return opt-in opportunity metrics without changing batch execution."""
+    if get_shared_prefix_training_config(policy_config).mode == "disabled":
+        return {}
+    return observe_shared_prefix_opportunity(
+        group_ids=group_ids,
+        prompt_token_ids=prompt_token_ids,
+        prompt_lengths=prompt_lengths,
+        input_lengths=input_lengths,
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+        expected_group_size=expected_group_size,
+    ).as_metrics()
 
 
 def _build_async_grpo_train_data(
@@ -2155,6 +2227,7 @@ def _build_async_grpo_train_data(
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    _preserve_shared_prefix_training_metadata(train_data, repeated_batch, policy_config)
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(
         as_tensors=False, pixel_dtype=_policy_dtype(policy_config)
@@ -3032,6 +3105,15 @@ def grpo_train(
                     )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
+                _stamp_shared_prefix_training_groups(
+                    repeated_batch,
+                    policy_config=master_config.policy,
+                    group_size=master_config.grpo.num_generations_per_prompt,
+                    namespace=(
+                        f"sync:{current_epoch}:{total_steps}:"
+                        f"{dynamic_sampling_num_gen_batches}"
+                    ),
+                )
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.grpo.reward_scaling
                 )
@@ -3182,6 +3264,9 @@ def grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    _preserve_shared_prefix_training_metadata(
+                        train_data, repeated_batch, master_config.policy
+                    )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
@@ -3245,6 +3330,9 @@ def grpo_train(
                     _preserve_router_replay_routed_experts(
                         logprob_data, flat_messages, master_config.policy
                     )
+                    _preserve_shared_prefix_training_metadata(
+                        logprob_data, repeated_batch, master_config.policy
+                    )
 
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
@@ -3301,6 +3389,18 @@ def grpo_train(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
+                    metrics.update(
+                        _get_shared_prefix_observation_metrics(
+                            policy_config=master_config.policy,
+                            expected_group_size=master_config.grpo.num_generations_per_prompt,
+                            group_ids=repeated_batch[SHARED_PREFIX_GROUP_ID],
+                            prompt_token_ids=prompt_ids_for_adv,
+                            prompt_lengths=repeated_batch["length"],
+                            input_lengths=input_lengths,
+                            token_mask=token_mask,
+                            sample_mask=sample_mask,
+                        )
+                    )
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
@@ -4846,6 +4946,16 @@ def async_grpo_train(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
+                    shared_prefix_observation_metrics = _get_shared_prefix_observation_metrics(
+                        policy_config=master_config.policy,
+                        expected_group_size=master_config.grpo.num_generations_per_prompt,
+                        group_ids=repeated_batch[SHARED_PREFIX_GROUP_ID],
+                        prompt_token_ids=prompt_ids_for_adv,
+                        prompt_lengths=repeated_batch["length"],
+                        input_lengths=input_lengths,
+                        token_mask=token_mask,
+                        sample_mask=sample_mask,
+                    )
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
@@ -5083,6 +5193,7 @@ def async_grpo_train(
                 )
 
                 metrics = {
+                    **shared_prefix_observation_metrics,
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
                     "num_mask_sample_filtered": num_mask_sample_filtered,

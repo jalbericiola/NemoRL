@@ -88,6 +88,7 @@ from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
+from nemo_rl.models.policy import get_shared_prefix_training_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
@@ -796,6 +797,9 @@ def setup_single_controller(
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
         require_routed_experts=router_replay_enabled(policy_config),
+        include_shared_prefix_metadata=(
+            get_shared_prefix_training_config(policy_config).mode != "disabled"
+        ),
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,

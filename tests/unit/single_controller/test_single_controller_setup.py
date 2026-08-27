@@ -339,6 +339,15 @@ class TestSetup:
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
         assert actor_args.tq_buffer._require_routed_experts is False
+        assert actor_args.tq_buffer._include_shared_prefix_metadata is False
+
+    def test_observe_mode_enables_replay_payload_metadata(self, patched_factories):
+        mc = _make_master_config(colocated=True)
+        mc.policy["shared_prefix_training"] = {"mode": "observe"}
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.tq_buffer._include_shared_prefix_metadata is True
 
     def test_router_replay_requires_routes_in_tq_buffer(self, patched_factories):
         mc = _make_master_config(colocated=True)

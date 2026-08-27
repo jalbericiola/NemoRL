@@ -28,12 +28,14 @@ identity preserved across shards).
 from __future__ import annotations
 
 import torch
+import pytest
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_EXECUTION_SLOT
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import (
@@ -140,11 +142,72 @@ def test_shard_meta_for_dp_unsorted_round_trip():
     if unsorted is None:
         # No reorder happened — DP-rank concat IS the original order.
         return
-    # Build a tensor whose row i is i; permute via dispatch order; reorder back.
+    # Build a batch whose row value is its original index, concatenate in
+    # dispatch order, then exercise the same API used by Policy logprobs.
+    original_ids = _meta(n).sample_ids
     flat = [k for m in metas for k in m.sample_ids]
-    aggregated = torch.tensor([_meta(n).sample_ids.index(k) for k in flat])
-    restored = aggregated[torch.tensor(unsorted)]
-    assert restored.tolist() == list(range(n))
+    aggregated = BatchedDataDict(
+        {"row": torch.tensor([original_ids.index(k) for k in flat])}
+    )
+    aggregated.reorder_data(unsorted)
+    assert aggregated["row"].tolist() == list(range(n))
+
+
+def test_shard_meta_for_dp_keeps_shared_prefix_groups_coherent():
+    group_ids = ["a", "b", "c", "d"]
+    sample_ids = [
+        f"{group_id}_g{index}" for group_id in group_ids for index in range(2)
+    ]
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="train",
+        sample_ids=sample_ids,
+        fields=list(DP_TRAIN_FIELDS),
+        sequence_lengths=[9, 9, 8, 8, 2, 2, 1, 1],
+        tags=[{"row": index} for index in range(8)],
+    )
+
+    metas, unsorted = shard_meta_for_dp(
+        meta,
+        dp_world=2,
+        sequence_packing_args={
+            "max_tokens_per_microbatch": 10,
+            "sequence_length_pad_multiple": 1,
+        },
+        shared_prefix_groups=True,
+    )
+
+    assert [item.sample_ids for item in metas] == [
+        ["a_g0", "a_g1", "d_g0", "d_g1"],
+        ["b_g0", "b_g1", "c_g0", "c_g1"],
+    ]
+    assert [[tag["row"] for tag in item.tags or []] for item in metas] == [
+        [0, 1, 6, 7],
+        [2, 3, 4, 5],
+    ]
+    assert unsorted == [0, 1, 6, 7, 2, 3, 4, 5]
+    assert [item.extra_info[SHARED_PREFIX_EXECUTION_SLOT] for item in metas] == [
+        [0, 1, 1, 0],
+        [0, 1, 1, 0],
+    ]
+
+
+def test_shard_meta_for_dp_rejects_incomplete_generation_indices():
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="train",
+        sample_ids=["a_g0", "a_g2", "b_g0", "b_g1"],
+        fields=list(DP_TRAIN_FIELDS),
+        sequence_lengths=[2, 2, 1, 1],
+    )
+
+    with pytest.raises(ValueError, match="each generation index exactly once"):
+        shard_meta_for_dp(
+            meta,
+            dp_world=1,
+            sequence_packing_args={"max_tokens_per_microbatch": 10},
+            shared_prefix_groups=True,
+        )
 
 
 # ── meta utility helpers ──────────────────────────────────────────────

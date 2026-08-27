@@ -15,6 +15,10 @@
 
 from typing import Literal, Sequence
 
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
+
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
 Layout = Literal["padded", "jagged"]
 
@@ -77,6 +81,7 @@ ROUTED_EXPERTS_FIELD = "routed_experts"
 PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
     {
         INPUT_LENGTHS,
+        SHARED_PREFIX_PROMPT_LENGTHS,
         "total_reward",
         SAMPLE_MASK,
     }

@@ -50,6 +50,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     _clip_grpo_advantages,
     _create_advantage_estimator,
+    _get_shared_prefix_observation_metrics,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
@@ -71,6 +72,7 @@ from nemo_rl.algorithms.utils import (
     log_generation_metrics,
     print_performance_metrics,
 )
+from nemo_rl.data.packing.shared_prefix_metadata import group_id_from_sample_id
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
@@ -870,6 +872,22 @@ def grpo_train_sync(
                             seq_logprob_error_threshold=seq_logprob_error_threshold,
                         )
                     )
+
+                metrics.update(
+                    _get_shared_prefix_observation_metrics(
+                        policy_config=master_config.policy,
+                        expected_group_size=master_config.grpo.num_generations_per_prompt,
+                        group_ids=[
+                            group_id_from_sample_id(sample_id)
+                            for sample_id in meta.sample_ids
+                        ],
+                        prompt_token_ids=prompt_ids_for_adv,
+                        prompt_lengths=length,
+                        input_lengths=input_lengths,
+                        token_mask=token_mask,
+                        sample_mask=sample_mask,
+                    )
+                )
 
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)

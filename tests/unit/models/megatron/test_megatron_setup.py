@@ -1978,6 +1978,214 @@ class TestValidateTrainingConfig:
 
 
 @pytest.mark.mcore
+class TestValidateSharedPrefixModelCapability:
+    """Tests for the late shared-prefix provider and MCore capability gate."""
+
+    @staticmethod
+    def _supported_model_cfg() -> Any:
+        from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
+
+        model_cfg = HybridModelProvider.__new__(HybridModelProvider)
+        model_cfg.sequence_parallel = False
+        model_cfg.recompute_granularity = None
+        model_cfg.recompute_modules = []
+        model_cfg.mtp_num_layers = 0
+        model_cfg.cuda_graph_impl = "none"
+        model_cfg.fp8 = None
+        model_cfg.fp4 = None
+        model_cfg.bf16 = True
+        model_cfg.fp16 = False
+        model_cfg.attention_dropout = 0.0
+        model_cfg.hidden_dropout = 0.0
+        model_cfg.window_size = None
+        model_cfg.position_embedding_type = "rope"
+        model_cfg.multi_latent_attention = False
+        model_cfg.softmax_type = "vanilla"
+        model_cfg.fine_grained_activation_offloading = False
+        model_cfg.qk_clip = False
+        model_cfg.log_max_attention_logit = False
+        model_cfg.num_moe_experts = 8
+        model_cfg.moe_router_load_balancing_type = "none"
+        model_cfg.moe_aux_loss_coeff = 0.0
+        model_cfg.moe_z_loss_coeff = None
+        model_cfg.moe_input_jitter_eps = None
+        model_cfg.moe_expert_capacity_factor = None
+        model_cfg.moe_router_enable_expert_bias = False
+        model_cfg.moe_router_force_load_balancing = False
+        model_cfg.moe_router_force_biased = None
+        return model_cfg
+
+    def test_observe_does_not_require_a_hybrid_provider(self):
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "observe"}}
+
+        _validate_shared_prefix_model_capability(config, object())
+
+    def test_train_rejects_non_hybrid_provider(self):
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+
+        with pytest.raises(NotImplementedError, match="HybridModelProvider"):
+            _validate_shared_prefix_model_capability(config, object())
+
+    @pytest.mark.parametrize("capability", [None, "hybrid_star_v1"])
+    def test_train_rejects_incompatible_mcore_capability(self, capability):
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=capability,
+            ),
+            pytest.raises(NotImplementedError, match="hybrid_star_cp1_tp1_v1"),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_accepts_explicit_end_to_end_mcore_capability(self):
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+
+        with patch(
+            "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+            return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    @pytest.mark.parametrize(
+        "attribute,value,expected_error",
+        [
+            ("sequence_parallel", True, "policy.megatron_cfg.sequence_parallel"),
+            ("recompute_granularity", "full", "recompute_granularity='full'"),
+            ("mtp_num_layers", 1, "policy.megatron_cfg.mtp_num_layers"),
+            ("cuda_graph_impl", "local", "policy.megatron_cfg.cuda_graph_impl"),
+            ("fp8", "e4m3", "policy.megatron_cfg.fp8_cfg.enabled"),
+            ("fp4", "e2m1", "policy.quant_cfg=null"),
+            ("attention_dropout", 0.1, "model_cfg.attention_dropout=0.0"),
+            ("hidden_dropout", 0.1, "model_cfg.hidden_dropout=0.0"),
+            ("window_size", (1023, 0), "sliding-window attention"),
+            ("position_embedding_type", "yarn", "requires standard RoPE"),
+            ("multi_latent_attention", True, "multi_latent_attention=true"),
+            ("softmax_type", "off-by-one", "softmax_type='vanilla'"),
+            (
+                "fine_grained_activation_offloading",
+                True,
+                "fine_grained_activation_offloading=false",
+            ),
+            ("qk_clip", True, "model_cfg.qk_clip=false"),
+            (
+                "log_max_attention_logit",
+                True,
+                "model_cfg.log_max_attention_logit=false",
+            ),
+            (
+                "moe_router_enable_expert_bias",
+                True,
+                "expert-bias token accounting",
+            ),
+            (
+                "moe_router_load_balancing_type",
+                "aux_loss",
+                "moe_router_load_balancing_type='none'",
+            ),
+            ("moe_aux_loss_coeff", 0.01, "moe_aux_loss_coeff=0.0"),
+            ("moe_z_loss_coeff", 0.01, "moe_z_loss_coeff"),
+            ("moe_input_jitter_eps", 0.01, "moe_input_jitter_eps"),
+            ("moe_expert_capacity_factor", 1.0, "moe_expert_capacity_factor=null"),
+            (
+                "moe_router_force_load_balancing",
+                True,
+                "moe_router_force_load_balancing=false",
+            ),
+            (
+                "moe_router_force_biased",
+                0.25,
+                "moe_router_force_biased=null",
+            ),
+        ],
+    )
+    def test_train_rejects_resolved_adapter_restrictions(
+        self, attribute: str, value: Any, expected_error: str
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        setattr(model_cfg, attribute, value)
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            ),
+            pytest.raises(NotImplementedError, match=expected_error),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_ignores_dormant_moe_fields_for_dense_model(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.num_moe_experts = None
+        model_cfg.moe_router_load_balancing_type = "aux_loss"
+        model_cfg.moe_aux_loss_coeff = 0.1
+        model_cfg.moe_z_loss_coeff = 0.1
+        model_cfg.moe_input_jitter_eps = 0.1
+        model_cfg.moe_expert_capacity_factor = 1.0
+        model_cfg.moe_router_enable_expert_bias = True
+        model_cfg.moe_router_force_load_balancing = True
+        model_cfg.moe_router_force_biased = 0.25
+
+        with patch(
+            "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+            return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_rejects_selective_core_attention_recompute(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.recompute_granularity = "selective"
+        model_cfg.recompute_modules = ["core_attn"]
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            ),
+            pytest.raises(NotImplementedError, match="core-attention recompute"),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+
+@pytest.mark.mcore
 class TestValidateDtypeConfig:
     """Tests for _validate_dtype_config function."""
 

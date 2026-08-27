@@ -14,8 +14,15 @@
 
 from __future__ import annotations
 
+import numpy as np
+import pytest
 import torch
 
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_GROUP_ID,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
+from nemo_rl.data_plane.codec import materialize
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
@@ -150,6 +157,114 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
         group_id="group",
     )
     assert "routed_experts" not in fields
+
+
+def test_shared_prefix_payload_metadata_is_explicitly_opt_in() -> None:
+    # Keep the optional TransferQueue runtime out of payload-test collection.
+    from nemo_rl.data_plane.adapters.transfer_queue import (
+        _from_wire,
+        _promote_1d_leaves,
+    )
+
+    record = _record(
+        [
+            _completion(route_start=10, reward=1.0),
+            _completion(route_start=30, reward=2.0),
+        ]
+    )
+
+    disabled_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+    assert set(disabled_batch) == {
+        "input_ids",
+        "input_lengths",
+        "generation_logprobs",
+        "token_mask",
+        "sample_mask",
+        "prompt_ids_for_adv",
+        "total_reward",
+        "routed_experts",
+    }
+    _, disabled_fields, _ = pack_payload(
+        disabled_batch,
+        weight_version=3,
+        group_id="group",
+    )
+    assert set(disabled_fields.keys()) == set(disabled_batch)
+
+    observed_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_shared_prefix_metadata=True,
+    )
+    assert observed_batch[SHARED_PREFIX_PROMPT_LENGTHS].tolist() == [2, 2]
+    _, observed_fields, _ = pack_payload(
+        observed_batch,
+        weight_version=3,
+        group_id="group",
+        include_shared_prefix_metadata=True,
+    )
+    wire_fields = _promote_1d_leaves(observed_fields)
+    assert wire_fields[SHARED_PREFIX_PROMPT_LENGTHS].shape == (2, 1)
+    restored_fields = _from_wire(wire_fields)
+    assert restored_fields[SHARED_PREFIX_PROMPT_LENGTHS].shape == (2,)
+
+    materialized = materialize(restored_fields)
+    group_ids = materialized[SHARED_PREFIX_GROUP_ID]
+    assert isinstance(group_ids, np.ndarray)
+    assert group_ids.dtype == object
+    assert group_ids.tolist() == ["group", "group"]
+    assert materialized[SHARED_PREFIX_PROMPT_LENGTHS].shape == (2,)
+    assert materialized[SHARED_PREFIX_PROMPT_LENGTHS].tolist() == [2, 2]
+
+
+def test_shared_prefix_payload_rejects_missing_prompt_lengths() -> None:
+    train_batch = record_to_train_batch(
+        _record([_completion(route_start=10, reward=1.0)]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+
+    with pytest.raises(ValueError, match="requires prompt lengths"):
+        pack_payload(
+            train_batch,
+            weight_version=3,
+            group_id="group",
+            include_shared_prefix_metadata=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("prompt_lengths", "match"),
+    [
+        (torch.tensor([[2], [2]]), r"shape \(2,\)"),
+        (torch.tensor([2, 6]), "no larger than input_lengths"),
+    ],
+)
+def test_shared_prefix_payload_rejects_invalid_prompt_lengths(
+    prompt_lengths: torch.Tensor,
+    match: str,
+) -> None:
+    train_batch = record_to_train_batch(
+        _record(
+            [
+                _completion(route_start=10, reward=1.0),
+                _completion(route_start=30, reward=2.0),
+            ]
+        ),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_shared_prefix_metadata=True,
+    )
+    train_batch[SHARED_PREFIX_PROMPT_LENGTHS] = prompt_lengths
+
+    with pytest.raises(ValueError, match=match):
+        pack_payload(
+            train_batch,
+            weight_version=3,
+            group_id="group",
+            include_shared_prefix_metadata=True,
+        )
 
 
 def _failed_completion() -> Completion:
