@@ -1987,6 +1987,9 @@ class TestValidateSharedPrefixModelCapability:
 
         model_cfg = HybridModelProvider.__new__(HybridModelProvider)
         model_cfg.sequence_parallel = False
+        model_cfg.tensor_model_parallel_size = 1
+        model_cfg.pipeline_model_parallel_size = 1
+        model_cfg.context_parallel_size = 1
         model_cfg.recompute_granularity = None
         model_cfg.recompute_modules = []
         model_cfg.mtp_num_layers = 0
@@ -2064,6 +2067,75 @@ class TestValidateSharedPrefixModelCapability:
         with patch(
             "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
             return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_cp_train_rejects_cp1_only_mcore_capability(self):
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.context_parallel_size = 2
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            ),
+            pytest.raises(NotImplementedError, match="hybrid_star_cp_v1.*CP=2"),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_cp_train_accepts_distinct_end_to_end_mcore_capability(self):
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_CP_TRAINING_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.context_parallel_size = 2
+
+        with patch(
+            "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+            return_value={
+                SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+                SUPPORTED_SHARED_PREFIX_CP_TRAINING_CAPABILITY,
+            },
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    @pytest.mark.parametrize(
+        "attribute,value",
+        [
+            ("tensor_model_parallel_size", 2),
+            ("pipeline_model_parallel_size", 2),
+        ],
+    )
+    def test_train_rejects_resolved_tp_or_pp_topology(
+        self,
+        attribute: str,
+        value: int,
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        setattr(model_cfg, attribute, value)
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            ),
+            pytest.raises(NotImplementedError, match="TP1/PP1"),
         ):
             _validate_shared_prefix_model_capability(config, model_cfg)
 

@@ -210,9 +210,9 @@ def _require_equal_shared_prefix_execution_count(
 ) -> int:
     """Require every model-world rank to execute the same number of forwards.
 
-    PP/TP/CP are all one in the first shared-prefix topology, so the default
-    process group is exactly the full set of ranks whose forward schedules must
-    agree. A masked dummy forward is not a safe balancing mechanism here:
+    PP and TP are one in the supported shared-prefix topology, while CP may be
+    greater than one. The default process group is the full model world whose
+    forward schedules must agree. A masked dummy forward is not safe here:
     Hybrid MoE layers can attach router auxiliary losses inside the model that
     are independent of the outer token/sample loss masks.
     """

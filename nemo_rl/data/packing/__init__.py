@@ -39,12 +39,15 @@ from nemo_rl.data.packing.shared_prefix_metadata import (
     plan_group_coherent_shards,
 )
 from nemo_rl.data.packing.shared_prefix_tensors import (
+    SharedPrefixContextParallelShard,
     SharedPrefixTensorBin,
     SharedPrefixTensorIndices,
     SharedPrefixTensorPlan,
     build_shared_prefix_tensor_plan,
     build_star_attention_allow_mask,
+    get_shared_prefix_context_parallel_indices,
     materialize_shared_prefix_layout,
+    shard_shared_prefix_tensor_bin_for_context_parallel,
 )
 
 __all__ = [
@@ -60,6 +63,7 @@ __all__ = [
     "PackingMetrics",
     "SharedPrefixFallback",
     "SharedPrefixFallbackReason",
+    "SharedPrefixContextParallelShard",
     "SharedPrefixLayout",
     "SharedPrefixPlan",
     "SharedPrefixRow",
@@ -70,8 +74,10 @@ __all__ = [
     "build_shared_prefix_layout",
     "build_shared_prefix_tensor_plan",
     "build_star_attention_allow_mask",
+    "get_shared_prefix_context_parallel_indices",
     "materialize_shared_prefix_layout",
     "plan_fixed_execution_slots",
     "plan_group_coherent_shards",
     "plan_shared_prefix_bins",
+    "shard_shared_prefix_tensor_bin_for_context_parallel",
 ]

@@ -143,6 +143,71 @@ def test_shared_prefix_microbatch_materializes_one_star_without_dense_mask():
     assert microbatch.packed_seq_params is None
 
 
+def test_shared_prefix_microbatch_uses_context_parallel_zigzag_shard():
+    from nemo_rl.data.packing.shared_prefix_metadata import (
+        SHARED_PREFIX_EXECUTION_SLOT,
+        SHARED_PREFIX_GROUP_ID,
+        SHARED_PREFIX_PROMPT_LENGTHS,
+    )
+    from nemo_rl.models.megatron.data import (
+        SHARED_PREFIX_SOURCE_ROW_INDEX,
+        process_shared_prefix_microbatch,
+    )
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [
+                    [10, 11, 12, 20, 21, 0],
+                    [10, 11, 12, 30, 31, 32],
+                ]
+            ),
+            "input_lengths": torch.tensor([5, 6]),
+            SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([3, 3]),
+            SHARED_PREFIX_GROUP_ID: ["g", "g"],
+            SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0]),
+            SHARED_PREFIX_SOURCE_ROW_INDEX: torch.tensor([0, 1]),
+        }
+    )
+    cfg = {
+        "make_sequence_length_divisible_by": 4,
+        "megatron_cfg": {"context_parallel_size": 2},
+        "sequence_packing": {"enabled": True, "algorithm": "ffd"},
+    }
+
+    with patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_rank",
+        return_value=1,
+    ):
+        processed = list(
+            process_shared_prefix_microbatch(
+                data_dict=batch,
+                cfg=cfg,
+                bin_capacity=16,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=4,
+                pad_packed_seq_to_multiple_of=1,
+                pad_full_seq_to=None,
+                straggler_timer=None,
+            )
+        )
+
+    assert len(processed) == 1
+    microbatch = processed[0]
+    torch.testing.assert_close(
+        microbatch.input_ids_cp_sharded,
+        torch.tensor([[12, 30, 31, 32]]),
+    )
+    torch.testing.assert_close(
+        microbatch.position_ids,
+        torch.tensor([[2, 3, 4, 5]]),
+    )
+    assert microbatch.shared_prefix is not None
+    assert microbatch.shared_prefix.cp_rank == 1
+    assert microbatch.shared_prefix.cp_size == 2
+    assert microbatch.shared_prefix.padded_total_length == 8
+
+
 def test_shared_prefix_microbatch_mixes_star_and_fallback_without_row_loss():
     """Every source row must appear exactly once across expanded forwards."""
     from nemo_rl.data.packing.shared_prefix_metadata import (

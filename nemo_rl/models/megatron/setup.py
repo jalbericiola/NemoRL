@@ -263,6 +263,7 @@ from nemo_rl.models.value.config import ValueConfig
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY = "hybrid_star_cp1_tp1_v1"
+SUPPORTED_SHARED_PREFIX_CP_TRAINING_CAPABILITY = "hybrid_star_cp_v1"
 
 
 def destroy_parallel_state():
@@ -437,16 +438,55 @@ def validate_and_set_config(
     )
 
 
-def _get_mcore_shared_prefix_training_capability() -> str | None:
-    """Return MCore's explicit end-to-end shared-prefix capability, if present."""
+def _get_mcore_shared_prefix_training_capability() -> frozenset[str]:
+    """Return MCore's explicit end-to-end shared-prefix capabilities.
+
+    Older CP1 ports export the scalar ``SHARED_PREFIX_TRAINING_CAPABILITY``.
+    CP-capable ports retain that scalar for compatibility and additionally
+    export ``SHARED_PREFIX_TRAINING_CAPABILITIES`` so CP1 and CP>1 support can
+    be negotiated independently.
+    """
     # Stock MCore and kernel-only ports intentionally lack this integration module.
     try:
-        from megatron.core.models.hybrid.shared_prefix import (
-            SHARED_PREFIX_TRAINING_CAPABILITY,
-        )
+        from megatron.core.models.hybrid import shared_prefix as mcore_shared_prefix
     except ImportError:
-        return None
-    return SHARED_PREFIX_TRAINING_CAPABILITY
+        return frozenset()
+
+    advertised = getattr(
+        mcore_shared_prefix,
+        "SHARED_PREFIX_TRAINING_CAPABILITIES",
+        None,
+    )
+    if advertised is None:
+        scalar = getattr(
+            mcore_shared_prefix,
+            "SHARED_PREFIX_TRAINING_CAPABILITY",
+            None,
+        )
+        return frozenset() if scalar is None else frozenset((scalar,))
+    if isinstance(advertised, str):
+        return frozenset((advertised,))
+    return frozenset(advertised)
+
+
+def _normalize_shared_prefix_training_capabilities(
+    advertised: object,
+) -> frozenset[str]:
+    """Normalize legacy scalar and new multi-capability test/runtime values."""
+    if advertised is None:
+        return frozenset()
+    if isinstance(advertised, str):
+        return frozenset((advertised,))
+    try:
+        capabilities = frozenset(advertised)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(
+            "MCore shared-prefix capabilities must be a string or an iterable "
+            "of strings"
+        ) from error
+    if any(not isinstance(item, str) for item in capabilities):
+        raise TypeError("MCore shared-prefix capabilities must contain only strings")
+    return capabilities
 
 
 def _validate_shared_prefix_model_capability(
@@ -465,13 +505,34 @@ def _validate_shared_prefix_model_capability(
             f"{type(model_cfg).__name__}."
         )
 
-    capability = _get_mcore_shared_prefix_training_capability()
-    if capability != SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY:
-        detected_capability = capability if capability is not None else "none"
+    tp_size = int(getattr(model_cfg, "tensor_model_parallel_size", 1))
+    pp_size = int(getattr(model_cfg, "pipeline_model_parallel_size", 1))
+    cp_size = int(getattr(model_cfg, "context_parallel_size", 1))
+    if tp_size != 1 or pp_size != 1:
+        raise NotImplementedError(
+            "policy.shared_prefix_training.mode=train currently requires a "
+            "resolved TP1/PP1 Hybrid model; got "
+            f"TP={tp_size}, PP={pp_size}."
+        )
+    if cp_size < 1:
+        raise ValueError(
+            f"resolved context_parallel_size must be positive, got {cp_size}"
+        )
+
+    required_capability = (
+        SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY
+        if cp_size == 1
+        else SUPPORTED_SHARED_PREFIX_CP_TRAINING_CAPABILITY
+    )
+    capabilities = _normalize_shared_prefix_training_capabilities(
+        _get_mcore_shared_prefix_training_capability()
+    )
+    if required_capability not in capabilities:
+        detected_capability = sorted(capabilities) if capabilities else "none"
         raise NotImplementedError(
             "policy.shared_prefix_training.mode=train requires an MCore build "
             "with end-to-end shared-prefix Hybrid model dispatch capability "
-            f"{SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY!r}; detected "
+            f"{required_capability!r} for resolved CP={cp_size}; detected "
             f"{detected_capability!r}. Kernel-only ports do not satisfy this "
             "training capability. Use mode=observe until the model integration "
             "is installed."

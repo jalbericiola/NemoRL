@@ -43,11 +43,11 @@ class SharedPrefixTensorIndices:
 
 @dataclass(frozen=True, slots=True)
 class SharedPrefixTensorBin:
-    """One unpadded, prompt-once CP1 star ready for a backend adapter.
+    """One unpadded, prompt-once global star ready for a backend adapter.
 
     When materialized, ``attention_allow_mask`` is a dense boolean
     ``[tokens, tokens]`` reference mask where ``True`` means attention is
-    allowed. It is intended as the exact CP1 correctness oracle; production
+    allowed. It is intended as the exact global correctness oracle; production
     long-context paths leave it as ``None`` and lower ``layout`` to fused
     structured attention instead of constructing this quadratic mask.
     """
@@ -72,12 +72,128 @@ class SharedPrefixTensorPlan:
         return tuple(fallback.row.row_index for fallback in self.fallbacks)
 
 
+@dataclass(frozen=True, slots=True)
+class SharedPrefixContextParallelShard:
+    """One standard zigzag CP shard of a padded shared-prefix star.
+
+    ``global_token_indices`` maps the local sequence dimension back to the
+    padded global physical order.  Real tokens occupy
+    ``[0, tensor_bin.layout.total_length)``; any trailing positions are causal
+    padding and are not represented in the logical star layout.
+    """
+
+    packed_input_ids: torch.Tensor
+    position_ids: torch.Tensor
+    global_token_indices: torch.Tensor
+    padded_total_length: int
+
+
+def get_shared_prefix_context_parallel_indices(
+    padded_total_length: int,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Return standard two-chunk causal CP indices in rank-local order.
+
+    Rank ``r`` owns global chunk ``r`` followed by chunk ``2*CP-r-1``.  This
+    is the same zigzag sequence ownership used by NeMo-RL's conventional MCore
+    path, expressed explicitly so the shared-prefix output fan-out can route
+    only scalar log-probabilities instead of gathering vocabulary logits.
+    """
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be positive, got {cp_size}")
+    if cp_rank < 0 or cp_rank >= cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
+    if padded_total_length < 1:
+        raise ValueError(
+            f"padded_total_length must be positive, got {padded_total_length}"
+        )
+    if cp_size == 1:
+        return torch.arange(
+            padded_total_length,
+            dtype=torch.long,
+            device=device,
+        )
+    alignment = 2 * cp_size
+    if padded_total_length % alignment != 0:
+        raise ValueError(
+            "shared-prefix CP length must be divisible by 2 * cp_size: "
+            f"{padded_total_length} % {alignment} != 0"
+        )
+
+    chunk_length = padded_total_length // alignment
+    first_chunk = cp_rank
+    second_chunk = alignment - cp_rank - 1
+    first = torch.arange(
+        first_chunk * chunk_length,
+        (first_chunk + 1) * chunk_length,
+        dtype=torch.long,
+        device=device,
+    )
+    second = torch.arange(
+        second_chunk * chunk_length,
+        (second_chunk + 1) * chunk_length,
+        dtype=torch.long,
+        device=device,
+    )
+    return torch.cat((first, second), dim=0)
+
+
+def shard_shared_prefix_tensor_bin_for_context_parallel(
+    tensor_bin: SharedPrefixTensorBin,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    padding_token_id: int = 0,
+) -> SharedPrefixContextParallelShard:
+    """Pad and shard a materialized star for MCore context parallelism.
+
+    The logical layout remains unpadded.  Padding is appended after all real
+    branches, so causality guarantees that it cannot influence a real token; the
+    MCore forest adapter masks padded queries/keys and NeMo-RL never selects
+    their logits for the loss.
+    """
+    total_length = tensor_bin.layout.total_length
+    alignment = 1 if cp_size == 1 else 2 * cp_size
+    padded_total_length = ((total_length + alignment - 1) // alignment) * alignment
+    pad_length = padded_total_length - total_length
+
+    packed_input_ids = tensor_bin.packed_input_ids
+    position_ids = tensor_bin.position_ids
+    if pad_length:
+        packed_input_ids = torch.nn.functional.pad(
+            packed_input_ids,
+            (0, pad_length),
+            value=padding_token_id,
+        )
+        position_ids = torch.nn.functional.pad(
+            position_ids,
+            (0, pad_length),
+            value=0,
+        )
+
+    global_token_indices = get_shared_prefix_context_parallel_indices(
+        padded_total_length,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        device=packed_input_ids.device,
+    )
+    return SharedPrefixContextParallelShard(
+        packed_input_ids=packed_input_ids.index_select(0, global_token_indices),
+        position_ids=position_ids.index_select(0, global_token_indices),
+        global_token_indices=global_token_indices,
+        padded_total_length=padded_total_length,
+    )
+
+
 def build_star_attention_allow_mask(
     layout: SharedPrefixLayout,
     *,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
-    """Materialize the exact dense causal allow-mask for one CP1 star.
+    """Materialize the exact dense causal allow-mask for one global star.
 
     Prompt queries attend causally within the prompt. A completion query attends
     every prompt token and causally within its own suffix, but never a sibling
@@ -95,7 +211,7 @@ def build_star_attention_allow_mask(
             completion region.
     """
     if layout.prompt_length < 1 or len(layout.row_indices) < 2:
-        raise ValueError("a CP1 star requires a prompt and at least two rows")
+        raise ValueError("a shared-prefix star requires a prompt and at least two rows")
     if len(layout.branch_starts) != len(layout.completion_lengths):
         raise ValueError("branch_starts and completion_lengths must have equal length")
 
@@ -150,13 +266,13 @@ def materialize_shared_prefix_layout(
         input_ids: Integer token tensor with shape ``[batch, sequence]``.
         input_lengths: Unpadded source-row lengths with shape ``[batch]``.
         layout: Planner output whose row indices address ``input_ids``.
-        materialize_attention_mask: Whether to build the dense CP1 correctness
+        materialize_attention_mask: Whether to build the dense global correctness
             oracle. Fused backends should disable it and lower ``layout``
             directly so long-context execution does not allocate ``O(T^2)``
             storage.
 
     Returns:
-        Unpadded packed tokens, prefix-continued positions, exact CP1 allow-mask,
+        Unpadded packed tokens, prefix-continued positions, exact global allow-mask,
         and tensorized gather/fan-out/scatter indices on ``input_ids.device``.
 
     Raises:
@@ -275,7 +391,7 @@ def build_shared_prefix_tensor_plan(
         bin_capacity: Maximum deduplicated token count per shared bin.
         max_completions_per_bin: Maximum branches per shared bin.
         materialize_attention_mask: Whether each tensor bin should include the
-            dense CP1 reference mask. Set to ``False`` for fused model adapters
+            dense global reference mask. Set to ``False`` for fused model adapters
             that consume the structured layout directly.
 
     Returns:

@@ -18,6 +18,7 @@ from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed.nn.functional
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -46,6 +47,7 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.data.packing import get_shared_prefix_context_parallel_indices
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -153,8 +155,8 @@ def model_forward(
         media_token_validity_mask: Which media-token positions actually anchor a
             projected feature, already in this model's token layout. Only passed
             when the model accepts it; otherwise the model derives its own.
-        shared_prefix: Structured Hybrid star layout for the explicit CP1/TP1
-            shared-prefix model path.
+        shared_prefix: Structured Hybrid star layout and CP ownership metadata
+            for the capability-negotiated TP1 shared-prefix model path.
         shared_prefix_train_mode: Whether the forward is part of a
             shared-prefix train schedule, including conventional fallback units.
 
@@ -251,12 +253,13 @@ def shared_prefix_next_token_logprobs(
 ) -> torch.Tensor:
     """Extract and scatter a star's next-token logprobs without logit fan-out.
 
-    The packed Hybrid forward returns ``[1, packed_tokens, vocab]``. Expanding
-    that tensor to conventional ``[branches, sequence, vocab]`` defeats most of
-    the shared-prefix memory saving, so this function gathers only the predictor
-    rows needed for next-token probabilities. Vocabulary work is bounded to
-    ``chunk_size`` predictor rows at a time, and only scalar logprobs are fanned
-    out to the conventional ``[branches, sequence - 1]`` loss layout.
+    The packed Hybrid forward returns ``[1, packed_tokens / CP, vocab]`` in the
+    standard rank-local zigzag order. Expanding or CP-gathering that tensor to
+    conventional ``[branches, sequence, vocab]`` defeats most of the
+    shared-prefix memory saving, so this function gathers only the predictor
+    rows owned locally. Vocabulary work is bounded to ``chunk_size`` predictor
+    rows at a time; only selected scalar logprobs cross CP ranks before fan-out
+    to the conventional ``[branches, sequence - 1]`` loss layout.
 
     Prompt predictions are evaluated once and broadcast as scalars. Completion
     predictions follow the planner's predecessor/scatter metadata, including
@@ -266,15 +269,49 @@ def shared_prefix_next_token_logprobs(
     """
     if packed_logits.ndim != 3 or packed_logits.shape[0] != 1:
         raise ValueError(
-            "shared-prefix Hybrid logits must have shape [1, tokens, vocab], "
+            "shared-prefix Hybrid logits must have shape [1, local_tokens, vocab], "
             f"got {tuple(packed_logits.shape)}"
         )
     tensor_bin = shared_prefix.tensor_bin
     layout = tensor_bin.layout
-    if packed_logits.shape[1] != layout.total_length:
+    cp_size = shared_prefix.cp_size
+    cp_rank = shared_prefix.cp_rank
+    if cp_size < 1 or cp_rank < 0 or cp_rank >= cp_size:
         raise ValueError(
-            "shared-prefix Hybrid output token count does not match its layout: "
-            f"{packed_logits.shape[1]} != {layout.total_length}"
+            "invalid shared-prefix context-parallel topology: "
+            f"cp_rank={cp_rank}, cp_size={cp_size}"
+        )
+    padded_total_length = (
+        layout.total_length
+        if shared_prefix.padded_total_length is None
+        else shared_prefix.padded_total_length
+    )
+    if padded_total_length < layout.total_length:
+        raise ValueError(
+            "shared-prefix padded length is shorter than the logical layout: "
+            f"{padded_total_length} < {layout.total_length}"
+        )
+    if cp_size == 1 and padded_total_length != layout.total_length:
+        raise ValueError(
+            "shared-prefix CP1 output cannot contain physical padding: "
+            f"{padded_total_length} != {layout.total_length}"
+        )
+    if cp_size > 1 and (
+        padded_total_length % (2 * cp_size) != 0
+        or padded_total_length - layout.total_length >= 2 * cp_size
+    ):
+        raise ValueError(
+            "shared-prefix CP output must use the minimal trailing pad to a "
+            "2 * cp_size multiple: "
+            f"physical={padded_total_length}, logical={layout.total_length}, "
+            f"cp_size={cp_size}"
+        )
+    expected_local_length = padded_total_length // cp_size
+    if packed_logits.shape[1] != expected_local_length:
+        raise ValueError(
+            "shared-prefix Hybrid output token count does not match its CP shard: "
+            f"{packed_logits.shape[1]} != {expected_local_length} "
+            f"(global padded length {padded_total_length}, cp_size {cp_size})"
         )
 
     row_count = len(layout.row_indices)
@@ -317,16 +354,60 @@ def shared_prefix_next_token_logprobs(
         0, target_positions
     )
 
-    # Do not select every predictor row up front: even the packed [tokens, vocab]
-    # gather can create a large additional allocation. Each iteration owns at
-    # most ``policy.logprob_chunk_size`` vocabulary rows and emits only scalars.
     prediction_count = predictor_positions.numel()
+    if cp_size == 1:
+        # Preserve the CP1 fast path: every logical predictor is already local,
+        # so no ownership map or sequence-sized temporary is needed.
+        owned_prediction_indices = torch.arange(
+            prediction_count,
+            dtype=torch.long,
+            device=device,
+        )
+        owned_local_predictors = predictor_positions
+        owned_target_tokens = target_tokens
+    else:
+        # Locate only predictor rows owned by this CP rank. Vocabulary logits
+        # never cross CP ranks: each owner emits scalars, then a small
+        # differentiable SUM reconstructs the global predictor vector on every
+        # rank.
+        local_global_indices = get_shared_prefix_context_parallel_indices(
+            padded_total_length,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            device=device,
+        )
+        global_to_local = torch.full(
+            (padded_total_length,),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+        global_to_local[local_global_indices] = torch.arange(
+            local_global_indices.numel(),
+            dtype=torch.long,
+            device=device,
+        )
+        local_predictor_positions = global_to_local.index_select(0, predictor_positions)
+        owned_prediction_indices = torch.nonzero(
+            local_predictor_positions >= 0,
+            as_tuple=False,
+        ).flatten()
+        owned_local_predictors = local_predictor_positions.index_select(
+            0, owned_prediction_indices
+        )
+        owned_target_tokens = target_tokens.index_select(0, owned_prediction_indices)
+
+    # Do not select every owned predictor row up front: even a local
+    # [tokens, vocab] gather can create a large additional allocation. Each
+    # iteration owns at most ``policy.logprob_chunk_size`` vocabulary rows and
+    # emits only scalars.
     effective_chunk_size = prediction_count if chunk_size is None else chunk_size
     selected_logprobs: list[torch.Tensor] = []
     packed_logits_2d = packed_logits[0]
-    for start in range(0, prediction_count, effective_chunk_size):
-        end = min(start + effective_chunk_size, prediction_count)
-        predictor_chunk = predictor_positions[start:end]
+    owned_prediction_count = owned_prediction_indices.numel()
+    for start in range(0, owned_prediction_count, effective_chunk_size):
+        end = min(start + effective_chunk_size, owned_prediction_count)
+        predictor_chunk = owned_local_predictors[start:end]
         logits_chunk = packed_logits_2d.index_select(0, predictor_chunk)
         if temperature != 1.0:
             # Match conventional temperature scaling in the model-output dtype,
@@ -337,10 +418,31 @@ def shared_prefix_next_token_logprobs(
         selected_logprobs.append(
             logprobs_chunk.gather(
                 dim=-1,
-                index=target_tokens[start:end].to(torch.long).unsqueeze(-1),
+                index=owned_target_tokens[start:end].to(torch.long).unsqueeze(-1),
             ).squeeze(-1)
         )
-    packed_logprobs = torch.cat(selected_logprobs, dim=0)
+    # Keep even a padding-only CP rank connected to the model graph without
+    # reducing over its entire local vocabulary tensor.
+    graph_zero = packed_logits_2d.reshape(-1)[0].to(torch.float32) * 0.0
+    local_packed_logprobs = graph_zero + packed_logits.new_zeros(
+        prediction_count,
+        dtype=torch.float32,
+    )
+    if selected_logprobs:
+        local_packed_logprobs = local_packed_logprobs.index_copy(
+            0,
+            owned_prediction_indices,
+            torch.cat(selected_logprobs, dim=0),
+        )
+    packed_logprobs = (
+        torch.distributed.nn.functional.all_reduce(
+            local_packed_logprobs,
+            op=torch.distributed.ReduceOp.SUM,
+            group=get_context_parallel_group(),
+        )
+        if cp_size > 1
+        else local_packed_logprobs
+    )
 
     restored = packed_logprobs.new_zeros((row_count, sequence_length - 1))
     if prompt_prediction_count > 0:

@@ -26,7 +26,9 @@ from nemo_rl.data.packing.shared_prefix import (
 )
 from nemo_rl.data.packing.shared_prefix_tensors import (
     build_star_attention_allow_mask,
+    get_shared_prefix_context_parallel_indices,
     materialize_shared_prefix_layout,
+    shard_shared_prefix_tensor_bin_for_context_parallel,
 )
 
 
@@ -108,6 +110,83 @@ def test_tensor_indices_encode_gather_fanout_and_scatter() -> None:
         indices.completion_scatter_columns,
         torch.tensor([2, 3, 4, 2, 3]),
     )
+
+
+def test_context_parallel_indices_match_standard_two_chunk_zigzag() -> None:
+    rank0 = get_shared_prefix_context_parallel_indices(
+        16,
+        cp_rank=0,
+        cp_size=2,
+    )
+    rank1 = get_shared_prefix_context_parallel_indices(
+        16,
+        cp_rank=1,
+        cp_size=2,
+    )
+
+    torch.testing.assert_close(rank0, torch.tensor([0, 1, 2, 3, 12, 13, 14, 15]))
+    torch.testing.assert_close(rank1, torch.tensor([4, 5, 6, 7, 8, 9, 10, 11]))
+    torch.testing.assert_close(
+        torch.cat((rank0, rank1)).sort().values,
+        torch.arange(16),
+    )
+
+
+def test_context_parallel_shard_pads_only_after_real_star_tokens() -> None:
+    input_ids = torch.tensor(
+        [
+            [10, 11, 12, 20, 0],
+            [10, 11, 12, 30, 31],
+        ]
+    )
+    tensor_bin = build_shared_prefix_tensor_plan(
+        input_ids=input_ids,
+        input_lengths=torch.tensor([4, 5]),
+        prompt_lengths=torch.tensor([3, 3]),
+        group_ids=["g", "g"],
+        bin_capacity=8,
+        materialize_attention_mask=False,
+    ).shared_bins[0]
+
+    rank0 = shard_shared_prefix_tensor_bin_for_context_parallel(
+        tensor_bin,
+        cp_rank=0,
+        cp_size=2,
+    )
+    rank1 = shard_shared_prefix_tensor_bin_for_context_parallel(
+        tensor_bin,
+        cp_rank=1,
+        cp_size=2,
+    )
+
+    assert tensor_bin.layout.total_length == 6
+    assert rank0.padded_total_length == rank1.padded_total_length == 8
+    torch.testing.assert_close(rank0.global_token_indices, torch.tensor([0, 1, 6, 7]))
+    torch.testing.assert_close(rank1.global_token_indices, torch.tensor([2, 3, 4, 5]))
+    torch.testing.assert_close(rank0.packed_input_ids, torch.tensor([10, 11, 0, 0]))
+    torch.testing.assert_close(rank1.packed_input_ids, torch.tensor([12, 30, 31, 20]))
+
+
+@pytest.mark.parametrize(
+    "padded_length,cp_rank,cp_size,message",
+    [
+        (8, 0, 0, "cp_size must be positive"),
+        (8, 2, 2, "cp_rank must be in"),
+        (6, 0, 2, r"divisible by 2 \* cp_size"),
+    ],
+)
+def test_context_parallel_indices_reject_invalid_topology(
+    padded_length: int,
+    cp_rank: int,
+    cp_size: int,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        get_shared_prefix_context_parallel_indices(
+            padded_length,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+        )
 
 
 def test_cp1_star_attention_mask_has_exact_branch_isolation() -> None:

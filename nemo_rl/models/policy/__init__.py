@@ -638,11 +638,13 @@ def get_shared_prefix_training_config(
 def validate_shared_prefix_training_config(
     config: PolicyConfig,
 ) -> SharedPrefixTrainingConfig:
-    """Validate the topology supported by the first training implementation.
+    """Validate backend-independent shared-prefix training requirements.
 
     Observation mode is deliberately backend-neutral and execution-neutral.
-    Model capability is validated later, after Megatron Bridge resolves the
-    concrete model provider.
+    The resolved TP/PP/CP topology and matching MCore capability are validated
+    later, after Megatron Bridge resolves the concrete model provider.  In
+    particular, accepting CP>1 here does not advertise support: a CP run remains
+    fail-closed unless MCore exports the distinct end-to-end CP capability.
     """
     shared_prefix_config = get_shared_prefix_training_config(config)
     if shared_prefix_config.mode != "train":
@@ -664,11 +666,30 @@ def validate_shared_prefix_training_config(
             "policy.sequence_packing.enabled=true."
         )
 
-    if megatron_config["context_parallel_size"] != 1:
-        raise ValueError(
-            "policy.shared_prefix_training.mode=train currently requires "
-            "policy.megatron_cfg.context_parallel_size=1."
-        )
+    cp_size = int(megatron_config["context_parallel_size"])
+    if cp_size < 1:
+        raise ValueError("policy.megatron_cfg.context_parallel_size must be positive.")
+    if cp_size > 1:
+        cp_alignment = 2 * cp_size
+        for capacity_key in ("train_mb_tokens", "logprob_mb_tokens"):
+            capacity = sequence_packing_config.get(capacity_key)
+            if capacity is not None and int(capacity) % cp_alignment != 0:
+                raise ValueError(
+                    "shared-prefix CP padding requires "
+                    f"policy.sequence_packing.{capacity_key} to be divisible "
+                    f"by 2 * context_parallel_size ({cp_alignment}); got {capacity}."
+                )
+        sequence_alignment = config.get("make_sequence_length_divisible_by")
+        if (
+            sequence_alignment is not None
+            and int(sequence_alignment) % cp_alignment != 0
+        ):
+            raise ValueError(
+                "shared-prefix CP padding requires "
+                "policy.make_sequence_length_divisible_by to be divisible by "
+                f"2 * context_parallel_size ({cp_alignment}); got "
+                f"{sequence_alignment}."
+            )
 
     if megatron_config["pipeline_model_parallel_size"] != 1:
         raise ValueError(

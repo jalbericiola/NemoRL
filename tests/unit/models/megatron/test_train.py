@@ -36,7 +36,14 @@ from nemo_rl.algorithms.loss.interfaces import LossInputType
 pytestmark = pytest.mark.mcore
 
 
-def test_shared_prefix_logprobs_are_chunked_ordered_and_differentiable():
+@pytest.mark.parametrize(
+    "logits_dtype",
+    [torch.float32, torch.bfloat16],
+    ids=["fp32", "bf16"],
+)
+def test_shared_prefix_logprobs_are_chunked_ordered_and_differentiable(
+    logits_dtype: torch.dtype,
+):
     """Scalar fan-out must match dense logits without allocating dense vocab rows."""
     from nemo_rl.data.packing import build_shared_prefix_tensor_plan
     from nemo_rl.models.megatron.data import SharedPrefixForwardMetadata
@@ -63,7 +70,13 @@ def test_shared_prefix_logprobs_are_chunked_ordered_and_differentiable():
         source_sequence_length=6,
     )
     torch.manual_seed(7)
-    packed_logits = torch.randn(1, 8, 40, requires_grad=True)
+    packed_logits = torch.randn(
+        1,
+        8,
+        40,
+        dtype=logits_dtype,
+        requires_grad=True,
+    )
     reference_logits = packed_logits.detach().clone().requires_grad_(True)
 
     real_log_softmax = torch.nn.functional.log_softmax
@@ -83,6 +96,7 @@ def test_shared_prefix_logprobs_are_chunked_ordered_and_differentiable():
     assert vocab_work_shapes
     assert all(len(shape) == 2 and shape[0] <= 2 for shape in vocab_work_shapes)
     assert restored.shape == (2, 5)
+    assert restored.dtype == torch.float32
 
     # Build the former dense fan-out only as a small test oracle. The planner
     # orders the longer completion first, hence local rows map to sources (1, 0).
@@ -102,7 +116,7 @@ def test_shared_prefix_logprobs_are_chunked_ordered_and_differentiable():
     ]
     local_input_ids = input_ids[list(layout.row_indices)]
     dense_logprobs = (
-        real_log_softmax(dense_logits[:, :-1], dim=-1)
+        real_log_softmax(dense_logits[:, :-1].to(torch.float32), dim=-1)
         .gather(
             dim=-1,
             index=local_input_ids[:, 1:].unsqueeze(-1),
@@ -121,6 +135,128 @@ def test_shared_prefix_logprobs_are_chunked_ordered_and_differentiable():
     (restored * weights).sum().backward()
     (expected * weights).sum().backward()
     torch.testing.assert_close(packed_logits.grad, reference_logits.grad)
+
+
+@pytest.mark.parametrize(
+    "logits_dtype",
+    [torch.float32, torch.bfloat16],
+    ids=["fp32", "bf16"],
+)
+def test_shared_prefix_cp_logprobs_reduce_scalars_and_route_gradients(
+    logits_dtype: torch.dtype,
+):
+    """CP reconstructs scalar targets without gathering vocabulary logits."""
+    from nemo_rl.data.packing import (
+        build_shared_prefix_tensor_plan,
+        get_shared_prefix_context_parallel_indices,
+    )
+    from nemo_rl.models.megatron.data import SharedPrefixForwardMetadata
+    from nemo_rl.models.megatron.train import shared_prefix_next_token_logprobs
+
+    input_ids = torch.tensor(
+        [
+            [10, 11, 12, 20, 21, 0],
+            [10, 11, 12, 30, 31, 0],
+        ]
+    )
+    tensor_bin = build_shared_prefix_tensor_plan(
+        input_ids=input_ids,
+        input_lengths=torch.tensor([5, 5]),
+        prompt_lengths=torch.tensor([3, 3]),
+        group_ids=["g", "g"],
+        bin_capacity=16,
+        materialize_attention_mask=False,
+    ).shared_bins[0]
+    torch.manual_seed(29)
+    global_logits = torch.randn(
+        1,
+        8,
+        40,
+        dtype=logits_dtype,
+        requires_grad=True,
+    )
+    assert tensor_bin.layout.total_length == 7
+    reference = shared_prefix_next_token_logprobs(
+        global_logits[:, : tensor_bin.layout.total_length],
+        SharedPrefixForwardMetadata(
+            tensor_bin=tensor_bin,
+            source_sequence_length=6,
+        ),
+        chunk_size=2,
+    )
+
+    local_logits: list[torch.Tensor] = []
+    local_outputs: list[torch.Tensor] = []
+    with (
+        patch(
+            "torch.distributed.nn.functional.all_reduce",
+            side_effect=lambda value, **_kwargs: value,
+        ) as mock_scalar_all_reduce,
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_group",
+            return_value=MagicMock(),
+        ),
+    ):
+        for cp_rank in range(2):
+            global_indices = get_shared_prefix_context_parallel_indices(
+                8,
+                cp_rank=cp_rank,
+                cp_size=2,
+            )
+            rank_logits = (
+                global_logits.detach()
+                .index_select(1, global_indices)
+                .clone()
+                .requires_grad_(True)
+            )
+            local_logits.append(rank_logits)
+            local_outputs.append(
+                shared_prefix_next_token_logprobs(
+                    rank_logits,
+                    SharedPrefixForwardMetadata(
+                        tensor_bin=tensor_bin,
+                        source_sequence_length=6,
+                        cp_rank=cp_rank,
+                        cp_size=2,
+                        padded_total_length=8,
+                    ),
+                    chunk_size=2,
+                )
+            )
+
+    reduced = local_outputs[0] + local_outputs[1]
+    torch.testing.assert_close(reduced, reference)
+    assert reduced.dtype == reference.dtype == torch.float32
+    assert mock_scalar_all_reduce.call_count == 2
+    expected_scalar_count = (
+        tensor_bin.layout.prompt_length
+        - 1
+        + tensor_bin.indices.predecessor_positions.numel()
+    )
+    assert all(
+        call.args[0].shape == (expected_scalar_count,)
+        for call in mock_scalar_all_reduce.call_args_list
+    )
+
+    weights = torch.arange(1, reference.numel() + 1, dtype=reference.dtype).view_as(
+        reference
+    )
+    (reference * weights).sum().backward()
+    # The real differentiable all-reduce returns ``reduced`` on both ranks and
+    # sums their backward contributions. LossPostProcessor normalizes each
+    # replicated loss by CP, so two copies of loss/2 must reproduce CP1 scale.
+    cp_normalized_replicated_loss = sum((reduced * weights).sum() / 2 for _ in range(2))
+    cp_normalized_replicated_loss.backward()
+
+    reconstructed_grad = torch.zeros_like(global_logits)
+    for cp_rank, rank_logits in enumerate(local_logits):
+        global_indices = get_shared_prefix_context_parallel_indices(
+            8,
+            cp_rank=cp_rank,
+            cp_size=2,
+        )
+        reconstructed_grad.index_copy_(1, global_indices, rank_logits.grad)
+    torch.testing.assert_close(reconstructed_grad, global_logits.grad)
 
 
 def test_shared_prefix_model_forward_lowers_outer_layout_to_hybrid_adapter():

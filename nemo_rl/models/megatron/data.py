@@ -36,6 +36,7 @@ from nemo_rl.data.packing import (
     SharedPrefixTensorBin,
     materialize_shared_prefix_layout,
     plan_shared_prefix_bins,
+    shard_shared_prefix_tensor_bin_for_context_parallel,
 )
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_EXECUTION_SLOT,
@@ -60,10 +61,19 @@ SHARED_PREFIX_SOURCE_ROW_INDEX = "_shared_prefix_source_row_index"
 
 @dataclass(frozen=True, slots=True)
 class SharedPrefixForwardMetadata:
-    """Structured star metadata retained until model-output fan-out."""
+    """Structured global star metadata retained until model-output fan-out.
+
+    For CP>1, ``padded_total_length`` is divisible by ``2 * cp_size`` and the
+    model input/output sequence is the standard two-chunk zigzag shard for
+    ``cp_rank``.  ``tensor_bin`` remains the unpadded global correctness
+    description used to route scalar next-token log-probabilities.
+    """
 
     tensor_bin: SharedPrefixTensorBin
     source_sequence_length: int
+    cp_rank: int = 0
+    cp_size: int = 1
+    padded_total_length: Optional[int] = None
 
 
 @dataclass
@@ -339,8 +349,12 @@ def get_microbatch_iterator(
 
     # Compute padded sequence length for pipeline parallelism
     if shared_prefix_train:
+        cp_size = int(cfg["megatron_cfg"]["context_parallel_size"])
+        cp_alignment = 1 if cp_size == 1 else 2 * cp_size
         padded_seq_length = (
-            pad_full_seq_to if pad_full_seq_to is not None else max_execution_length
+            pad_full_seq_to
+            if pad_full_seq_to is not None
+            else _round_up_to_multiple(max_execution_length, cp_alignment)
         )
     else:
         padded_seq_length = (
@@ -647,6 +661,11 @@ def process_shared_prefix_microbatch(
         cfg=cfg,
         bin_capacity=bin_capacity,
     )
+    megatron_cfg = cfg.get("megatron_cfg") or {}
+    cp_size = int(megatron_cfg.get("context_parallel_size", 1))
+    if cp_size < 1:
+        raise ValueError(f"context_parallel_size must be positive, got {cp_size}")
+    cp_rank = get_context_parallel_rank() if cp_size > 1 else 0
     source_sequence_length = data_dict["input_ids"].shape[1]
     for unit in execution_units:
         unit_rows = list(unit.row_indices)
@@ -658,16 +677,33 @@ def process_shared_prefix_microbatch(
                 layout=unit.shared_layout,
                 materialize_attention_mask=False,
             )
+            cp_shard = shard_shared_prefix_tensor_bin_for_context_parallel(
+                tensor_bin,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+            if cp_shard.padded_total_length > bin_capacity:
+                raise RuntimeError(
+                    "context-parallel padding makes a shared-prefix star exceed "
+                    "its bin capacity: "
+                    f"real_tokens={tensor_bin.layout.total_length}, "
+                    f"padded_tokens={cp_shard.padded_total_length}, "
+                    f"capacity={bin_capacity}. Configure shared-prefix microbatch "
+                    f"token capacities as multiples of {2 * cp_size}."
+                )
             shared_prefix = SharedPrefixForwardMetadata(
                 tensor_bin=tensor_bin,
                 source_sequence_length=source_sequence_length,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                padded_total_length=cp_shard.padded_total_length,
             )
             yield ProcessedMicrobatch(
                 data_dict=unit_data,
                 input_ids=unit_data["input_ids"],
-                input_ids_cp_sharded=tensor_bin.packed_input_ids.unsqueeze(0),
+                input_ids_cp_sharded=cp_shard.packed_input_ids.unsqueeze(0),
                 attention_mask=None,
-                position_ids=tensor_bin.position_ids.unsqueeze(0),
+                position_ids=cp_shard.position_ids.unsqueeze(0),
                 packed_seq_params=None,
                 cu_seqlens_padded=None,
                 shared_prefix=shared_prefix,

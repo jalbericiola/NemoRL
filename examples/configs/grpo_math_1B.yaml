@@ -338,8 +338,9 @@ policy:
 
   # Prompt-prefix reuse in policy training forwards. "observe" only reports
   # opportunity metrics and does not change packing or model execution. "train"
-  # is experimental and currently requires Megatron, sequence packing, CP1, TP1,
-  # PP1, and a supported Hybrid model.
+  # is experimental and requires Megatron, sequence packing, TP1, PP1, and a
+  # supported Hybrid model. CP>1 additionally requires an MCore build that
+  # advertises the distinct end-to-end shared-prefix CP capability.
   shared_prefix_training:
     mode: "disabled"
 

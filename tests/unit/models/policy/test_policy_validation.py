@@ -220,6 +220,14 @@ def test_shared_prefix_train_mode_accepts_first_slice_topology() -> None:
     assert resolved_config.mode == "train"
 
 
+def test_shared_prefix_train_mode_accepts_cp_config_for_late_capability_gate() -> None:
+    config = create_shared_prefix_train_config(cp=2)
+
+    resolved_config = validate_shared_prefix_training_config(config)
+
+    assert resolved_config.mode == "train"
+
+
 @pytest.mark.parametrize(
     "config,expected_config_path",
     [
@@ -230,10 +238,6 @@ def test_shared_prefix_train_mode_accepts_first_slice_topology() -> None:
         (
             create_megatron_config("test-model", tp=1),
             "policy.sequence_packing.enabled=true",
-        ),
-        (
-            create_megatron_config("test-model", tp=1, cp=2),
-            "policy.megatron_cfg.context_parallel_size=1",
         ),
         (
             create_megatron_config("test-model", tp=1, pp=2),
@@ -317,6 +321,32 @@ def test_shared_prefix_train_mode_rejects_unsupported_runtime_features_early(
     cast(dict[str, Any], config).update(policy_overrides)
 
     with pytest.raises(ValueError, match=expected_config_path):
+        validate_shared_prefix_training_config(config)
+
+
+@pytest.mark.parametrize(
+    "config_path,value",
+    [
+        ("train_mb_tokens", 126),
+        ("logprob_mb_tokens", 130),
+    ],
+)
+def test_shared_prefix_cp_requires_aligned_microbatch_capacities(
+    config_path: str,
+    value: int,
+) -> None:
+    config = create_shared_prefix_train_config(cp=2)
+    cast(dict[str, Any], config["sequence_packing"])[config_path] = value
+
+    with pytest.raises(ValueError, match=f"sequence_packing.{config_path}"):
+        validate_shared_prefix_training_config(config)
+
+
+def test_shared_prefix_cp_requires_aligned_sequence_divisibility() -> None:
+    config = create_shared_prefix_train_config(cp=2)
+    config["make_sequence_length_divisible_by"] = 2
+
+    with pytest.raises(ValueError, match="make_sequence_length_divisible_by"):
         validate_shared_prefix_training_config(config)
 
 
