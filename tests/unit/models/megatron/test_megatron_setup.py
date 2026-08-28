@@ -1991,6 +1991,8 @@ class TestValidateSharedPrefixModelCapability:
         model_cfg.pipeline_model_parallel_size = 1
         model_cfg.context_parallel_size = 1
         model_cfg.recompute_granularity = None
+        model_cfg.recompute_method = None
+        model_cfg.recompute_num_layers = None
         model_cfg.recompute_modules = []
         model_cfg.mtp_num_layers = 0
         model_cfg.cuda_graph_impl = "none"
@@ -2017,6 +2019,19 @@ class TestValidateSharedPrefixModelCapability:
         model_cfg.moe_router_force_load_balancing = False
         model_cfg.moe_router_force_biased = None
         return model_cfg
+
+    @staticmethod
+    def _supported_capabilities(*additional: str) -> set[str]:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+        )
+
+        return {
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
+            *additional,
+        }
 
     def test_observe_does_not_require_a_hybrid_provider(self):
         from nemo_rl.models.megatron.setup import (
@@ -2057,6 +2072,7 @@ class TestValidateSharedPrefixModelCapability:
 
     def test_train_accepts_explicit_end_to_end_mcore_capability(self):
         from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
             SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
             _validate_shared_prefix_model_capability,
         )
@@ -2066,7 +2082,31 @@ class TestValidateSharedPrefixModelCapability:
 
         with patch(
             "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
-            return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            return_value={
+                SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+                SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
+            },
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_rejects_topology_only_mcore_without_physical_layout_capability(self):
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            ),
+            pytest.raises(
+                NotImplementedError,
+                match="hybrid_star_explicit_physical_padding_v1",
+            ),
         ):
             _validate_shared_prefix_model_capability(config, model_cfg)
 
@@ -2092,6 +2132,7 @@ class TestValidateSharedPrefixModelCapability:
     def test_cp_train_accepts_distinct_end_to_end_mcore_capability(self):
         from nemo_rl.models.megatron.setup import (
             SUPPORTED_SHARED_PREFIX_CP_TRAINING_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
             SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
             _validate_shared_prefix_model_capability,
         )
@@ -2105,22 +2146,12 @@ class TestValidateSharedPrefixModelCapability:
             return_value={
                 SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
                 SUPPORTED_SHARED_PREFIX_CP_TRAINING_CAPABILITY,
+                SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
             },
         ):
             _validate_shared_prefix_model_capability(config, model_cfg)
 
-    @pytest.mark.parametrize(
-        "attribute,value",
-        [
-            ("tensor_model_parallel_size", 2),
-            ("pipeline_model_parallel_size", 2),
-        ],
-    )
-    def test_train_rejects_resolved_tp_or_pp_topology(
-        self,
-        attribute: str,
-        value: int,
-    ) -> None:
+    def test_train_rejects_resolved_pipeline_parallel_topology(self) -> None:
         from nemo_rl.models.megatron.setup import (
             SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
             _validate_shared_prefix_model_capability,
@@ -2128,22 +2159,93 @@ class TestValidateSharedPrefixModelCapability:
 
         config = {"shared_prefix_training": {"mode": "train"}}
         model_cfg = self._supported_model_cfg()
-        setattr(model_cfg, attribute, value)
+        model_cfg.pipeline_model_parallel_size = 2
 
         with (
             patch(
                 "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
                 return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
             ),
-            pytest.raises(NotImplementedError, match="TP1/PP1"),
+            pytest.raises(NotImplementedError, match="PP1"),
         ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    @pytest.mark.parametrize(
+        ("cp_size", "topology_capability"),
+        [
+            (1, "hybrid_star_cp1_tp_sp_v1"),
+            (2, "hybrid_star_cp_tp_sp_v1"),
+        ],
+    )
+    def test_tp_sp_train_negotiates_distinct_topology_plus_physical_capability(
+        self,
+        cp_size: int,
+        topology_capability: str,
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.tensor_model_parallel_size = 2
+        model_cfg.context_parallel_size = cp_size
+        model_cfg.sequence_parallel = True
+
+        with patch(
+            "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+            return_value={
+                topology_capability,
+                SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
+            },
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_tp_sp_train_rejects_topology_token_without_physical_feature(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.tensor_model_parallel_size = 2
+        model_cfg.context_parallel_size = 2
+        model_cfg.sequence_parallel = True
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value={"hybrid_star_cp_tp_sp_v1"},
+            ),
+            pytest.raises(
+                NotImplementedError,
+                match="hybrid_star_explicit_physical_padding_v1",
+            ),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_tp_train_requires_sequence_parallelism(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.tensor_model_parallel_size = 2
+
+        with pytest.raises(NotImplementedError, match="sequence_parallel=false"):
             _validate_shared_prefix_model_capability(config, model_cfg)
 
     @pytest.mark.parametrize(
         "attribute,value,expected_error",
         [
             ("sequence_parallel", True, "policy.megatron_cfg.sequence_parallel"),
-            ("recompute_granularity", "full", "recompute_granularity='full'"),
+            (
+                "recompute_granularity",
+                "full",
+                "hybrid_star_full_uniform_recompute_v1",
+            ),
             ("mtp_num_layers", 1, "policy.megatron_cfg.mtp_num_layers"),
             ("cuda_graph_impl", "local", "policy.megatron_cfg.cuda_graph_impl"),
             ("fp8", "e4m3", "policy.megatron_cfg.fp8_cfg.enabled"),
@@ -2168,7 +2270,7 @@ class TestValidateSharedPrefixModelCapability:
             (
                 "moe_router_enable_expert_bias",
                 True,
-                "expert-bias token accounting",
+                "hybrid_star_moe_expert_bias_v1",
             ),
             (
                 "moe_router_load_balancing_type",
@@ -2195,7 +2297,6 @@ class TestValidateSharedPrefixModelCapability:
         self, attribute: str, value: Any, expected_error: str
     ) -> None:
         from nemo_rl.models.megatron.setup import (
-            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
             _validate_shared_prefix_model_capability,
         )
 
@@ -2206,7 +2307,7 @@ class TestValidateSharedPrefixModelCapability:
         with (
             patch(
                 "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
-                return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+                return_value=self._supported_capabilities(),
             ),
             pytest.raises(NotImplementedError, match=expected_error),
         ):
@@ -2214,7 +2315,6 @@ class TestValidateSharedPrefixModelCapability:
 
     def test_train_ignores_dormant_moe_fields_for_dense_model(self) -> None:
         from nemo_rl.models.megatron.setup import (
-            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
             _validate_shared_prefix_model_capability,
         )
 
@@ -2232,13 +2332,12 @@ class TestValidateSharedPrefixModelCapability:
 
         with patch(
             "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
-            return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            return_value=self._supported_capabilities(),
         ):
             _validate_shared_prefix_model_capability(config, model_cfg)
 
     def test_train_rejects_selective_core_attention_recompute(self) -> None:
         from nemo_rl.models.megatron.setup import (
-            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
             _validate_shared_prefix_model_capability,
         )
 
@@ -2250,9 +2349,71 @@ class TestValidateSharedPrefixModelCapability:
         with (
             patch(
                 "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
-                return_value=SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+                return_value=self._supported_capabilities(),
             ),
             pytest.raises(NotImplementedError, match="core-attention recompute"),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_accepts_selective_moe_recompute(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.recompute_granularity = "selective"
+        model_cfg.recompute_modules = ["moe"]
+
+        with patch(
+            "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+            return_value=self._supported_capabilities(),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_accepts_negotiated_full_uniform_recompute(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.recompute_granularity = "full"
+        model_cfg.recompute_method = "uniform"
+        model_cfg.recompute_num_layers = 1
+
+        with patch(
+            "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+            return_value={
+                SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+                SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY,
+                SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
+            },
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_accepts_negotiated_moe_expert_bias(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.moe_router_enable_expert_bias = True
+
+        with patch(
+            "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+            return_value={
+                SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY,
+                SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY,
+                SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
+            },
         ):
             _validate_shared_prefix_model_capability(config, model_cfg)
 

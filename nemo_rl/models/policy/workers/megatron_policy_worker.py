@@ -210,9 +210,9 @@ def _require_equal_shared_prefix_execution_count(
 ) -> int:
     """Require every model-world rank to execute the same number of forwards.
 
-    PP and TP are one in the supported shared-prefix topology, while CP may be
-    greater than one. The default process group is the full model world whose
-    forward schedules must agree. A masked dummy forward is not safe here:
+    The default process group is the full model world across TP, CP, PP, and DP;
+    every rank whose schedule can share a collective dependency must agree. A
+    masked dummy forward is not safe here:
     Hybrid MoE layers can attach router auxiliary losses inside the model that
     are independent of the outer token/sample loss masks.
     """
@@ -889,8 +889,12 @@ class MegatronPolicyWorkerImpl(
         mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
         if mtp_num_layers is not None and mtp_num_layers > 0:
             unsupported.append("MTP")
-        if getattr(model_config, "sequence_parallel", False):
-            unsupported.append("sequence parallelism")
+        tp_size = int(getattr(model_config, "tensor_model_parallel_size", 1))
+        sequence_parallel = bool(getattr(model_config, "sequence_parallel", False))
+        if tp_size == 1 and sequence_parallel:
+            unsupported.append("sequence parallelism with TP=1")
+        elif tp_size > 1 and not sequence_parallel:
+            unsupported.append("TP>1 without sequence parallelism")
 
         if unsupported:
             raise NotImplementedError(

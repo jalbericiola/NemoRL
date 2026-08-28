@@ -90,6 +90,25 @@ class SharedPrefixLayout:
     predecessor_positions: tuple[int, ...]
     completion_scatter_rows: tuple[int, ...]
     completion_scatter_columns: tuple[int, ...]
+    physical_completion_lengths: tuple[int, ...] = ()
+    physical_padding_positions: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        physical_lengths = self.physical_completion_lengths or self.completion_lengths
+        if len(physical_lengths) != len(self.completion_lengths):
+            raise ValueError(
+                "physical_completion_lengths and completion_lengths must have equal length"
+            )
+        if any(
+            physical < logical
+            for physical, logical in zip(
+                physical_lengths, self.completion_lengths, strict=True
+            )
+        ):
+            raise ValueError(
+                "physical completion lengths cannot be shorter than logical completions"
+            )
+        object.__setattr__(self, "physical_completion_lengths", physical_lengths)
 
     @property
     def prompt_length(self) -> int:
@@ -100,6 +119,11 @@ class SharedPrefixLayout:
     def baseline_length(self) -> int:
         """Token count if every completion duplicated the prompt."""
         return len(self.row_indices) * self.prompt_length + sum(self.completion_lengths)
+
+    @property
+    def physical_total_length(self) -> int:
+        """Prompt-once length including each branch's ordinary packing tail."""
+        return self.prompt_length + sum(self.physical_completion_lengths)
 
     @property
     def tokens_saved(self) -> int:
@@ -154,6 +178,8 @@ class SharedPrefixPlan:
 
 def build_shared_prefix_layout(
     rows: Sequence[SharedPrefixRow],
+    *,
+    sequence_length_pad_multiple: int = 1,
 ) -> SharedPrefixLayout:
     """Build one exact-prompt GRPO star from two or more rows.
 
@@ -175,6 +201,12 @@ def build_shared_prefix_layout(
     """
     if len(rows) < 2:
         raise ValueError("a shared-prefix layout requires at least two rows")
+    if (
+        isinstance(sequence_length_pad_multiple, bool)
+        or not isinstance(sequence_length_pad_multiple, int)
+        or sequence_length_pad_multiple < 1
+    ):
+        raise ValueError("sequence_length_pad_multiple must be a positive integer")
 
     first = rows[0]
     group_id = first.group_id
@@ -204,15 +236,26 @@ def build_shared_prefix_layout(
     predecessor_positions: list[int] = []
     completion_scatter_rows: list[int] = []
     completion_scatter_columns: list[int] = []
+    physical_completion_lengths: list[int] = []
+    physical_padding_positions: list[int] = []
     packed_offset = prompt_length
 
     for row in rows:
-        branch_starts.append(packed_offset)
-        token_gather_rows.extend([row.row_index] * row.completion_length)
-        token_gather_columns.extend(
-            range(prompt_length, prompt_length + row.completion_length)
+        padded_row_length = (
+            (row.total_length + sequence_length_pad_multiple - 1)
+            // sequence_length_pad_multiple
+            * sequence_length_pad_multiple
         )
-        position_ids.extend(range(prompt_length, prompt_length + row.completion_length))
+        physical_completion_length = padded_row_length - prompt_length
+        physical_completion_lengths.append(physical_completion_length)
+        branch_starts.append(packed_offset)
+        token_gather_rows.extend([row.row_index] * physical_completion_length)
+        token_gather_columns.extend(
+            range(prompt_length, prompt_length + physical_completion_length)
+        )
+        position_ids.extend(
+            range(prompt_length, prompt_length + physical_completion_length)
+        )
         for completion_offset in range(row.completion_length):
             packed_position = packed_offset + completion_offset
             predecessor_position = (
@@ -222,14 +265,20 @@ def build_shared_prefix_layout(
             predecessor_positions.append(predecessor_position)
             completion_scatter_rows.append(row.row_index)
             completion_scatter_columns.append(prompt_length + completion_offset - 1)
-        packed_offset += row.completion_length
+        physical_padding_positions.extend(
+            range(
+                packed_offset + row.completion_length,
+                packed_offset + physical_completion_length,
+            )
+        )
+        packed_offset += physical_completion_length
 
     return SharedPrefixLayout(
         group_id=group_id,
         prompt_token_ids=first.prompt_token_ids,
         row_indices=tuple(row.row_index for row in rows),
         completion_lengths=tuple(row.completion_length for row in rows),
-        total_length=packed_offset,
+        total_length=prompt_length + sum(row.completion_length for row in rows),
         branch_starts=tuple(branch_starts),
         position_ids=tuple(position_ids),
         token_gather_rows=tuple(token_gather_rows),
@@ -238,6 +287,8 @@ def build_shared_prefix_layout(
         predecessor_positions=tuple(predecessor_positions),
         completion_scatter_rows=tuple(completion_scatter_rows),
         completion_scatter_columns=tuple(completion_scatter_columns),
+        physical_completion_lengths=tuple(physical_completion_lengths),
+        physical_padding_positions=tuple(physical_padding_positions),
     )
 
 
@@ -246,6 +297,7 @@ def plan_shared_prefix_bins(
     *,
     bin_capacity: int,
     max_completions_per_bin: int = 16,
+    sequence_length_pad_multiple: int = 1,
 ) -> SharedPrefixPlan:
     """Partition exact-prompt GRPO rows into shared stars and mixed fallbacks.
 
@@ -272,6 +324,22 @@ def plan_shared_prefix_bins(
         raise ValueError("bin_capacity must be positive")
     if max_completions_per_bin < 2:
         raise ValueError("max_completions_per_bin must be at least 2")
+    if (
+        isinstance(sequence_length_pad_multiple, bool)
+        or not isinstance(sequence_length_pad_multiple, int)
+        or sequence_length_pad_multiple < 1
+    ):
+        raise ValueError("sequence_length_pad_multiple must be a positive integer")
+
+    def padded_row_length(row: SharedPrefixRow) -> int:
+        return (
+            (row.total_length + sequence_length_pad_multiple - 1)
+            // sequence_length_pad_multiple
+            * sequence_length_pad_multiple
+        )
+
+    def physical_completion_length(row: SharedPrefixRow) -> int:
+        return padded_row_length(row) - row.prompt_length
 
     ordered_rows = sorted(rows, key=lambda row: row.row_index)
     row_indices = [row.row_index for row in ordered_rows]
@@ -288,7 +356,7 @@ def plan_shared_prefix_bins(
             reason = SharedPrefixFallbackReason.EMPTY_PROMPT
         elif row.completion_length == 0:
             reason = SharedPrefixFallbackReason.EMPTY_COMPLETION
-        elif row.total_length > bin_capacity:
+        elif padded_row_length(row) > bin_capacity:
             reason = SharedPrefixFallbackReason.SEQUENCE_EXCEEDS_BIN
 
         if reason is None:
@@ -298,7 +366,7 @@ def plan_shared_prefix_bins(
                 SharedPrefixFallback(
                     row=row,
                     reason=reason,
-                    fits_block_diagonal_bin=row.total_length <= bin_capacity,
+                    fits_block_diagonal_bin=padded_row_length(row) <= bin_capacity,
                 )
             )
 
@@ -333,7 +401,11 @@ def plan_shared_prefix_bins(
         bin_completion_tokens: list[int] = []
         rows_by_size = sorted(
             exact_rows,
-            key=lambda row: (-row.completion_length, row.row_index),
+            key=lambda row: (
+                -physical_completion_length(row),
+                -row.completion_length,
+                row.row_index,
+            ),
         )
         for row in rows_by_size:
             destination: int | None = None
@@ -342,7 +414,7 @@ def plan_shared_prefix_bins(
                 has_token_space = (
                     prompt_length
                     + bin_completion_tokens[bin_index]
-                    + row.completion_length
+                    + physical_completion_length(row)
                     <= bin_capacity
                 )
                 if has_branch_slot and has_token_space:
@@ -350,14 +422,19 @@ def plan_shared_prefix_bins(
                     break
             if destination is None:
                 physical_bins.append([row])
-                bin_completion_tokens.append(row.completion_length)
+                bin_completion_tokens.append(physical_completion_length(row))
             else:
                 physical_bins[destination].append(row)
-                bin_completion_tokens[destination] += row.completion_length
+                bin_completion_tokens[destination] += physical_completion_length(row)
 
         for bin_rows in physical_bins:
             if len(bin_rows) >= 2:
-                shared_bins.append(build_shared_prefix_layout(bin_rows))
+                shared_bins.append(
+                    build_shared_prefix_layout(
+                        bin_rows,
+                        sequence_length_pad_multiple=sequence_length_pad_multiple,
+                    )
+                )
             else:
                 fallbacks.append(
                     SharedPrefixFallback(

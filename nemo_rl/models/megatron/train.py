@@ -23,9 +23,11 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
+    get_context_parallel_rank,
     get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -47,9 +49,13 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
-from nemo_rl.data.packing import get_shared_prefix_context_parallel_indices
+from nemo_rl.data.packing import (
+    get_shared_prefix_context_parallel_indices,
+    get_shared_prefix_physical_alignment,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    DistributedLogprob,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
@@ -156,7 +162,7 @@ def model_forward(
             projected feature, already in this model's token layout. Only passed
             when the model accepts it; otherwise the model derives its own.
         shared_prefix: Structured Hybrid star layout and CP ownership metadata
-            for the capability-negotiated TP1 shared-prefix model path.
+            for the capability-negotiated shared-prefix model path.
         shared_prefix_train_mode: Whether the forward is part of a
             shared-prefix train schedule, including conventional fallback units.
 
@@ -196,7 +202,13 @@ def model_forward(
 
         additional_kwargs["shared_prefix_layout"] = MCoreSharedPrefixLayout(
             prefix_len=shared_prefix.tensor_bin.layout.prompt_length,
-            completion_lens=shared_prefix.tensor_bin.layout.completion_lengths,
+            completion_lens=(
+                shared_prefix.tensor_bin.layout.physical_completion_lengths
+            ),
+            logical_completion_lens=(
+                shared_prefix.tensor_bin.layout.completion_lengths
+            ),
+            padding_multiple=shared_prefix.padding_multiple,
         )
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
@@ -253,13 +265,14 @@ def shared_prefix_next_token_logprobs(
 ) -> torch.Tensor:
     """Extract and scatter a star's next-token logprobs without logit fan-out.
 
-    The packed Hybrid forward returns ``[1, packed_tokens / CP, vocab]`` in the
-    standard rank-local zigzag order. Expanding or CP-gathering that tensor to
+    The packed Hybrid forward returns ``[1, packed_tokens / CP, vocab / TP]`` in
+    the standard rank-local zigzag order, with a contiguous vocabulary shard on
+    each TP rank. Expanding or CP-gathering that tensor to
     conventional ``[branches, sequence, vocab]`` defeats most of the
     shared-prefix memory saving, so this function gathers only the predictor
     rows owned locally. Vocabulary work is bounded to ``chunk_size`` predictor
-    rows at a time; only selected scalar logprobs cross CP ranks before fan-out
-    to the conventional ``[branches, sequence - 1]`` loss layout.
+    rows at a time; only selected scalar logprobs cross TP and CP ranks before
+    fan-out to the conventional ``[branches, sequence - 1]`` loss layout.
 
     Prompt predictions are evaluated once and broadcast as scalars. Completion
     predictions follow the planner's predecessor/scatter metadata, including
@@ -269,42 +282,73 @@ def shared_prefix_next_token_logprobs(
     """
     if packed_logits.ndim != 3 or packed_logits.shape[0] != 1:
         raise ValueError(
-            "shared-prefix Hybrid logits must have shape [1, local_tokens, vocab], "
+            "shared-prefix Hybrid logits must have shape "
+            "[1, local_tokens, vocab_shard], "
             f"got {tuple(packed_logits.shape)}"
         )
     tensor_bin = shared_prefix.tensor_bin
     layout = tensor_bin.layout
     cp_size = shared_prefix.cp_size
     cp_rank = shared_prefix.cp_rank
+    runtime_cp_size = get_context_parallel_world_size()
+    runtime_cp_rank = get_context_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
     if cp_size < 1 or cp_rank < 0 or cp_rank >= cp_size:
         raise ValueError(
             "invalid shared-prefix context-parallel topology: "
             f"cp_rank={cp_rank}, cp_size={cp_size}"
         )
+    if runtime_cp_size != cp_size:
+        raise ValueError(
+            "shared-prefix metadata CP size disagrees with the active process group: "
+            f"metadata={cp_size}, runtime={runtime_cp_size}"
+        )
+    if runtime_cp_rank != cp_rank:
+        raise ValueError(
+            "shared-prefix metadata CP rank disagrees with the active process group: "
+            f"metadata={cp_rank}, runtime={runtime_cp_rank}"
+        )
+    if tp_size < 1 or tp_rank < 0 or tp_rank >= tp_size:
+        raise ValueError(
+            "invalid shared-prefix tensor-parallel topology: "
+            f"tp_rank={tp_rank}, tp_size={tp_size}"
+        )
+    topology_alignment = get_shared_prefix_physical_alignment(
+        tp_size=tp_size,
+        cp_size=cp_size,
+    )
+    padding_multiple = shared_prefix.padding_multiple
+    if (
+        isinstance(padding_multiple, bool)
+        or not isinstance(padding_multiple, int)
+        or padding_multiple < 1
+        or padding_multiple % topology_alignment
+    ):
+        raise ValueError(
+            "shared-prefix metadata padding_multiple must be a positive multiple "
+            f"of topology alignment Q={topology_alignment}, got {padding_multiple!r}"
+        )
     padded_total_length = (
-        layout.total_length
+        layout.physical_total_length
         if shared_prefix.padded_total_length is None
         else shared_prefix.padded_total_length
     )
-    if padded_total_length < layout.total_length:
+    if padded_total_length < layout.physical_total_length:
         raise ValueError(
-            "shared-prefix padded length is shorter than the logical layout: "
-            f"{padded_total_length} < {layout.total_length}"
+            "shared-prefix padded length is shorter than the physical layout: "
+            f"{padded_total_length} < {layout.physical_total_length}"
         )
-    if cp_size == 1 and padded_total_length != layout.total_length:
-        raise ValueError(
-            "shared-prefix CP1 output cannot contain physical padding: "
-            f"{padded_total_length} != {layout.total_length}"
-        )
-    if cp_size > 1 and (
-        padded_total_length % (2 * cp_size) != 0
-        or padded_total_length - layout.total_length >= 2 * cp_size
+    if (
+        padded_total_length % padding_multiple != 0
+        or padded_total_length - layout.physical_total_length >= padding_multiple
     ):
         raise ValueError(
-            "shared-prefix CP output must use the minimal trailing pad to a "
-            "2 * cp_size multiple: "
-            f"physical={padded_total_length}, logical={layout.total_length}, "
-            f"cp_size={cp_size}"
+            "shared-prefix output must use the minimal trailing pad for its "
+            "resolved physical packing contract: "
+            f"padded={padded_total_length}, physical="
+            f"{layout.physical_total_length}, M={padding_multiple}, "
+            f"tp_size={tp_size}, cp_size={cp_size}"
         )
     expected_local_length = padded_total_length // cp_size
     if packed_logits.shape[1] != expected_local_length:
@@ -353,6 +397,17 @@ def shared_prefix_next_token_logprobs(
     target_tokens = tensor_bin.packed_input_ids.to(device=device).index_select(
         0, target_positions
     )
+    local_vocab_size = packed_logits.shape[-1]
+    global_padded_vocab_size = local_vocab_size * tp_size
+    if target_tokens.numel() and bool(
+        torch.any(
+            (target_tokens < 0) | (target_tokens >= global_padded_vocab_size)
+        ).item()
+    ):
+        raise ValueError(
+            "shared-prefix target token is outside the TP-sharded padded vocabulary: "
+            f"padded_vocab={global_padded_vocab_size}"
+        )
 
     prediction_count = predictor_positions.numel()
     if cp_size == 1:
@@ -414,13 +469,30 @@ def shared_prefix_next_token_logprobs(
             # but only mutate the private chunk rather than the model's logits.
             logits_chunk.div_(temperature)
         logits_chunk = logits_chunk.to(torch.float32)
-        logprobs_chunk = torch.nn.functional.log_softmax(logits_chunk, dim=-1)
-        selected_logprobs.append(
-            logprobs_chunk.gather(
-                dim=-1,
-                index=owned_target_tokens[start:end].to(torch.long).unsqueeze(-1),
-            ).squeeze(-1)
-        )
+        target_chunk = owned_target_tokens[start:end].to(torch.long)
+        if tp_size == 1:
+            logprobs_chunk = torch.nn.functional.log_softmax(logits_chunk, dim=-1)
+            selected_logprobs.append(
+                logprobs_chunk.gather(
+                    dim=-1,
+                    index=target_chunk.unsqueeze(-1),
+                ).squeeze(-1)
+            )
+        else:
+            # DistributedLogprob reduces only the selected scalar across TP
+            # vocabulary shards. Its custom backward forms the exact local
+            # softmax gradient, avoiding a full-vocabulary gather and an extra
+            # differentiable-collective TP multiplier.
+            selected_logprobs.append(
+                DistributedLogprob.apply(
+                    logits_chunk,
+                    target_chunk,
+                    tp_rank * local_vocab_size,
+                    (tp_rank + 1) * local_vocab_size,
+                    get_tensor_model_parallel_group(),
+                    False,
+                )
+            )
     # Keep even a padding-only CP rank connected to the model graph without
     # reducing over its entire local vocabulary tensor.
     graph_zero = packed_logits_2d.reshape(-1)[0].to(torch.float32) * 0.0

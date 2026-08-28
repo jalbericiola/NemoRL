@@ -46,7 +46,10 @@ from nemo_rl.data.packing.shared_prefix_tensors import (
     build_shared_prefix_tensor_plan,
     build_star_attention_allow_mask,
     get_shared_prefix_context_parallel_indices,
+    get_shared_prefix_physical_alignment,
     materialize_shared_prefix_layout,
+    resolve_shared_prefix_parallel_topology,
+    resolve_shared_prefix_physical_padding_multiple,
     shard_shared_prefix_tensor_bin_for_context_parallel,
 )
 
@@ -75,9 +78,12 @@ __all__ = [
     "build_shared_prefix_tensor_plan",
     "build_star_attention_allow_mask",
     "get_shared_prefix_context_parallel_indices",
+    "get_shared_prefix_physical_alignment",
     "materialize_shared_prefix_layout",
     "plan_fixed_execution_slots",
     "plan_group_coherent_shards",
     "plan_shared_prefix_bins",
+    "resolve_shared_prefix_parallel_topology",
+    "resolve_shared_prefix_physical_padding_multiple",
     "shard_shared_prefix_tensor_bin_for_context_parallel",
 ]

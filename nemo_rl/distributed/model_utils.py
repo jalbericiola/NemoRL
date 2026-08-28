@@ -168,7 +168,7 @@ class DistributedLogprob(torch.autograd.Function):
     def backward(
         ctx: Any,
         *grad_outputs: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
+    ) -> tuple[torch.Tensor, None, None, None, None, None]:
         grad_output = grad_outputs[0]
         softmax, target_mask, masked_target = ctx.saved_tensors
 
@@ -204,7 +204,7 @@ class DistributedLogprob(torch.autograd.Function):
             grad_input.mul_(grad_output.unsqueeze(-1))
 
         # if you add an argument to the forward method, then you must add a corresponding None here
-        return grad_input, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None
 
 
 class DistributedCrossEntropy(torch.autograd.Function):

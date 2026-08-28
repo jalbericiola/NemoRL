@@ -62,6 +62,45 @@ def test_build_layout_emits_gather_fanout_and_scatter_indices() -> None:
     assert layout.completion_scatter_columns == (2, 3, 2, 2, 3, 4)
 
 
+def test_layout_materializes_each_branch_to_the_dense_sequence_alignment() -> None:
+    rows = [_row(0, completion_length=2), _row(1, completion_length=4)]
+
+    layout = build_shared_prefix_layout(rows, sequence_length_pad_multiple=4)
+
+    assert layout.completion_lengths == (2, 4)
+    assert layout.physical_completion_lengths == (5, 5)
+    assert layout.total_length == 9
+    assert layout.physical_total_length == 13
+    assert layout.branch_starts == (3, 8)
+    assert layout.position_ids == (0, 1, 2, 3, 4, 5, 6, 7, 3, 4, 5, 6, 7)
+    assert layout.physical_padding_positions == (5, 6, 7, 12)
+    assert layout.completion_positions == (3, 4, 8, 9, 10, 11)
+    assert layout.predecessor_positions == (2, 3, 2, 8, 9, 10)
+
+
+def test_planner_accounts_for_physical_branch_padding_in_capacity() -> None:
+    rows = [_row(0, completion_length=2), _row(1, completion_length=4)]
+
+    too_small = plan_shared_prefix_bins(
+        rows,
+        bin_capacity=12,
+        sequence_length_pad_multiple=4,
+    )
+    exact = plan_shared_prefix_bins(
+        rows,
+        bin_capacity=13,
+        sequence_length_pad_multiple=4,
+    )
+
+    assert not too_small.shared_bins
+    assert [fallback.reason for fallback in too_small.fallbacks] == [
+        SharedPrefixFallbackReason.NO_CAPACITY_COMPATIBLE_PEER,
+        SharedPrefixFallbackReason.NO_CAPACITY_COMPATIBLE_PEER,
+    ]
+    assert len(exact.shared_bins) == 1
+    assert exact.shared_bins[0].physical_total_length == 13
+
+
 def test_layout_requires_a_valid_exact_prompt_group() -> None:
     with pytest.raises(ValueError, match="at least two"):
         build_shared_prefix_layout([_row(0)])

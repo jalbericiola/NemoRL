@@ -27,9 +27,94 @@ from nemo_rl.data.packing.shared_prefix import (
 from nemo_rl.data.packing.shared_prefix_tensors import (
     build_star_attention_allow_mask,
     get_shared_prefix_context_parallel_indices,
+    get_shared_prefix_physical_alignment,
     materialize_shared_prefix_layout,
+    resolve_shared_prefix_parallel_topology,
+    resolve_shared_prefix_physical_padding_multiple,
     shard_shared_prefix_tensor_bin_for_context_parallel,
 )
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "cp_size", "expected"),
+    [
+        (1, 1, 1),
+        (1, 2, 4),
+        (2, 1, 4),
+        (2, 2, 8),
+        (4, 4, 32),
+    ],
+)
+def test_shared_prefix_physical_alignment_contract(
+    tp_size: int,
+    cp_size: int,
+    expected: int,
+) -> None:
+    assert (
+        get_shared_prefix_physical_alignment(tp_size=tp_size, cp_size=cp_size)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "cp_size", "sequence_parallel"),
+    [
+        (True, 1, False),
+        (4.0, 1, True),
+        ("4", 1, True),
+        (1, False, False),
+        (1, 2.0, False),
+        (1, "2", False),
+        (1, 1, 0),
+        (1, 1, "false"),
+    ],
+)
+def test_shared_prefix_parallel_topology_rejects_coercible_values(
+    tp_size: object,
+    cp_size: object,
+    sequence_parallel: object,
+) -> None:
+    with pytest.raises(ValueError):
+        resolve_shared_prefix_parallel_topology(
+            tp_size=tp_size,
+            cp_size=cp_size,
+            sequence_parallel=sequence_parallel,
+        )
+
+
+@pytest.mark.parametrize("raw", [True, False, 0, -8, 8.0, "8"])
+def test_physical_padding_resolver_rejects_invalid_explicit_values(raw: object) -> None:
+    with pytest.raises(ValueError, match="padding_multiple"):
+        resolve_shared_prefix_physical_padding_multiple(
+            tp_size=2,
+            cp_size=2,
+            padding_multiple=raw,  # type: ignore[arg-type]
+        )
+
+
+def test_physical_padding_resolver_defaults_to_q_and_accepts_m_multiple() -> None:
+    assert (
+        resolve_shared_prefix_physical_padding_multiple(
+            tp_size=2,
+            cp_size=2,
+            padding_multiple=None,
+        )
+        == 8
+    )
+    assert (
+        resolve_shared_prefix_physical_padding_multiple(
+            tp_size=2,
+            cp_size=2,
+            padding_multiple=32,
+        )
+        == 32
+    )
+    with pytest.raises(ValueError, match="topology alignment 8"):
+        resolve_shared_prefix_physical_padding_multiple(
+            tp_size=2,
+            cp_size=2,
+            padding_multiple=12,
+        )
 
 
 def _batch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
@@ -165,6 +250,126 @@ def test_context_parallel_shard_pads_only_after_real_star_tokens() -> None:
     torch.testing.assert_close(rank1.global_token_indices, torch.tensor([2, 3, 4, 5]))
     torch.testing.assert_close(rank0.packed_input_ids, torch.tensor([10, 11, 0, 0]))
     torch.testing.assert_close(rank1.packed_input_ids, torch.tensor([12, 30, 31, 20]))
+
+
+def test_physical_branch_tails_match_dense_router_count_semantics() -> None:
+    input_ids = torch.tensor(
+        [
+            [10, 11, 12, 20, 21, 91, 92],
+            [10, 11, 12, 30, 31, 32, 33],
+        ]
+    )
+    tensor_bin = build_shared_prefix_tensor_plan(
+        input_ids=input_ids,
+        input_lengths=torch.tensor([5, 7]),
+        prompt_lengths=torch.tensor([3, 3]),
+        group_ids=["g", "g"],
+        bin_capacity=16,
+        sequence_length_pad_multiple=4,
+    ).shared_bins[0]
+    layout = tensor_bin.layout
+
+    assert layout.completion_lengths == (4, 2)
+    assert layout.physical_completion_lengths == (5, 5)
+    assert layout.physical_total_length == 13
+    torch.testing.assert_close(
+        tensor_bin.packed_input_ids,
+        torch.tensor([10, 11, 12, 30, 31, 32, 33, 0, 20, 21, 0, 0, 0]),
+    )
+    torch.testing.assert_close(
+        tensor_bin.position_ids,
+        torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 3, 4, 5, 6, 7]),
+    )
+    torch.testing.assert_close(
+        tensor_bin.indices.physical_padding_positions,
+        torch.tensor([7, 10, 11, 12]),
+    )
+
+    # This deterministic route surrogate depends on the same token and RoPE
+    # position inputs as the real router. Prompt routes are counted twice;
+    # every per-row physical tail route is counted once.
+    star_routes = (tensor_bin.packed_input_ids + tensor_bin.position_ids) % 4
+    multiplicities = torch.tensor([2, 2, 2] + [1] * 10)
+    star_counts = torch.zeros(4, dtype=torch.long)
+    star_counts.scatter_add_(0, star_routes, multiplicities)
+
+    dense_tokens = torch.tensor(
+        [
+            [10, 11, 12, 20, 21, 0, 0, 0],
+            [10, 11, 12, 30, 31, 32, 33, 0],
+        ]
+    )
+    dense_positions = torch.arange(8).expand_as(dense_tokens)
+    dense_counts = torch.bincount(
+        ((dense_tokens + dense_positions) % 4).flatten(),
+        minlength=4,
+    )
+    torch.testing.assert_close(star_counts, dense_counts)
+
+    mask = tensor_bin.attention_allow_mask
+    assert mask is not None
+    assert mask.shape == (13, 13)
+    assert not mask[7, 8]
+    assert not mask[12, 3]
+    assert mask[7, 3]
+    assert mask[12, 8]
+
+    shard = shard_shared_prefix_tensor_bin_for_context_parallel(
+        tensor_bin,
+        cp_rank=0,
+        cp_size=2,
+        padding_multiple=8,
+    )
+    assert shard.padded_total_length == 16
+
+
+def test_tp_sp_shard_composes_interior_and_topology_padding() -> None:
+    """M-aligned branches and the final star tail remain distinct metadata."""
+    input_ids = torch.tensor(
+        [
+            [10, 11, 12, 13, 20, 21, 22, 0, 0],
+            [10, 11, 12, 13, 30, 31, 32, 33, 0],
+            [10, 11, 12, 13, 40, 41, 42, 43, 44],
+        ]
+    )
+    tensor_bin = build_shared_prefix_tensor_plan(
+        input_ids=input_ids,
+        input_lengths=torch.tensor([7, 8, 9]),
+        prompt_lengths=torch.tensor([4, 4, 4]),
+        group_ids=["g", "g", "g"],
+        bin_capacity=64,
+        sequence_length_pad_multiple=16,
+        materialize_attention_mask=False,
+    ).shared_bins[0]
+
+    assert tensor_bin.layout.completion_lengths == (5, 4, 3)
+    assert tensor_bin.layout.physical_completion_lengths == (12, 12, 12)
+    assert tensor_bin.layout.physical_total_length == 40
+    assert tensor_bin.indices.physical_padding_positions.numel() == 24
+
+    shards = [
+        shard_shared_prefix_tensor_bin_for_context_parallel(
+            tensor_bin,
+            cp_rank=rank,
+            cp_size=2,
+            tp_size=2,
+            padding_multiple=16,
+        )
+        for rank in range(2)
+    ]
+    assert all(shard.padding_multiple == 16 for shard in shards)
+    assert all(shard.padded_total_length == 48 for shard in shards)
+    assert all(shard.packed_input_ids.numel() == 24 for shard in shards)
+    torch.testing.assert_close(
+        torch.cat([shard.global_token_indices for shard in shards]).sort().values,
+        torch.arange(48),
+    )
+    # The final eight positions are topology-only padding, separate from the
+    # 24 per-branch native padding positions retained in the logical layout.
+    restored = torch.empty(48, dtype=torch.long)
+    for shard in shards:
+        restored[shard.global_token_indices] = shard.packed_input_ids
+    torch.testing.assert_close(restored[40:], torch.zeros(8, dtype=torch.long))
 
 
 @pytest.mark.parametrize(

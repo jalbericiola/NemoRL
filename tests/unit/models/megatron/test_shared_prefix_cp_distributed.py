@@ -43,8 +43,7 @@ def _dense_conventional_logprob_oracle(
     ].expand(row_count, -1, -1)
 
     source_to_local = {
-        source_row: local_row
-        for local_row, source_row in enumerate(layout.row_indices)
+        source_row: local_row for local_row, source_row in enumerate(layout.row_indices)
     }
     scatter_rows = torch.tensor(
         [source_to_local[row] for row in layout.completion_scatter_rows],
@@ -56,9 +55,7 @@ def _dense_conventional_logprob_oracle(
     )
     dense_logits[scatter_rows, scatter_columns] = global_padded_logits[
         0,
-        tensor_bin.indices.predecessor_positions.to(
-            device=global_padded_logits.device
-        ),
+        tensor_bin.indices.predecessor_positions.to(device=global_padded_logits.device),
     ]
 
     local_input_ids = source_input_ids[list(layout.row_indices)].to(
@@ -87,9 +84,7 @@ def _gradient_metrics(
     expected_norm = torch.linalg.vector_norm(expected_fp64)
     actual_norm = torch.linalg.vector_norm(actual_fp64)
     relative_l2 = torch.linalg.vector_norm(difference) / expected_norm
-    cosine = torch.dot(actual_fp64, expected_fp64) / (
-        actual_norm * expected_norm
-    )
+    cosine = torch.dot(actual_fp64, expected_fp64) / (actual_norm * expected_norm)
     return (
         relative_l2.item(),
         cosine.item(),
@@ -250,6 +245,7 @@ def _run_shared_prefix_cp2_scalar_reduce(rank: int, world_size: int) -> None:
                     SharedPrefixForwardMetadata(
                         tensor_bin=tensor_bin,
                         source_sequence_length=source_input_ids.shape[1],
+                        padding_multiple=2 * world_size,
                         cp_rank=rank,
                         cp_size=world_size,
                         padded_total_length=padded_length,
@@ -306,9 +302,9 @@ def _run_shared_prefix_cp2_scalar_reduce(rank: int, world_size: int) -> None:
                     == 0
                 )
 
-    assert reduce_payloads == [
-        (torch.Size([predictor_count]), torch.float32, device)
-    ] * 4
+    assert (
+        reduce_payloads == [(torch.Size([predictor_count]), torch.float32, device)] * 4
+    )
     assert predictor_count < (padded_length // world_size) * vocab_size
     assert predictor_count != vocab_size
 

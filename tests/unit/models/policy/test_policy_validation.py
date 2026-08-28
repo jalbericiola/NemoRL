@@ -182,8 +182,9 @@ def create_megatron_config(
 def create_shared_prefix_train_config(
     *, tp: int = 1, pp: int = 1, cp: int = 1
 ) -> PolicyConfig:
-    """Create the currently supported shared-prefix policy slice."""
+    """Create a topology-valid shared-prefix policy slice."""
     config = create_megatron_config("test-model", tp=tp, pp=pp, cp=cp)
+    cast(dict[str, Any], config["megatron_cfg"])["sequence_parallel"] = tp > 1
     config["precision"] = "bfloat16"
     config["sequence_packing"] = {
         "enabled": True,
@@ -228,6 +229,42 @@ def test_shared_prefix_train_mode_accepts_cp_config_for_late_capability_gate() -
     assert resolved_config.mode == "train"
 
 
+@pytest.mark.parametrize(("tp", "cp"), [(2, 1), (2, 2), (4, 4)])
+def test_shared_prefix_train_mode_accepts_tp_sp_for_late_capability_gate(
+    tp: int,
+    cp: int,
+) -> None:
+    config = create_shared_prefix_train_config(tp=tp, cp=cp)
+
+    resolved_config = validate_shared_prefix_training_config(config)
+
+    assert resolved_config.mode == "train"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tensor_model_parallel_size", True),
+        ("tensor_model_parallel_size", 2.0),
+        ("tensor_model_parallel_size", "2"),
+        ("context_parallel_size", False),
+        ("context_parallel_size", 2.0),
+        ("context_parallel_size", "2"),
+        ("sequence_parallel", 1),
+        ("sequence_parallel", "false"),
+    ],
+)
+def test_shared_prefix_train_mode_rejects_coercible_topology_values(
+    field: str,
+    value: object,
+) -> None:
+    config = create_shared_prefix_train_config()
+    cast(dict[str, Any], config["megatron_cfg"])[field] = value
+
+    with pytest.raises(ValueError, match="positive integer|boolean"):
+        validate_shared_prefix_training_config(config)
+
+
 @pytest.mark.parametrize(
     "config,expected_config_path",
     [
@@ -245,7 +282,7 @@ def test_shared_prefix_train_mode_accepts_cp_config_for_late_capability_gate() -
         ),
         (
             create_megatron_config("test-model", tp=2),
-            "policy.megatron_cfg.tensor_model_parallel_size=1",
+            "sequence_parallel=true exactly when TP>1",
         ),
     ],
 )
@@ -274,20 +311,7 @@ def test_shared_prefix_train_mode_rejects_unsupported_first_slice_topology(
         (
             {"sequence_parallel": True},
             {},
-            "policy.megatron_cfg.sequence_parallel=false",
-        ),
-        (
-            {"activation_checkpointing": True},
-            {},
-            "policy.megatron_cfg.activation_checkpointing=false",
-        ),
-        (
-            {
-                "activation_checkpointing": True,
-                "recompute_granularity": "full",
-            },
-            {},
-            "policy.megatron_cfg.recompute_granularity",
+            "sequence_parallel=true exactly when TP>1",
         ),
         (
             {"mtp_num_layers": 1},
@@ -350,6 +374,41 @@ def test_shared_prefix_cp_requires_aligned_sequence_divisibility() -> None:
         validate_shared_prefix_training_config(config)
 
 
+@pytest.mark.parametrize("raw", [True, False, 0, -8, 8.0, "8"])
+def test_shared_prefix_rejects_invalid_explicit_physical_multiple(raw: object) -> None:
+    config = create_shared_prefix_train_config(tp=2, cp=2)
+    cast(dict[str, Any], config)["make_sequence_length_divisible_by"] = raw
+
+    with pytest.raises(ValueError, match="make_sequence_length_divisible_by"):
+        validate_shared_prefix_training_config(config)
+
+
+@pytest.mark.parametrize("raw", [None, 16])
+def test_shared_prefix_tp_cp_resolves_legacy_or_explicit_m(raw: int | None) -> None:
+    config = create_shared_prefix_train_config(tp=2, cp=2)
+    if raw is not None:
+        config["make_sequence_length_divisible_by"] = raw
+    else:
+        cast(dict[str, Any], config)["make_sequence_length_divisible_by"] = None
+
+    resolved_config = validate_shared_prefix_training_config(config)
+
+    assert resolved_config.mode == "train"
+
+
+def test_shared_prefix_capacities_must_follow_explicit_m_not_only_q() -> None:
+    config = create_shared_prefix_train_config(tp=2, cp=2)
+    config["make_sequence_length_divisible_by"] = 32
+    cast(dict[str, Any], config["sequence_packing"])["train_mb_tokens"] = 128
+    cast(dict[str, Any], config["sequence_packing"])["logprob_mb_tokens"] = 96
+
+    assert validate_shared_prefix_training_config(config).mode == "train"
+
+    cast(dict[str, Any], config["sequence_packing"])["logprob_mb_tokens"] = 104
+    with pytest.raises(ValueError, match="resolved padding M=32"):
+        validate_shared_prefix_training_config(config)
+
+
 def test_shared_prefix_train_mode_allows_selective_activation_recompute() -> None:
     config = create_shared_prefix_train_config()
     cast(dict[str, Any], config["megatron_cfg"]).update(
@@ -363,6 +422,51 @@ def test_shared_prefix_train_mode_allows_selective_activation_recompute() -> Non
     resolved_config = validate_shared_prefix_training_config(config)
 
     assert resolved_config.mode == "train"
+
+
+def test_shared_prefix_train_mode_allows_pipeclean_default_full_recompute() -> None:
+    config = create_shared_prefix_train_config()
+    megatron_config = cast(dict[str, Any], config["megatron_cfg"])
+    megatron_config["activation_checkpointing"] = True
+    assert "recompute_granularity" not in megatron_config
+    assert "recompute_method" not in megatron_config
+    assert "recompute_num_layers" not in megatron_config
+
+    resolved_config = validate_shared_prefix_training_config(config)
+
+    assert resolved_config.mode == "train"
+
+
+@pytest.mark.parametrize(
+    ("recompute_overrides", "expected_config_path"),
+    [
+        (
+            {
+                "activation_checkpointing": True,
+                "recompute_granularity": "full",
+                "recompute_method": "block",
+            },
+            "policy.megatron_cfg.recompute_method='uniform'",
+        ),
+        (
+            {
+                "activation_checkpointing": True,
+                "recompute_granularity": "full",
+                "recompute_num_layers": 2,
+            },
+            "policy.megatron_cfg.recompute_num_layers=1",
+        ),
+    ],
+)
+def test_shared_prefix_train_mode_rejects_incompatible_raw_full_recompute(
+    recompute_overrides: dict[str, object],
+    expected_config_path: str,
+) -> None:
+    config = create_shared_prefix_train_config()
+    cast(dict[str, Any], config["megatron_cfg"]).update(recompute_overrides)
+
+    with pytest.raises(ValueError, match=expected_config_path):
+        validate_shared_prefix_training_config(config)
 
 
 @pytest.mark.parametrize(

@@ -171,7 +171,11 @@ def test_shared_prefix_microbatch_uses_context_parallel_zigzag_shard():
     )
     cfg = {
         "make_sequence_length_divisible_by": 4,
-        "megatron_cfg": {"context_parallel_size": 2},
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 1,
+            "context_parallel_size": 2,
+            "sequence_parallel": False,
+        },
         "sequence_packing": {"enabled": True, "algorithm": "ffd"},
     }
 
@@ -196,16 +200,96 @@ def test_shared_prefix_microbatch_uses_context_parallel_zigzag_shard():
     microbatch = processed[0]
     torch.testing.assert_close(
         microbatch.input_ids_cp_sharded,
-        torch.tensor([[12, 30, 31, 32]]),
+        torch.tensor([[31, 32, 0, 0, 20, 21, 0, 0]]),
     )
     torch.testing.assert_close(
         microbatch.position_ids,
-        torch.tensor([[2, 3, 4, 5]]),
+        torch.tensor([[4, 5, 6, 7, 3, 4, 5, 6]]),
     )
     assert microbatch.shared_prefix is not None
     assert microbatch.shared_prefix.cp_rank == 1
     assert microbatch.shared_prefix.cp_size == 2
-    assert microbatch.shared_prefix.padded_total_length == 8
+    assert microbatch.shared_prefix.tensor_bin.layout.total_length == 8
+    assert microbatch.shared_prefix.tensor_bin.layout.physical_total_length == 13
+    assert microbatch.shared_prefix.padded_total_length == 16
+    assert microbatch.shared_prefix.padding_multiple == 4
+
+
+def test_shared_prefix_microbatch_propagates_tp_sp_physical_multiple():
+    from nemo_rl.data.packing.shared_prefix_metadata import (
+        SHARED_PREFIX_EXECUTION_SLOT,
+        SHARED_PREFIX_GROUP_ID,
+        SHARED_PREFIX_PROMPT_LENGTHS,
+    )
+    from nemo_rl.models.megatron.data import (
+        SHARED_PREFIX_SOURCE_ROW_INDEX,
+        process_shared_prefix_microbatch,
+    )
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [
+                    [10, 11, 12, 13, 20, 21, 22, 0, 0],
+                    [10, 11, 12, 13, 30, 31, 32, 33, 0],
+                    [10, 11, 12, 13, 40, 41, 42, 43, 44],
+                ]
+            ),
+            "input_lengths": torch.tensor([7, 8, 9]),
+            SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([4, 4, 4]),
+            SHARED_PREFIX_GROUP_ID: ["g", "g", "g"],
+            SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0, 0]),
+            SHARED_PREFIX_SOURCE_ROW_INDEX: torch.arange(3),
+        }
+    )
+    cfg = {
+        "make_sequence_length_divisible_by": 16,
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 2,
+            "context_parallel_size": 2,
+            "sequence_parallel": True,
+        },
+        "sequence_packing": {"enabled": True, "algorithm": "ffd"},
+    }
+
+    with patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_rank",
+        return_value=1,
+    ):
+        (microbatch,) = list(
+            process_shared_prefix_microbatch(
+                data_dict=batch,
+                cfg=cfg,
+                bin_capacity=64,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=16,
+                pad_packed_seq_to_multiple_of=1,
+                pad_full_seq_to=None,
+                straggler_timer=None,
+            )
+        )
+
+    assert microbatch.shared_prefix is not None
+    assert microbatch.shared_prefix.padding_multiple == 16
+    assert microbatch.shared_prefix.cp_rank == 1
+    assert microbatch.shared_prefix.cp_size == 2
+    assert microbatch.shared_prefix.tensor_bin.layout.physical_total_length == 40
+    assert microbatch.shared_prefix.padded_total_length == 48
+    assert microbatch.input_ids_cp_sharded.shape == (1, 24)
+
+
+def test_shared_prefix_supplied_topology_fails_loudly_on_missing_keys():
+    from nemo_rl.models.megatron.data import (
+        _resolve_shared_prefix_execution_topology,
+    )
+
+    with pytest.raises(KeyError, match="tensor_model_parallel_size"):
+        _resolve_shared_prefix_execution_topology(
+            {
+                "megatron_cfg": {"context_parallel_size": 2},
+                "make_sequence_length_divisible_by": 4,
+            }
+        )
 
 
 def test_shared_prefix_microbatch_mixes_star_and_fallback_without_row_loss():

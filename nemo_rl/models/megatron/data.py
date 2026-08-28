@@ -36,6 +36,8 @@ from nemo_rl.data.packing import (
     SharedPrefixTensorBin,
     materialize_shared_prefix_layout,
     plan_shared_prefix_bins,
+    resolve_shared_prefix_parallel_topology,
+    resolve_shared_prefix_physical_padding_multiple,
     shard_shared_prefix_tensor_bin_for_context_parallel,
 )
 from nemo_rl.data.packing.shared_prefix_metadata import (
@@ -63,14 +65,17 @@ SHARED_PREFIX_SOURCE_ROW_INDEX = "_shared_prefix_source_row_index"
 class SharedPrefixForwardMetadata:
     """Structured global star metadata retained until model-output fan-out.
 
-    For CP>1, ``padded_total_length`` is divisible by ``2 * cp_size`` and the
-    model input/output sequence is the standard two-chunk zigzag shard for
-    ``cp_rank``.  ``tensor_bin`` remains the unpadded global correctness
-    description used to route scalar next-token log-probabilities.
+    For CP>1, the model input/output sequence is the standard two-chunk zigzag
+    shard for ``cp_rank``. ``padding_multiple`` is the resolved physical packing
+    contract ``M`` and is a multiple of the TP/CP topology quantum ``Q``.
+    ``padded_total_length`` is the minimally ``M``-padded global star length.
+    ``tensor_bin`` retains the global physical and logical correctness metadata
+    used to route scalar next-token log-probabilities.
     """
 
     tensor_bin: SharedPrefixTensorBin
     source_sequence_length: int
+    padding_multiple: int
     cp_rank: int = 0
     cp_size: int = 1
     padded_total_length: Optional[int] = None
@@ -148,6 +153,7 @@ def make_processed_microbatch_iterator(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     shared_prefix_bin_capacity: Optional[int] = None,
+    shared_prefix_padding_multiple: Optional[int] = None,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -188,6 +194,7 @@ def make_processed_microbatch_iterator(
                 pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
                 pad_full_seq_to=pad_full_seq_to,
                 straggler_timer=straggler_timer,
+                padding_multiple=shared_prefix_padding_multiple,
             )
             continue
 
@@ -265,6 +272,7 @@ def get_microbatch_iterator(
         seq_length_key = "input_lengths"
 
     shared_prefix_train = get_shared_prefix_training_config(cfg).mode == "train"
+    shared_prefix_padding_multiple: Optional[int] = None
     if shared_prefix_train:
         if shared_prefix_bin_capacity is None:
             raise ValueError(
@@ -291,6 +299,12 @@ def get_microbatch_iterator(
             data.size,
             dtype=torch.long,
         )
+        (
+            _tp_size,
+            _cp_size,
+            _sequence_parallel,
+            shared_prefix_padding_multiple,
+        ) = _resolve_shared_prefix_execution_topology(cfg)
         raw_iterator = iter((working_data,))
         (
             data_iterator_len,
@@ -299,6 +313,7 @@ def get_microbatch_iterator(
             working_data,
             cfg=cfg,
             bin_capacity=shared_prefix_bin_capacity,
+            padding_multiple=shared_prefix_padding_multiple,
         )
         (
             pad_factor,
@@ -306,7 +321,7 @@ def get_microbatch_iterator(
             pad_full_seq_to,
         ) = _get_pack_sequence_parameters_for_megatron(
             cast(MegatronConfig, cfg["megatron_cfg"]),
-            cfg["make_sequence_length_divisible_by"],
+            shared_prefix_padding_multiple,
             max_execution_length,
         )
         micro_batch_size = 1
@@ -345,16 +360,19 @@ def get_microbatch_iterator(
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
         shared_prefix_bin_capacity=shared_prefix_bin_capacity,
+        shared_prefix_padding_multiple=shared_prefix_padding_multiple,
     )
 
     # Compute padded sequence length for pipeline parallelism
     if shared_prefix_train:
-        cp_size = int(cfg["megatron_cfg"]["context_parallel_size"])
-        cp_alignment = 1 if cp_size == 1 else 2 * cp_size
+        assert shared_prefix_padding_multiple is not None
         padded_seq_length = (
             pad_full_seq_to
             if pad_full_seq_to is not None
-            else _round_up_to_multiple(max_execution_length, cp_alignment)
+            else _round_up_to_multiple(
+                max_execution_length,
+                shared_prefix_padding_multiple,
+            )
         )
     else:
         padded_seq_length = (
@@ -495,6 +513,42 @@ class _SharedPrefixExecutionUnit:
     physical_length: int
 
 
+def _get_shared_prefix_execution_topology(
+    cfg: PolicyConfig,
+) -> tuple[int, int, bool]:
+    """Return the shared-prefix TP/CP/SP topology for one data entry."""
+    raw_megatron_cfg = cfg.get("megatron_cfg")
+    if raw_megatron_cfg is None:
+        tp_size, cp_size, sequence_parallel = 1, 1, False
+    else:
+        megatron_cfg = cast(MegatronConfig, raw_megatron_cfg)
+        tp_size, cp_size, sequence_parallel = resolve_shared_prefix_parallel_topology(
+            tp_size=megatron_cfg["tensor_model_parallel_size"],
+            cp_size=megatron_cfg["context_parallel_size"],
+            sequence_parallel=megatron_cfg["sequence_parallel"],
+        )
+    return tp_size, cp_size, sequence_parallel
+
+
+def _resolve_shared_prefix_execution_topology(
+    cfg: PolicyConfig,
+) -> tuple[int, int, bool, int]:
+    """Resolve TP/CP/SP and the physical packing multiple exactly once.
+
+    Low-level unit callers that omit ``megatron_cfg`` retain the legacy TP1,
+    CP1, SP-disabled topology. A supplied topology must obey the shared-prefix
+    SP contract, and an absent/``None`` physical multiple resolves to its
+    topology quantum rather than through a truthiness fallback.
+    """
+    tp_size, cp_size, sequence_parallel = _get_shared_prefix_execution_topology(cfg)
+    padding_multiple = resolve_shared_prefix_physical_padding_multiple(
+        tp_size=tp_size,
+        cp_size=cp_size,
+        padding_multiple=cfg.get("make_sequence_length_divisible_by"),
+    )
+    return tp_size, cp_size, sequence_parallel, padding_multiple
+
+
 def _iter_prescribed_shared_prefix_slots(
     data_dict: BatchedDataDict[Any],
 ) -> tuple[tuple[int, ...], ...]:
@@ -560,11 +614,13 @@ def _plan_prescribed_shared_prefix_execution_units(
     *,
     cfg: PolicyConfig,
     bin_capacity: int,
+    padding_multiple: Optional[int] = None,
 ) -> tuple[_SharedPrefixExecutionUnit, ...]:
     """Resolve each prescribed slot to exactly one star or conventional unit."""
     rows = _build_shared_prefix_rows(data_dict)
     rows_by_index = {row.row_index: row for row in rows}
-    pad_multiple = cfg["make_sequence_length_divisible_by"]
+    if padding_multiple is None:
+        *_topology, padding_multiple = _resolve_shared_prefix_execution_topology(cfg)
     input_lengths = data_dict["input_lengths"].detach().cpu().to(torch.long)
     units: list[_SharedPrefixExecutionUnit] = []
     for row_indices in _iter_prescribed_shared_prefix_slots(data_dict):
@@ -573,6 +629,7 @@ def _plan_prescribed_shared_prefix_execution_units(
             slot_rows,
             bin_capacity=bin_capacity,
             max_completions_per_bin=16,
+            sequence_length_pad_multiple=padding_multiple,
         )
         if (
             len(candidate.shared_bins) == 1
@@ -584,13 +641,13 @@ def _plan_prescribed_shared_prefix_execution_units(
                 _SharedPrefixExecutionUnit(
                     row_indices=layout.row_indices,
                     shared_layout=layout,
-                    physical_length=layout.total_length,
+                    physical_length=layout.physical_total_length,
                 )
             )
             continue
 
         fallback_length = sum(
-            _round_up_to_multiple(int(input_lengths[index].item()), pad_multiple)
+            _round_up_to_multiple(int(input_lengths[index].item()), padding_multiple)
             for index in row_indices
         )
         if fallback_length > bin_capacity:
@@ -616,12 +673,14 @@ def _get_shared_prefix_execution_shape(
     *,
     cfg: PolicyConfig,
     bin_capacity: int,
+    padding_multiple: Optional[int] = None,
 ) -> tuple[int, int]:
     """Return execution-unit count and maximum physical token length."""
     units = _plan_prescribed_shared_prefix_execution_units(
         data_dict,
         cfg=cfg,
         bin_capacity=bin_capacity,
+        padding_multiple=padding_multiple,
     )
     return len(units), max(unit.physical_length for unit in units)
 
@@ -636,6 +695,7 @@ def process_shared_prefix_microbatch(
     pad_packed_seq_to_multiple_of: int,
     pad_full_seq_to: Optional[int],
     straggler_timer: Optional[StragglerDetector],
+    padding_multiple: Optional[int] = None,
 ) -> Iterator[ProcessedMicrobatch]:
     """Expand one conventional local batch into star and fallback forwards."""
     data_dict = _normalize_shared_prefix_group_ids(data_dict)
@@ -656,15 +716,25 @@ def process_shared_prefix_microbatch(
             "shared-prefix train mode requires seq_length_key='input_lengths'"
         )
 
+    tp_size, cp_size, _sequence_parallel = _get_shared_prefix_execution_topology(cfg)
+    if padding_multiple is None:
+        resolved_padding_multiple = resolve_shared_prefix_physical_padding_multiple(
+            tp_size=tp_size,
+            cp_size=cp_size,
+            padding_multiple=cfg.get("make_sequence_length_divisible_by"),
+        )
+    else:
+        resolved_padding_multiple = resolve_shared_prefix_physical_padding_multiple(
+            tp_size=tp_size,
+            cp_size=cp_size,
+            padding_multiple=padding_multiple,
+        )
     execution_units = _plan_prescribed_shared_prefix_execution_units(
         data_dict,
         cfg=cfg,
         bin_capacity=bin_capacity,
+        padding_multiple=resolved_padding_multiple,
     )
-    megatron_cfg = cfg.get("megatron_cfg") or {}
-    cp_size = int(megatron_cfg.get("context_parallel_size", 1))
-    if cp_size < 1:
-        raise ValueError(f"context_parallel_size must be positive, got {cp_size}")
     cp_rank = get_context_parallel_rank() if cp_size > 1 else 0
     source_sequence_length = data_dict["input_ids"].shape[1]
     for unit in execution_units:
@@ -681,15 +751,18 @@ def process_shared_prefix_microbatch(
                 tensor_bin,
                 cp_rank=cp_rank,
                 cp_size=cp_size,
+                tp_size=tp_size,
+                padding_multiple=resolved_padding_multiple,
             )
             if cp_shard.padded_total_length > bin_capacity:
                 raise RuntimeError(
                     "context-parallel padding makes a shared-prefix star exceed "
                     "its bin capacity: "
-                    f"real_tokens={tensor_bin.layout.total_length}, "
+                    f"physical_tokens={tensor_bin.layout.physical_total_length}, "
                     f"padded_tokens={cp_shard.padded_total_length}, "
                     f"capacity={bin_capacity}. Configure shared-prefix microbatch "
-                    f"token capacities as multiples of {2 * cp_size}."
+                    "token capacities as multiples of resolved padding "
+                    f"M={resolved_padding_multiple}."
                 )
             shared_prefix = SharedPrefixForwardMetadata(
                 tensor_bin=tensor_bin,
@@ -697,6 +770,7 @@ def process_shared_prefix_microbatch(
                 cp_rank=cp_rank,
                 cp_size=cp_size,
                 padded_total_length=cp_shard.padded_total_length,
+                padding_multiple=resolved_padding_multiple,
             )
             yield ProcessedMicrobatch(
                 data_dict=unit_data,

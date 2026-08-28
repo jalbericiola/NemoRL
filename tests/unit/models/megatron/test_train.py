@@ -22,7 +22,7 @@ focusing on:
 - Loss/logprobs/topk post-processors
 """
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -34,6 +34,82 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 
 pytestmark = pytest.mark.mcore
+
+
+@contextmanager
+def _mock_shared_prefix_runtime_topology(
+    *,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    cp_size: int = 1,
+    cp_rank: int = 0,
+):
+    """Supply the process-group topology required by the scalar router."""
+    with (
+        patch(
+            "nemo_rl.models.megatron.train.get_tensor_model_parallel_world_size",
+            return_value=tp_size,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+            return_value=tp_rank,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+            return_value=cp_size,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_rank",
+            return_value=cp_rank,
+        ),
+    ):
+        yield
+
+
+@pytest.mark.parametrize(
+    "logits_dtype",
+    [torch.float32, torch.bfloat16],
+    ids=["fp32", "bf16"],
+)
+def test_shared_prefix_distributed_logprob_2d_backward_matches_log_softmax(
+    logits_dtype: torch.dtype,
+) -> None:
+    """The six-input TP scalar primitive must return one gradient per input."""
+    from nemo_rl.distributed.model_utils import DistributedLogprob
+
+    torch.manual_seed(20260828)
+    logits = torch.randn(7, 19, dtype=logits_dtype, requires_grad=True)
+    reference_logits = logits.detach().clone().requires_grad_(True)
+    targets = torch.tensor([0, 3, 5, 8, 11, 14, 18], dtype=torch.long)
+    scalar_weights = torch.linspace(0.5, 2.0, targets.numel())
+
+    with (
+        patch("torch.distributed.all_reduce") as mock_all_reduce,
+        patch(
+            "torch.distributed.nn.functional.all_reduce",
+            side_effect=lambda value, **_kwargs: value,
+        ) as mock_functional_all_reduce,
+    ):
+        actual = DistributedLogprob.apply(
+            logits,
+            targets,
+            0,
+            logits.shape[-1],
+            object(),
+            False,
+        )
+    expected = (
+        torch.log_softmax(reference_logits.float(), dim=-1)
+        .gather(-1, targets.unsqueeze(-1))
+        .squeeze(-1)
+    )
+    torch.testing.assert_close(actual, expected)
+    assert mock_all_reduce.call_count == 2
+    assert mock_functional_all_reduce.call_count == 1
+
+    (actual * scalar_weights).sum().backward()
+    (expected * scalar_weights).sum().backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad)
 
 
 @pytest.mark.parametrize(
@@ -68,6 +144,7 @@ def test_shared_prefix_logprobs_are_chunked_ordered_and_differentiable(
     metadata = SharedPrefixForwardMetadata(
         tensor_bin=tensor_bin,
         source_sequence_length=6,
+        padding_multiple=1,
     )
     torch.manual_seed(7)
     packed_logits = torch.randn(
@@ -80,9 +157,12 @@ def test_shared_prefix_logprobs_are_chunked_ordered_and_differentiable(
     reference_logits = packed_logits.detach().clone().requires_grad_(True)
 
     real_log_softmax = torch.nn.functional.log_softmax
-    with patch(
-        "torch.nn.functional.log_softmax", wraps=real_log_softmax
-    ) as mock_log_softmax:
+    with (
+        _mock_shared_prefix_runtime_topology(),
+        patch(
+            "torch.nn.functional.log_softmax", wraps=real_log_softmax
+        ) as mock_log_softmax,
+    ):
         restored = shared_prefix_next_token_logprobs(
             packed_logits,
             metadata,
@@ -176,14 +256,16 @@ def test_shared_prefix_cp_logprobs_reduce_scalars_and_route_gradients(
         requires_grad=True,
     )
     assert tensor_bin.layout.total_length == 7
-    reference = shared_prefix_next_token_logprobs(
-        global_logits[:, : tensor_bin.layout.total_length],
-        SharedPrefixForwardMetadata(
-            tensor_bin=tensor_bin,
-            source_sequence_length=6,
-        ),
-        chunk_size=2,
-    )
+    with _mock_shared_prefix_runtime_topology():
+        reference = shared_prefix_next_token_logprobs(
+            global_logits[:, : tensor_bin.layout.total_length],
+            SharedPrefixForwardMetadata(
+                tensor_bin=tensor_bin,
+                source_sequence_length=6,
+                padding_multiple=1,
+            ),
+            chunk_size=2,
+        )
 
     local_logits: list[torch.Tensor] = []
     local_outputs: list[torch.Tensor] = []
@@ -195,6 +277,22 @@ def test_shared_prefix_cp_logprobs_reduce_scalars_and_route_gradients(
         patch(
             "nemo_rl.models.megatron.train.get_context_parallel_group",
             return_value=MagicMock(),
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+            return_value=2,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_rank",
+            side_effect=[0, 1],
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_tensor_model_parallel_world_size",
+            return_value=1,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+            return_value=0,
         ),
     ):
         for cp_rank in range(2):
@@ -219,6 +317,7 @@ def test_shared_prefix_cp_logprobs_reduce_scalars_and_route_gradients(
                         cp_rank=cp_rank,
                         cp_size=2,
                         padded_total_length=8,
+                        padding_multiple=4,
                     ),
                     chunk_size=2,
                 )
@@ -259,6 +358,162 @@ def test_shared_prefix_cp_logprobs_reduce_scalars_and_route_gradients(
     torch.testing.assert_close(reconstructed_grad, global_logits.grad)
 
 
+def test_shared_prefix_logprobs_reject_mismatched_context_parallel_rank() -> None:
+    """CP-local logits must be routed with metadata for the active CP rank."""
+    from nemo_rl.data.packing import build_shared_prefix_tensor_plan
+    from nemo_rl.models.megatron.data import SharedPrefixForwardMetadata
+    from nemo_rl.models.megatron.train import shared_prefix_next_token_logprobs
+
+    tensor_bin = build_shared_prefix_tensor_plan(
+        input_ids=torch.tensor(
+            [
+                [10, 11, 12, 20, 21, 0],
+                [10, 11, 12, 30, 31, 0],
+            ]
+        ),
+        input_lengths=torch.tensor([5, 5]),
+        prompt_lengths=torch.tensor([3, 3]),
+        group_ids=["g", "g"],
+        bin_capacity=8,
+        materialize_attention_mask=False,
+    ).shared_bins[0]
+
+    with (
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+            return_value=2,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_rank",
+            return_value=1,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_tensor_model_parallel_world_size",
+            return_value=1,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+            return_value=0,
+        ),
+        pytest.raises(
+            ValueError,
+            match="metadata CP rank disagrees.*metadata=0, runtime=1",
+        ),
+    ):
+        shared_prefix_next_token_logprobs(
+            torch.randn(1, 4, 40),
+            SharedPrefixForwardMetadata(
+                tensor_bin=tensor_bin,
+                source_sequence_length=6,
+                cp_rank=0,
+                cp_size=2,
+                padded_total_length=8,
+                padding_multiple=4,
+            ),
+        )
+
+
+def test_shared_prefix_tp_logprobs_use_scalar_vocab_parallel_primitive() -> None:
+    """TP stars select bounded rows and never gather full-vocabulary logits."""
+    from nemo_rl.data.packing import build_shared_prefix_tensor_plan
+    from nemo_rl.models.megatron.data import SharedPrefixForwardMetadata
+    from nemo_rl.models.megatron.train import shared_prefix_next_token_logprobs
+
+    input_ids = torch.tensor(
+        [
+            [10, 11, 12, 20, 21, 0],
+            [10, 11, 12, 30, 31, 32],
+        ]
+    )
+    tensor_bin = build_shared_prefix_tensor_plan(
+        input_ids=input_ids,
+        input_lengths=torch.tensor([5, 6]),
+        prompt_lengths=torch.tensor([3, 3]),
+        group_ids=["g", "g"],
+        bin_capacity=16,
+        materialize_attention_mask=False,
+        sequence_length_pad_multiple=4,
+    ).shared_bins[0]
+    local_logits = torch.randn(1, 16, 20, requires_grad=True)
+    calls: list[tuple[torch.Size, torch.Tensor, int, int, object, bool]] = []
+    tp_group = object()
+
+    def fake_distributed_logprob(
+        logits,
+        targets,
+        vocab_start,
+        vocab_end,
+        group,
+        inference_only,
+    ):
+        calls.append(
+            (
+                logits.shape,
+                targets.detach().clone(),
+                vocab_start,
+                vocab_end,
+                group,
+                inference_only,
+            )
+        )
+        return logits.sum(dim=-1)
+
+    with (
+        patch(
+            "nemo_rl.models.megatron.train.get_tensor_model_parallel_world_size",
+            return_value=2,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+            return_value=1,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_tensor_model_parallel_group",
+            return_value=tp_group,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+            return_value=1,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_rank",
+            return_value=0,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.DistributedLogprob.apply",
+            side_effect=fake_distributed_logprob,
+        ),
+        patch(
+            "torch.nn.functional.log_softmax",
+            side_effect=AssertionError("TP path must use distributed log-softmax"),
+        ),
+    ):
+        restored = shared_prefix_next_token_logprobs(
+            local_logits,
+            SharedPrefixForwardMetadata(
+                tensor_bin=tensor_bin,
+                source_sequence_length=6,
+                padded_total_length=16,
+                padding_multiple=4,
+            ),
+            chunk_size=2,
+        )
+
+    assert restored.shape == (2, 5)
+    assert len(calls) == 4
+    assert all(shape[0] <= 2 and shape[1] == 20 for shape, *_ in calls)
+    assert all(
+        (vocab_start, vocab_end, group, inference_only) == (20, 40, tp_group, False)
+        for _, _, vocab_start, vocab_end, group, inference_only in calls
+    )
+    torch.testing.assert_close(
+        torch.cat([targets for _, targets, *_ in calls]),
+        torch.tensor([11, 12, 30, 31, 32, 20, 21]),
+    )
+    restored.sum().backward()
+    assert local_logits.grad is not None
+
+
 def test_shared_prefix_model_forward_lowers_outer_layout_to_hybrid_adapter():
     from nemo_rl.data.packing import build_shared_prefix_tensor_plan
     from nemo_rl.models.megatron.data import SharedPrefixForwardMetadata
@@ -277,10 +532,12 @@ def test_shared_prefix_model_forward_lowers_outer_layout_to_hybrid_adapter():
         group_ids=["g", "g"],
         bin_capacity=16,
         materialize_attention_mask=False,
+        sequence_length_pad_multiple=4,
     ).shared_bins[0]
     metadata = SharedPrefixForwardMetadata(
         tensor_bin=tensor_bin,
         source_sequence_length=6,
+        padding_multiple=4,
     )
     model = MagicMock(return_value=torch.randn(1, 8, 4))
     data_dict = MagicMock()
@@ -303,7 +560,57 @@ def test_shared_prefix_model_forward_lowers_outer_layout_to_hybrid_adapter():
     assert "fp32_output" not in call_kwargs
     assert "packed_seq_params" not in call_kwargs
     assert call_kwargs["shared_prefix_layout"].prefix_len == 3
-    assert tuple(call_kwargs["shared_prefix_layout"].completion_lens) == (3, 2)
+    assert tuple(call_kwargs["shared_prefix_layout"].completion_lens) == (5, 5)
+    assert tuple(call_kwargs["shared_prefix_layout"].logical_completion_lens) == (
+        3,
+        2,
+    )
+    assert call_kwargs["shared_prefix_layout"].padding_multiple == 4
+
+
+def test_shared_prefix_cp1_logprobs_allow_explicit_topology_tail():
+    from nemo_rl.data.packing import build_shared_prefix_tensor_plan
+    from nemo_rl.models.megatron.data import SharedPrefixForwardMetadata
+    from nemo_rl.models.megatron.train import shared_prefix_next_token_logprobs
+
+    input_ids = torch.tensor(
+        [
+            [10, 11, 12, 20, 21, 0, 0],
+            [10, 11, 12, 30, 31, 32, 33],
+        ]
+    )
+    tensor_bin = build_shared_prefix_tensor_plan(
+        input_ids=input_ids,
+        input_lengths=torch.tensor([5, 7]),
+        prompt_lengths=torch.tensor([3, 3]),
+        group_ids=["g", "g"],
+        bin_capacity=16,
+        materialize_attention_mask=False,
+        sequence_length_pad_multiple=4,
+    ).shared_bins[0]
+    torch.manual_seed(41)
+    padded_logits = torch.randn(1, 16, 48)
+
+    with _mock_shared_prefix_runtime_topology():
+        padded = shared_prefix_next_token_logprobs(
+            padded_logits,
+            SharedPrefixForwardMetadata(
+                tensor_bin=tensor_bin,
+                source_sequence_length=7,
+                padded_total_length=16,
+                padding_multiple=4,
+            ),
+        )
+        assert padded.shape == (2, 6)
+        with pytest.raises(ValueError, match="minimal trailing pad"):
+            shared_prefix_next_token_logprobs(
+                padded_logits[:, : tensor_bin.layout.physical_total_length],
+                SharedPrefixForwardMetadata(
+                    tensor_bin=tensor_bin,
+                    source_sequence_length=7,
+                    padding_multiple=4,
+                ),
+            )
 
 
 class TestModelForward:

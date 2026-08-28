@@ -39,6 +39,7 @@ class SharedPrefixTensorIndices:
     predecessor_positions: torch.Tensor
     completion_scatter_rows: torch.Tensor
     completion_scatter_columns: torch.Tensor
+    physical_padding_positions: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,15 +78,101 @@ class SharedPrefixContextParallelShard:
     """One standard zigzag CP shard of a padded shared-prefix star.
 
     ``global_token_indices`` maps the local sequence dimension back to the
-    padded global physical order.  Real tokens occupy
-    ``[0, tensor_bin.layout.total_length)``; any trailing positions are causal
-    padding and are not represented in the logical star layout.
+    padded global physical order. Branch-physical tokens occupy
+    ``[0, tensor_bin.layout.physical_total_length)``; this includes each ordinary
+    sequence's zero tail. Any later positions are topology-only padding.
     """
 
     packed_input_ids: torch.Tensor
     position_ids: torch.Tensor
     global_token_indices: torch.Tensor
     padded_total_length: int
+    padding_multiple: int
+
+
+def resolve_shared_prefix_parallel_topology(
+    *,
+    tp_size: object,
+    cp_size: object,
+    sequence_parallel: object,
+) -> tuple[int, int, bool]:
+    """Strictly validate the TP/CP/SP shared-prefix topology.
+
+    Configuration values must already have their semantic Python types. This
+    deliberately rejects coercible strings, floats, and booleans for world
+    sizes, plus truthy/falsy non-booleans for sequence parallelism.
+    """
+    if isinstance(tp_size, bool) or not isinstance(tp_size, int) or tp_size < 1:
+        raise ValueError(
+            "shared-prefix tensor_model_parallel_size must be a positive integer, "
+            f"got {tp_size!r}"
+        )
+    if isinstance(cp_size, bool) or not isinstance(cp_size, int) or cp_size < 1:
+        raise ValueError(
+            "shared-prefix context_parallel_size must be a positive integer, "
+            f"got {cp_size!r}"
+        )
+    if not isinstance(sequence_parallel, bool):
+        raise ValueError(
+            "shared-prefix sequence_parallel must be a boolean, got "
+            f"{sequence_parallel!r}"
+        )
+    if sequence_parallel != (tp_size > 1):
+        raise ValueError(
+            "shared-prefix train mode requires sequence_parallel=true exactly "
+            f"when TP>1; got TP={tp_size}, sequence_parallel={sequence_parallel}"
+        )
+    return tp_size, cp_size, sequence_parallel
+
+
+def get_shared_prefix_physical_alignment(*, tp_size: int, cp_size: int) -> int:
+    """Return the topology-minimum physical token quantum for one star.
+
+    TP1 retains the original contract: CP1 is unpadded and CP>1 uses the
+    standard two-chunk CP quantum. TP>1 shared-prefix execution requires SP and
+    uses the stricter ``2 * TP * CP`` integration quantum so every CP-local
+    zigzag sequence can be split evenly across TP sequence-parallel ranks.
+    """
+    if isinstance(tp_size, bool) or not isinstance(tp_size, int) or tp_size < 1:
+        raise ValueError(f"tp_size must be a positive integer, got {tp_size!r}")
+    if isinstance(cp_size, bool) or not isinstance(cp_size, int) or cp_size < 1:
+        raise ValueError(f"cp_size must be a positive integer, got {cp_size!r}")
+    if tp_size == 1:
+        return 1 if cp_size == 1 else 2 * cp_size
+    return 2 * tp_size * cp_size
+
+
+def resolve_shared_prefix_physical_padding_multiple(
+    *,
+    tp_size: int,
+    cp_size: int,
+    padding_multiple: int | None,
+) -> int:
+    """Resolve explicit packing alignment against the topology minimum.
+
+    Older configs may omit ``make_sequence_length_divisible_by``; those resolve
+    to the topology quantum. Explicit values are never interpreted by
+    truthiness, so zero and booleans fail instead of silently selecting a
+    fallback.
+    """
+    topology_alignment = get_shared_prefix_physical_alignment(
+        tp_size=tp_size,
+        cp_size=cp_size,
+    )
+    if padding_multiple is None:
+        return topology_alignment
+    if isinstance(padding_multiple, bool) or not isinstance(padding_multiple, int):
+        raise ValueError(
+            "shared-prefix padding_multiple must be an integer or None, got "
+            f"{padding_multiple!r}"
+        )
+    if padding_multiple < 1 or padding_multiple % topology_alignment:
+        raise ValueError(
+            "shared-prefix padding_multiple must be a positive multiple of "
+            f"the TP/CP topology alignment {topology_alignment}, got "
+            f"{padding_multiple}"
+        )
+    return padding_multiple
 
 
 def get_shared_prefix_context_parallel_indices(
@@ -146,7 +233,9 @@ def shard_shared_prefix_tensor_bin_for_context_parallel(
     *,
     cp_rank: int,
     cp_size: int,
+    tp_size: int = 1,
     padding_token_id: int = 0,
+    padding_multiple: int | None = None,
 ) -> SharedPrefixContextParallelShard:
     """Pad and shard a materialized star for MCore context parallelism.
 
@@ -155,9 +244,17 @@ def shard_shared_prefix_tensor_bin_for_context_parallel(
     MCore forest adapter masks padded queries/keys and NeMo-RL never selects
     their logits for the loss.
     """
-    total_length = tensor_bin.layout.total_length
-    alignment = 1 if cp_size == 1 else 2 * cp_size
-    padded_total_length = ((total_length + alignment - 1) // alignment) * alignment
+    total_length = tensor_bin.layout.physical_total_length
+    resolved_padding_multiple = resolve_shared_prefix_physical_padding_multiple(
+        tp_size=tp_size,
+        cp_size=cp_size,
+        padding_multiple=padding_multiple,
+    )
+    padded_total_length = (
+        (total_length + resolved_padding_multiple - 1)
+        // resolved_padding_multiple
+        * resolved_padding_multiple
+    )
     pad_length = padded_total_length - total_length
 
     packed_input_ids = tensor_bin.packed_input_ids
@@ -185,6 +282,7 @@ def shard_shared_prefix_tensor_bin_for_context_parallel(
         position_ids=position_ids.index_select(0, global_token_indices),
         global_token_indices=global_token_indices,
         padded_total_length=padded_total_length,
+        padding_multiple=resolved_padding_multiple,
     )
 
 
@@ -204,7 +302,8 @@ def build_star_attention_allow_mask(
         device: Device for the returned boolean tensor. Defaults to CPU.
 
     Returns:
-        Boolean ``[layout.total_length, layout.total_length]`` allow-mask.
+        Boolean ``[layout.physical_total_length, layout.physical_total_length]``
+        allow-mask.
 
     Raises:
         ValueError: If the layout's branch spans do not exactly cover its packed
@@ -212,19 +311,25 @@ def build_star_attention_allow_mask(
     """
     if layout.prompt_length < 1 or len(layout.row_indices) < 2:
         raise ValueError("a shared-prefix star requires a prompt and at least two rows")
-    if len(layout.branch_starts) != len(layout.completion_lengths):
-        raise ValueError("branch_starts and completion_lengths must have equal length")
+    if len(layout.branch_starts) != len(layout.physical_completion_lengths):
+        raise ValueError(
+            "branch_starts and physical_completion_lengths must have equal length"
+        )
 
     mask_device = torch.device("cpu") if device is None else torch.device(device)
     segment_ids = torch.zeros(
-        layout.total_length,
+        layout.physical_total_length,
         dtype=torch.long,
         device=mask_device,
     )
 
     expected_start = layout.prompt_length
     for branch_id, (branch_start, completion_length) in enumerate(
-        zip(layout.branch_starts, layout.completion_lengths, strict=True),
+        zip(
+            layout.branch_starts,
+            layout.physical_completion_lengths,
+            strict=True,
+        ),
         start=1,
     ):
         if branch_start != expected_start or completion_length < 1:
@@ -236,13 +341,13 @@ def build_star_attention_allow_mask(
         branch_end = branch_start + completion_length
         segment_ids[branch_start:branch_end] = branch_id
         expected_start = branch_end
-    if expected_start != layout.total_length:
+    if expected_start != layout.physical_total_length:
         raise ValueError(
-            "shared-prefix branch spans do not cover total_length: "
-            f"covered {expected_start}, total {layout.total_length}"
+            "shared-prefix branch spans do not cover physical_total_length: "
+            f"covered {expected_start}, total {layout.physical_total_length}"
         )
 
-    packed_positions = torch.arange(layout.total_length, device=mask_device)
+    packed_positions = torch.arange(layout.physical_total_length, device=mask_device)
     query_positions = packed_positions[:, None]
     key_positions = packed_positions[None, :]
     query_segments = segment_ids[:, None]
@@ -290,17 +395,14 @@ def materialize_shared_prefix_layout(
     if not layout.token_gather_rows or not layout.token_gather_columns:
         raise ValueError("shared-prefix layout has no token gather indices")
     if (
-        len(layout.token_gather_rows) != layout.total_length
-        or len(layout.token_gather_columns) != layout.total_length
+        len(layout.token_gather_rows) != layout.physical_total_length
+        or len(layout.token_gather_columns) != layout.physical_total_length
     ):
-        raise ValueError("token gather indices must have total_length entries")
+        raise ValueError("token gather indices must have physical_total_length entries")
     if min(layout.token_gather_rows) < 0 or max(layout.token_gather_rows) >= batch_size:
         raise ValueError("shared-prefix layout references a row outside input_ids")
-    if (
-        min(layout.token_gather_columns) < 0
-        or max(layout.token_gather_columns) >= sequence_width
-    ):
-        raise ValueError("shared-prefix layout references a token outside input_ids")
+    if min(layout.token_gather_columns) < 0:
+        raise ValueError("shared-prefix layout references a negative token column")
 
     expected_prompt = torch.tensor(
         layout.prompt_token_ids,
@@ -352,11 +454,25 @@ def materialize_shared_prefix_layout(
             layout.completion_scatter_columns,
             device=device,
         ),
+        physical_padding_positions=_as_long_tensor(
+            layout.physical_padding_positions,
+            device=device,
+        ),
     )
-    packed_input_ids = input_ids[
+    required_width = max(layout.token_gather_columns) + 1
+    gather_input_ids = input_ids
+    if required_width > sequence_width:
+        gather_input_ids = torch.nn.functional.pad(
+            input_ids,
+            (0, required_width - sequence_width),
+            value=0,
+        )
+    packed_input_ids = gather_input_ids[
         indices.token_gather_rows,
         indices.token_gather_columns,
-    ]
+    ].clone()
+    if indices.physical_padding_positions.numel():
+        packed_input_ids[indices.physical_padding_positions] = 0
     return SharedPrefixTensorBin(
         layout=layout,
         packed_input_ids=packed_input_ids,
@@ -379,6 +495,7 @@ def build_shared_prefix_tensor_plan(
     bin_capacity: int,
     max_completions_per_bin: int = 16,
     materialize_attention_mask: bool = True,
+    sequence_length_pad_multiple: int = 1,
 ) -> SharedPrefixTensorPlan:
     """Plan and materialize exact-prompt stars from a conventional padded batch.
 
@@ -390,6 +507,7 @@ def build_shared_prefix_tensor_plan(
         group_ids: Opaque rollout-group ID per source row.
         bin_capacity: Maximum deduplicated token count per shared bin.
         max_completions_per_bin: Maximum branches per shared bin.
+        sequence_length_pad_multiple: Ordinary per-sequence packing alignment.
         materialize_attention_mask: Whether each tensor bin should include the
             dense global reference mask. Set to ``False`` for fused model adapters
             that consume the structured layout directly.
@@ -434,6 +552,7 @@ def build_shared_prefix_tensor_plan(
         rows,
         bin_capacity=bin_capacity,
         max_completions_per_bin=max_completions_per_bin,
+        sequence_length_pad_multiple=sequence_length_pad_multiple,
     )
     return SharedPrefixTensorPlan(
         shared_bins=tuple(

@@ -264,6 +264,15 @@ TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY = "hybrid_star_cp1_tp1_v1"
 SUPPORTED_SHARED_PREFIX_CP_TRAINING_CAPABILITY = "hybrid_star_cp_v1"
+SUPPORTED_SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp1_tp_sp_v1"
+SUPPORTED_SHARED_PREFIX_TP_CP_SP_TRAINING_CAPABILITY = "hybrid_star_cp_tp_sp_v1"
+SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY = (
+    "hybrid_star_explicit_physical_padding_v1"
+)
+SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY = "hybrid_star_moe_expert_bias_v1"
+SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY = (
+    "hybrid_star_full_uniform_recompute_v1"
+)
 
 
 def destroy_parallel_state():
@@ -442,9 +451,9 @@ def _get_mcore_shared_prefix_training_capability() -> frozenset[str]:
     """Return MCore's explicit end-to-end shared-prefix capabilities.
 
     Older CP1 ports export the scalar ``SHARED_PREFIX_TRAINING_CAPABILITY``.
-    CP-capable ports retain that scalar for compatibility and additionally
-    export ``SHARED_PREFIX_TRAINING_CAPABILITIES`` so CP1 and CP>1 support can
-    be negotiated independently.
+    Newer ports retain that scalar for compatibility and additionally export
+    ``SHARED_PREFIX_TRAINING_CAPABILITIES`` so topology and feature support can
+    be negotiated independently and conjunctively.
     """
     # Stock MCore and kernel-only ports intentionally lack this integration module.
     try:
@@ -508,22 +517,45 @@ def _validate_shared_prefix_model_capability(
     tp_size = int(getattr(model_cfg, "tensor_model_parallel_size", 1))
     pp_size = int(getattr(model_cfg, "pipeline_model_parallel_size", 1))
     cp_size = int(getattr(model_cfg, "context_parallel_size", 1))
-    if tp_size != 1 or pp_size != 1:
+    if tp_size < 1:
+        raise ValueError(
+            f"resolved tensor_model_parallel_size must be positive, got {tp_size}"
+        )
+    if pp_size != 1:
         raise NotImplementedError(
             "policy.shared_prefix_training.mode=train currently requires a "
-            "resolved TP1/PP1 Hybrid model; got "
-            f"TP={tp_size}, PP={pp_size}."
+            f"resolved PP1 Hybrid model; got PP={pp_size}."
         )
     if cp_size < 1:
         raise ValueError(
             f"resolved context_parallel_size must be positive, got {cp_size}"
         )
 
-    required_capability = (
-        SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY
-        if cp_size == 1
-        else SUPPORTED_SHARED_PREFIX_CP_TRAINING_CAPABILITY
-    )
+    sequence_parallel = bool(model_cfg.sequence_parallel)
+    if tp_size == 1:
+        if sequence_parallel:
+            raise NotImplementedError(
+                "policy.shared_prefix_training.mode=train resolved TP=1 with "
+                "model_cfg.sequence_parallel=true; set "
+                "policy.megatron_cfg.sequence_parallel=false."
+            )
+        required_capability = (
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY
+            if cp_size == 1
+            else SUPPORTED_SHARED_PREFIX_CP_TRAINING_CAPABILITY
+        )
+    else:
+        if not sequence_parallel:
+            raise NotImplementedError(
+                "policy.shared_prefix_training.mode=train resolved TP>1 with "
+                "model_cfg.sequence_parallel=false; set "
+                "policy.megatron_cfg.sequence_parallel=true."
+            )
+        required_capability = (
+            SUPPORTED_SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY
+            if cp_size == 1
+            else SUPPORTED_SHARED_PREFIX_TP_CP_SP_TRAINING_CAPABILITY
+        )
     capabilities = _normalize_shared_prefix_training_capabilities(
         _get_mcore_shared_prefix_training_capability()
     )
@@ -532,26 +564,37 @@ def _validate_shared_prefix_model_capability(
         raise NotImplementedError(
             "policy.shared_prefix_training.mode=train requires an MCore build "
             "with end-to-end shared-prefix Hybrid model dispatch capability "
-            f"{required_capability!r} for resolved CP={cp_size}; detected "
+            f"{required_capability!r} for resolved TP={tp_size}, CP={cp_size}, "
+            f"SP={sequence_parallel}; detected "
             f"{detected_capability!r}. Kernel-only ports do not satisfy this "
             "training capability. Use mode=observe until the model integration "
             "is installed."
         )
 
-    if model_cfg.sequence_parallel:
+    if SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY not in capabilities:
         raise NotImplementedError(
-            "policy.shared_prefix_training.mode=train resolved "
-            "model_cfg.sequence_parallel=true; "
-            "policy.megatron_cfg.sequence_parallel must be false."
+            "policy.shared_prefix_training.mode=train materializes explicit per-branch "
+            "physical padding and requires MCore capability "
+            f"{SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY!r}. "
+            "A topology-only shared-prefix MCore build cannot safely accept the "
+            "logical_completion_lens layout contract."
         )
 
     if model_cfg.recompute_granularity == "full":
-        raise NotImplementedError(
-            "policy.shared_prefix_training.mode=train resolved "
-            "model_cfg.recompute_granularity='full'. Set "
-            "policy.megatron_cfg.activation_checkpointing=false or use "
-            "policy.megatron_cfg.recompute_granularity=selective."
-        )
+        if SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY not in capabilities:
+            raise NotImplementedError(
+                "policy.shared_prefix_training.mode=train with full activation "
+                "recomputation requires MCore capability "
+                f"{SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY!r}."
+            )
+        if (
+            model_cfg.recompute_method != "uniform"
+            or model_cfg.recompute_num_layers != 1
+        ):
+            raise NotImplementedError(
+                "policy.shared_prefix_training.mode=train supports full recomputation "
+                "only with recompute_method='uniform' and recompute_num_layers=1."
+            )
 
     if model_cfg.recompute_granularity == "selective" and "core_attn" in (
         getattr(model_cfg, "recompute_modules", None) or []
@@ -695,13 +738,12 @@ def _validate_shared_prefix_model_capability(
             )
 
         if getattr(model_cfg, "moe_router_enable_expert_bias", False):
-            raise NotImplementedError(
-                "policy.shared_prefix_training.mode=train does not yet preserve "
-                "MoE expert-bias token accounting: a shared prompt is routed once "
-                "but the conventional baseline contributes it once per completion. "
-                "Set policy.megatron_cfg.moe_router_enable_expert_bias=false until "
-                "the shared-prefix adapter supplies multiplicity-aware router counts."
-            )
+            if SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY not in capabilities:
+                raise NotImplementedError(
+                    "policy.shared_prefix_training.mode=train with MoE expert bias "
+                    "requires MCore capability "
+                    f"{SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY!r}."
+                )
 
         if (
             getattr(model_cfg, "moe_router_force_load_balancing", False)

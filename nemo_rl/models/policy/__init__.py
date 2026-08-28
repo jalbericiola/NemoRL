@@ -16,6 +16,10 @@ from typing import Any, Literal, NotRequired, TypedDict, Union, cast
 
 from pydantic import BaseModel
 
+from nemo_rl.data.packing.shared_prefix_tensors import (
+    resolve_shared_prefix_parallel_topology,
+    resolve_shared_prefix_physical_padding_multiple,
+)
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
@@ -355,6 +359,10 @@ class MegatronConfig(TypedDict):
     # only specific modules (see recompute_modules). "selective" typically saves ~10-18GB
     # for MoE models while retaining higher throughput than "full".
     recompute_granularity: NotRequired[Literal["full", "selective"]]
+    # Full recompute resolves to uniform chunks of one layer in Megatron setup.
+    # Optional raw values are accepted only when they agree with that resolution.
+    recompute_method: NotRequired[Literal["uniform"]]
+    recompute_num_layers: NotRequired[int]
     # Modules to selectively recompute when recompute_granularity="selective".
     # MCore valid options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
     # Defaults to ["core_attn"] when None. Full list and per-module constraints:
@@ -642,9 +650,9 @@ def validate_shared_prefix_training_config(
 
     Observation mode is deliberately backend-neutral and execution-neutral.
     The resolved TP/PP/CP topology and matching MCore capability are validated
-    later, after Megatron Bridge resolves the concrete model provider.  In
-    particular, accepting CP>1 here does not advertise support: a CP run remains
-    fail-closed unless MCore exports the distinct end-to-end CP capability.
+    later, after Megatron Bridge resolves the concrete model provider. Accepting
+    TP/SP or CP here does not advertise support: the run remains fail-closed
+    unless MCore exports the exact topology and physical-layout capabilities.
     """
     shared_prefix_config = get_shared_prefix_training_config(config)
     if shared_prefix_config.mode != "train":
@@ -666,29 +674,46 @@ def validate_shared_prefix_training_config(
             "policy.sequence_packing.enabled=true."
         )
 
-    cp_size = int(megatron_config["context_parallel_size"])
-    if cp_size < 1:
-        raise ValueError("policy.megatron_cfg.context_parallel_size must be positive.")
-    if cp_size > 1:
-        cp_alignment = 2 * cp_size
-        for capacity_key in ("train_mb_tokens", "logprob_mb_tokens"):
-            capacity = sequence_packing_config.get(capacity_key)
-            if capacity is not None and int(capacity) % cp_alignment != 0:
-                raise ValueError(
-                    "shared-prefix CP padding requires "
-                    f"policy.sequence_packing.{capacity_key} to be divisible "
-                    f"by 2 * context_parallel_size ({cp_alignment}); got {capacity}."
-                )
-        sequence_alignment = config.get("make_sequence_length_divisible_by")
+    try:
+        tp_size, cp_size, _sequence_parallel = resolve_shared_prefix_parallel_topology(
+            tp_size=megatron_config["tensor_model_parallel_size"],
+            cp_size=megatron_config["context_parallel_size"],
+            sequence_parallel=megatron_config["sequence_parallel"],
+        )
+    except ValueError as error:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train requires positive integer "
+            "policy.megatron_cfg.tensor_model_parallel_size/context_parallel_size "
+            "and a boolean policy.megatron_cfg.sequence_parallel that is true "
+            f"exactly when TP>1: {error}"
+        ) from error
+
+    try:
+        padding_multiple = resolve_shared_prefix_physical_padding_multiple(
+            tp_size=tp_size,
+            cp_size=cp_size,
+            padding_multiple=config.get("make_sequence_length_divisible_by"),
+        )
+    except ValueError as error:
+        raise ValueError(
+            "policy.make_sequence_length_divisible_by must be absent/None or "
+            "a positive integer multiple of the shared-prefix TP/CP topology "
+            f"alignment; got {config.get('make_sequence_length_divisible_by')!r}."
+        ) from error
+    for capacity_key in ("train_mb_tokens", "logprob_mb_tokens"):
+        capacity = sequence_packing_config.get(capacity_key)
+        if capacity is None:
+            continue
         if (
-            sequence_alignment is not None
-            and int(sequence_alignment) % cp_alignment != 0
+            isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or capacity < 1
+            or capacity % padding_multiple
         ):
             raise ValueError(
-                "shared-prefix CP padding requires "
-                "policy.make_sequence_length_divisible_by to be divisible by "
-                f"2 * context_parallel_size ({cp_alignment}); got "
-                f"{sequence_alignment}."
+                "shared-prefix physical padding requires "
+                f"policy.sequence_packing.{capacity_key} to be a positive "
+                f"multiple of resolved padding M={padding_multiple}; got {capacity}."
             )
 
     if megatron_config["pipeline_model_parallel_size"] != 1:
@@ -697,31 +722,27 @@ def validate_shared_prefix_training_config(
             "policy.megatron_cfg.pipeline_model_parallel_size=1."
         )
 
-    if megatron_config["tensor_model_parallel_size"] != 1:
-        raise ValueError(
-            "policy.shared_prefix_training.mode=train currently requires "
-            "policy.megatron_cfg.tensor_model_parallel_size=1."
-        )
-
-    if megatron_config["sequence_parallel"]:
-        raise ValueError(
-            "policy.shared_prefix_training.mode=train currently requires "
-            "policy.megatron_cfg.sequence_parallel=false."
-        )
-
     recompute_granularity = megatron_config.get("recompute_granularity")
-    if (
-        megatron_config["activation_checkpointing"]
-        and recompute_granularity != "selective"
+    if megatron_config["activation_checkpointing"] and recompute_granularity in (
+        None,
+        "full",
     ):
-        resolved_granularity = recompute_granularity or "full (default)"
-        raise ValueError(
-            "policy.shared_prefix_training.mode=train does not support full-layer "
-            "activation recomputation: policy.megatron_cfg.activation_checkpointing=true "
-            f"resolves policy.megatron_cfg.recompute_granularity to {resolved_granularity!r}. "
-            "Set policy.megatron_cfg.activation_checkpointing=false or use "
-            "policy.megatron_cfg.recompute_granularity=selective."
-        )
+        recompute_method = megatron_config.get("recompute_method")
+        if recompute_method not in (None, "uniform"):
+            raise ValueError(
+                "policy.shared_prefix_training.mode=train full activation "
+                "recomputation requires policy.megatron_cfg.recompute_method='uniform' "
+                f"when supplied; got {recompute_method!r}."
+            )
+        recompute_num_layers = megatron_config.get("recompute_num_layers")
+        if recompute_num_layers is not None and (
+            isinstance(recompute_num_layers, bool) or recompute_num_layers != 1
+        ):
+            raise ValueError(
+                "policy.shared_prefix_training.mode=train full activation "
+                "recomputation requires policy.megatron_cfg.recompute_num_layers=1 "
+                f"when supplied; got {recompute_num_layers!r}."
+            )
 
     mtp_num_layers = megatron_config.get("mtp_num_layers")
     if mtp_num_layers is not None and mtp_num_layers > 0:
