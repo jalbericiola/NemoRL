@@ -29,6 +29,7 @@ from nemo_rl.data.packing.shared_prefix_tensors import (
     get_shared_prefix_context_parallel_indices,
     get_shared_prefix_physical_alignment,
     materialize_shared_prefix_layout,
+    materialize_shared_prefix_token_aligned_tensor,
     resolve_shared_prefix_parallel_topology,
     resolve_shared_prefix_physical_padding_multiple,
     shard_shared_prefix_tensor_bin_for_context_parallel,
@@ -321,6 +322,41 @@ def test_physical_branch_tails_match_dense_router_count_semantics() -> None:
         padding_multiple=8,
     )
     assert shard.padded_total_length == 16
+
+
+def test_token_aligned_mtp_mask_uses_star_order_and_zeros_physical_padding() -> None:
+    input_ids = torch.tensor(
+        [
+            [10, 11, 12, 20, 21, 91, 92],
+            [10, 11, 12, 30, 31, 32, 33],
+        ]
+    )
+    tensor_bin = build_shared_prefix_tensor_plan(
+        input_ids=input_ids,
+        input_lengths=torch.tensor([5, 7]),
+        prompt_lengths=torch.tensor([3, 3]),
+        group_ids=["g", "g"],
+        bin_capacity=16,
+        sequence_length_pad_multiple=4,
+        materialize_attention_mask=False,
+    ).shared_bins[0]
+    source_mtp_mask = torch.tensor(
+        [
+            [0, 0, 0, 1, 1, 7, 7],
+            [0, 0, 0, 1, 1, 1, 1],
+        ]
+    )
+
+    packed_mtp_mask = materialize_shared_prefix_token_aligned_tensor(
+        source_mtp_mask,
+        tensor_bin=tensor_bin,
+        padding_value=0,
+    )
+
+    torch.testing.assert_close(
+        packed_mtp_mask,
+        torch.tensor([0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0]),
+    )
 
 
 def test_tp_sp_shard_composes_interior_and_topology_padding() -> None:

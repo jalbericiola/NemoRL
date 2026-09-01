@@ -111,9 +111,7 @@ class HFToLocalParamMap:
 
     specs: dict[str, LocalParamSpec] = field(default_factory=dict)
 
-    def get(
-        self, hf_name: str, default: Optional[LocalParamSpec] = None
-    ) -> Optional[LocalParamSpec]:
+    def get(self, hf_name: str, default: Optional[LocalParamSpec] = None) -> Optional[LocalParamSpec]:
         """Spec for ``hf_name`` or ``default`` (``None``); loops assert non-None."""
         return self.specs.get(hf_name, default)
 
@@ -204,9 +202,7 @@ def is_nccl_reshard_param(param_name: str) -> bool:
         return False
     if param_name.startswith("mtp."):
         return False
-    return param_name.endswith(FFN_PROJ_WEIGHT_SUFFIXES) or param_name.endswith(
-        FFN_GROUPED_EXPERT_SUFFIXES
-    )
+    return param_name.endswith(FFN_PROJ_WEIGHT_SUFFIXES) or param_name.endswith(FFN_GROUPED_EXPERT_SUFFIXES)
 
 
 def _get_expert_tp_shard_dim(param_name: str) -> Optional[int]:
@@ -307,12 +303,8 @@ def restore_refit_info_placements(refit_info: dict) -> dict:
     """
     for layer_name in refit_info.get("layer_names", []):
         for param_info in refit_info.get("per_layer_params", {}).get(layer_name, []):
-            param_info["src_placements"] = [
-                _restore_placement(p) for p in param_info["src_placements"]
-            ]
-            param_info["dst_placements"] = [
-                _restore_placement(p) for p in param_info["dst_placements"]
-            ]
+            param_info["src_placements"] = [_restore_placement(p) for p in param_info["src_placements"]]
+            param_info["dst_placements"] = [_restore_placement(p) for p in param_info["dst_placements"]]
             # Reconstruct MeshInfo if serialized to dict
             for key in ("src_mesh_info", "dst_mesh_info"):
                 mesh = param_info.get(key)
@@ -363,14 +355,12 @@ def build_mesh_info(
         to the corresponding mesh-tensor axis index.
     """
     dp_size = num_gpus // (tp_size * ep_size * pp_size)
-    assert dp_size * tp_size * ep_size * pp_size == num_gpus, (
-        f"Cannot divide {num_gpus} GPUs into TP={tp_size} EP={ep_size} PP={pp_size} DP={dp_size}"
-    )
+    assert (
+        dp_size * tp_size * ep_size * pp_size == num_gpus
+    ), f"Cannot divide {num_gpus} GPUs into TP={tp_size} EP={ep_size} PP={pp_size} DP={dp_size}"
 
     dim_sizes = {"tp": tp_size, "ep": ep_size, "dp": dp_size, "pp": pp_size}
-    active_dims = [
-        (n, dim_sizes[n]) for n in ("tp", "ep", "dp", "pp") if dim_sizes[n] > 1
-    ]
+    active_dims = [(n, dim_sizes[n]) for n in ("tp", "ep", "dp", "pp") if dim_sizes[n] > 1]
 
     if not active_dims:
         return MeshInfo(torch.arange(rank_offset, rank_offset + num_gpus)), {}
@@ -422,9 +412,7 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
 # Anchored with ``$`` so it doesn't prefix-match FP8 ``_scale_inv`` siblings
 # (scale_inv siblings take the misc refit path via ``is_nccl_reshard_param`` and
 # must not appear in the per-expert weight fusion groups).
-_INDIVIDUAL_EXPERT_RE = re.compile(
-    r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
-)
+_INDIVIDUAL_EXPERT_RE = re.compile(r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
 
 
 def group_expert_params_in_metadata(
@@ -448,6 +436,7 @@ def group_expert_params_in_metadata(
     """
     # Group individual expert params by (prefix, proj_type)
     expert_groups: dict[tuple[str, str], list[tuple[str, dict]]] = {}
+    expert_ids_by_group: dict[tuple[str, str], set[int]] = {}
     grouped_metadata: dict[str, dict[str, Any]] = OrderedDict()
     pre_grouped_experts = False  # whether any already-fused expert was tagged
 
@@ -457,6 +446,7 @@ def group_expert_params_in_metadata(
             prefix = m.group(1)  # e.g., "model.layers.0.mlp.experts"
             proj = m.group(3)  # "gate_proj", "up_proj", "down_proj"
             expert_groups.setdefault((prefix, proj), []).append((name, meta))
+            expert_ids_by_group.setdefault((prefix, proj), set()).add(int(m.group(2)))
         elif name.endswith("experts.gate_up_proj"):
             # Grouped-GEMM export (e.g. Qwen3.5-VL): experts arrive already
             # stacked as ``[E, 2*inter, hidden]`` with gate+up fused.  The train
@@ -489,6 +479,32 @@ def group_expert_params_in_metadata(
     # Dense model without any experts.
     if not expert_groups and not pre_grouped_experts:
         return state_dict_metadata
+
+    # A leading E=len(entries) is only truthful for canonical expert ids
+    # 0..E-1. Missing/non-contiguous ids would otherwise silently renumber the
+    # grouped tensor and could update the wrong vLLM expert. All projections
+    # present for one expert block must also describe the same expert set;
+    # non-gated blocks simply omit the gate group entirely.
+    expert_ids_by_prefix: dict[str, dict[str, set[int]]] = {}
+    for (prefix, proj), expert_ids in expert_ids_by_group.items():
+        expected_ids = set(range(len(expert_ids)))
+        if expert_ids != expected_ids:
+            raise ValueError(
+                "Cannot group expert refit metadata with non-contiguous expert "
+                f"ids for {prefix}.{proj}: expected {sorted(expected_ids)}, "
+                f"found {sorted(expert_ids)}."
+            )
+        expert_ids_by_prefix.setdefault(prefix, {})[proj] = expert_ids
+
+    for prefix, ids_by_projection in expert_ids_by_prefix.items():
+        reference_projection, reference_ids = next(iter(ids_by_projection.items()))
+        for projection, expert_ids in ids_by_projection.items():
+            if expert_ids != reference_ids:
+                raise ValueError(
+                    f"Expert refit metadata for {prefix} has mismatched expert "
+                    f"ids: {reference_projection}={sorted(reference_ids)}, "
+                    f"{projection}={sorted(expert_ids)}."
+                )
 
     # Stack each (prefix, proj) group into one [E, *per_expert_shape] grouped
     # HF entry.
@@ -548,11 +564,7 @@ def _extract_layer_name(param_name: str) -> str:
     m = _LAYER_RE.match(param_name)
     if m:
         prefix = m.group("prefix")
-        return (
-            f"{prefix}.layers.{m.group('index')}"
-            if prefix
-            else f"layers.{m.group('index')}"
-        )
+        return f"{prefix}.layers.{m.group('index')}" if prefix else f"layers.{m.group('index')}"
     m = _MODEL_PREFIX_RE.match(param_name)
     if m:
         return m.group(1)
@@ -599,9 +611,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     # Gen backend = vLLM — only backend with prepare_nccl_reshard_refit_info.
     backend = generation.get("backend")
     if backend != "vllm":
-        violations.append(
-            f"policy.generation.backend must be 'vllm' (got {backend!r})."
-        )
+        violations.append(f"policy.generation.backend must be 'vllm' (got {backend!r}).")
 
     if vllm_kwargs.get("enable_eplb"):
         violations.append(
@@ -641,30 +651,20 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
 
         # ETP is not supported yet.
         if etp not in (1, None):
-            violations.append(
-                f"Megatron expert_tensor_parallel_size is not supported yet "
-                f"(got etp={etp})."
-            )
+            violations.append(f"Megatron expert_tensor_parallel_size is not supported yet " f"(got etp={etp}).")
 
         # PP-layout knobs that _build_layer_to_pp_stage doesn't yet handle.
         if megatron_cfg.get("pipeline_model_parallel_layout") is not None:
-            violations.append(
-                "policy.megatron_cfg.pipeline_model_parallel_layout must be unset."
-            )
+            violations.append("policy.megatron_cfg.pipeline_model_parallel_layout must be unset.")
         vpp = megatron_cfg.get("virtual_pipeline_model_parallel_size")
         if vpp not in (None, 1):
             violations.append(
-                "policy.megatron_cfg.virtual_pipeline_model_parallel_size must be "
-                f"None or 1 (got {vpp})."
+                "policy.megatron_cfg.virtual_pipeline_model_parallel_size must be " f"None or 1 (got {vpp})."
             )
         if megatron_cfg.get("account_for_embedding_in_pipeline_split", False):
-            violations.append(
-                "policy.megatron_cfg.account_for_embedding_in_pipeline_split must be False."
-            )
+            violations.append("policy.megatron_cfg.account_for_embedding_in_pipeline_split must be False.")
         if megatron_cfg.get("account_for_loss_in_pipeline_split", False):
-            violations.append(
-                "policy.megatron_cfg.account_for_loss_in_pipeline_split must be False."
-            )
+            violations.append("policy.megatron_cfg.account_for_loss_in_pipeline_split must be False.")
 
         # Precision compatibility (train ↔ gen).  Supported combinations:
         #   BF16 train  ↔ BF16 gen   (default, tested)
@@ -743,9 +743,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                 f"equal to tensor_parallel_size (got ep={gen_ep}, tp={gen_tp})."
             )
         if gen_pp != 1:
-            violations.append(
-                f"policy.generation.vllm_cfg.pipeline_parallel_size must be 1 (got {gen_pp})."
-            )
+            violations.append(f"policy.generation.vllm_cfg.pipeline_parallel_size must be 1 (got {gen_pp}).")
 
     if violations:
         raise ValueError(
@@ -792,9 +790,7 @@ def build_nccl_reshard_refit_info(
     ep_size = train_parallelism.get("ep_size", 1)
     use_per_stage = pp_size > 1
     if use_per_stage:
-        assert layer_to_pp_stage is not None, (
-            "layer_to_pp_stage must be provided when pp_size > 1"
-        )
+        assert layer_to_pp_stage is not None, "layer_to_pp_stage must be provided when pp_size > 1"
 
     # Currently we don't support ETP>1 for the nccl_reshard_refit.
     # Non-expert params, ranks are partitioned (tp, dp);
@@ -858,22 +854,16 @@ def build_nccl_reshard_refit_info(
             (
                 per_stage_src_nonexpert[s],
                 per_stage_src_expert[s],
-            ) = _build_train_src_meshes(
-                train_ranks_per_stage, rank_offset=0, stage_pp=1
-            )
+            ) = _build_train_src_meshes(train_ranks_per_stage, rank_offset=0, stage_pp=1)
 
         # dst mesh: gen ranks start at train_ranks_per_stage within each sub-group
-        dst_non_expert, dst_expert = _build_dst_meshes(
-            gen_world_size, rank_offset=train_ranks_per_stage
-        )
+        dst_non_expert, dst_expert = _build_dst_meshes(gen_world_size, rank_offset=train_ranks_per_stage)
     else:
         # Single global mesh pair (PP=1 or no per-stage mapping)
-        (non_expert_mesh, non_expert_dim_map), (expert_mesh, expert_dim_map) = (
-            _build_train_src_meshes(train_world_size, rank_offset=0, stage_pp=pp_size)
+        (non_expert_mesh, non_expert_dim_map), (expert_mesh, expert_dim_map) = _build_train_src_meshes(
+            train_world_size, rank_offset=0, stage_pp=pp_size
         )
-        dst_non_expert, dst_expert = _build_dst_meshes(
-            gen_world_size, rank_offset=train_world_size
-        )
+        dst_non_expert, dst_expert = _build_dst_meshes(gen_world_size, rank_offset=train_world_size)
 
     per_layer_params: dict[str, list] = OrderedDict()
     for name, meta in state_dict_metadata.items():
@@ -896,9 +886,7 @@ def build_nccl_reshard_refit_info(
                 )
             stage = layer_to_pp_stage[layer]
             stage_src_mesh, stage_src_dim_map = (
-                per_stage_src_expert[stage]
-                if expert
-                else per_stage_src_nonexpert[stage]
+                per_stage_src_expert[stage] if expert else per_stage_src_nonexpert[stage]
             )
             info = {
                 "name": name,
@@ -912,9 +900,7 @@ def build_nccl_reshard_refit_info(
             }
         else:
             this_src_mesh, this_src_dim_map = (
-                (expert_mesh, expert_dim_map)
-                if expert
-                else (non_expert_mesh, non_expert_dim_map)
+                (expert_mesh, expert_dim_map) if expert else (non_expert_mesh, non_expert_dim_map)
             )
             info = {
                 "name": name,

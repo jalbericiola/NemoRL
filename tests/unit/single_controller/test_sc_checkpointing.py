@@ -67,6 +67,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.rollout_manager import RolloutStats
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
@@ -237,6 +238,7 @@ class _FakeRolloutManager:
     def __init__(self) -> None:
         self.weight_versions: list[int] = []
         self._tq_buffer = None
+        self.stats = RolloutStats()
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
@@ -331,7 +333,9 @@ def _actor_master_config(
             "train_global_batch_size": num_prompts_per_step * 2,
         },
         loss_fn=ClippedPGLossConfig(),
-        env={},
+        # Checkpoint pump fakes exercise counter/save behavior without running
+        # the real advantage stage that captures per-step trainer rows.
+        env={"should_log_nemo_gym_responses": True},
         data={"shuffle": False, "num_workers": 0},
         grpo=GRPOConfig.model_construct(
             max_num_steps=max_num_steps,
@@ -1102,6 +1106,141 @@ class TestDataloaderState:
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         patched_factories["dataloader"].load_state_dict.assert_not_called()
+
+
+# ── rollout admission persistence ───────────────────────────────────────────
+
+
+class TestRolloutAdmissionPersistence:
+    """The dataloader cursor and lookahead admissions checkpoint as one boundary."""
+
+    @staticmethod
+    def _entry(label: str) -> dict[str, Any]:
+        dispatch_index = int(label.removeprefix("step"))
+        return {
+            "dispatch_index": dispatch_index,
+            "admitted": True,
+            "source": "dataloader",
+            "groups": [
+                {
+                    "target_step": None,
+                    "group_id": None,
+                    "prompt": f"{label}-{group_index}",
+                }
+                for group_index in range(2)
+            ],
+        }
+
+    def test_save_writes_absolute_cursor_and_untrained_batches(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+
+        def seed(actor):
+            actor._next_rollout_admission = 3
+            actor._pending_rollout_admissions.extend(
+                [self._entry("step0"), self._entry("step1"), self._entry("step2")]
+            )
+
+        _run_train_pump(mc, _make_actor_args(), seed=seed)
+
+        state_path = tmp_path / "checkpoints" / "step_2" / "rollout_admission.pt"
+        state = torch.load(state_path, weights_only=False)
+        assert state == {
+            "version": 2,
+            "sampler_name": "windowed",
+            "next_rollout_admission": 3,
+            "legacy_untracked_group_ids": [],
+            "pending_admissions": [self._entry("step2")],
+        }
+
+    def test_restore_seeds_sampler_after_saved_lookahead(self, tmp_path):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        state = {
+            "version": 2,
+            "sampler_name": "windowed",
+            "next_rollout_admission": 4,
+            "legacy_untracked_group_ids": [],
+            "pending_admissions": [self._entry("step3")],
+        }
+        torch.save(state, ckpt_dir / "rollout_admission.pt")
+        save_state = _initial_grpo_save_state()
+        save_state.current_step = 3
+        save_state.total_steps = 3
+        save_state.sampler_name = "windowed"
+
+        async def restore():
+            actor = _ACTOR_CLS(
+                _actor_master_config(tmp_path),
+                _make_actor_args(
+                    save_state=save_state,
+                    last_checkpoint_path=str(ckpt_dir),
+                ),
+                SetupTimingMetrics(),
+            )
+            await actor._maybe_restore_rollout_admission_state()
+            return actor
+
+        actor = asyncio.run(restore())
+
+        assert actor._next_rollout_admission == 4
+        assert list(actor._pending_rollout_admissions) == [self._entry("step3")]
+        # set_dispatch_index(next=4) stores 3 so the next gated admit returns 4.
+        assert actor._sampler._dispatch_index == 3
+
+    def test_replay_snapshot_and_cursor_ledger_share_one_admission_cut(self, tmp_path):
+        """A new unstamped admission cannot enter replay after the ledger cut."""
+
+        class _BlockingSnapshotBuffer(_FakeTQBuffer):
+            def __init__(self):
+                super().__init__({"groups": ["at-cut"]})
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def state_dict(self, *, saved_capacity: int) -> dict[str, Any]:
+                self.state_dict_calls.append(saved_capacity)
+                self.entered.set()
+                await self.release.wait()
+                return dict(self._state)
+
+        async def exercise():
+            buffer = _BlockingSnapshotBuffer()
+            actor = _ACTOR_CLS(
+                _actor_master_config(tmp_path, max_num_steps=1, save_period=1),
+                _make_actor_args(tq_buffer=buffer),
+                SetupTimingMetrics(),
+            )
+            actor._train_steps = 1
+            actor._trainer_version = 1
+            actor._next_rollout_admission = 1
+            actor._pending_rollout_admissions.append(self._entry("step0"))
+
+            save_task = asyncio.create_task(actor._save_checkpoint({}))
+            await buffer.entered.wait()
+
+            async def admit_late_batch():
+                async with actor._rollout_admission_lock:
+                    actor._next_rollout_admission = 2
+                    actor._pending_rollout_admissions.append(self._entry("step1"))
+
+            late_task = asyncio.create_task(admit_late_batch())
+            await asyncio.sleep(0)
+            assert not late_task.done()
+            buffer.release.set()
+            await save_task
+            await late_task
+            actor._checkpointer.shutdown()
+
+        asyncio.run(exercise())
+
+        checkpoint = tmp_path / "checkpoints" / "step_1"
+        admission_state = torch.load(
+            checkpoint / "rollout_admission.pt", weights_only=False
+        )
+        assert admission_state["next_rollout_admission"] == 1
+        assert admission_state["pending_admissions"] == [self._entry("step0")]
+        assert torch.load(checkpoint / "replay_buffer.pt", weights_only=False) == {
+            "groups": ["at-cut"]
+        }
 
 
 # ── replay buffer persistence ────────────────────────────────────────────────

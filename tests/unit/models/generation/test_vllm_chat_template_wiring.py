@@ -25,14 +25,24 @@ These tests drive the real _setup_vllm_openai_api_server against a fake vLLM
 module tree and inspect what each consumer was constructed with.
 """
 
+import asyncio
+import json
 import sys
 import types
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import nemo_rl.models.generation.vllm.vllm_worker_async as vllm_worker_async
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+)
+from nemo_rl.utils.vllm_replay_bundle import (
+    REPLAY_BUNDLE_ENV,
+    REPLAY_BUNDLE_SHA256_ENV,
+    VllmReplayConfigurationError,
+    VllmReplayMissError,
 )
 
 # The server subclasses each of these (NeMoRLOnlineRenderer, and so on), so the
@@ -161,14 +171,16 @@ def _install_fake_vllm(monkeypatch):
         built.clear()
 
 
-def _build_server(monkeypatch, serving_chat_kwargs):
-    """Run the real server setup and hand back the three consumer stubs."""
+def _build_server_context(monkeypatch, serving_chat_kwargs, replay_bundle=None):
+    """Run the real server setup and return its worker and registered app."""
     _install_fake_vllm(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.cfg = {
         "temperature": 1.0,
         "top_p": 1.0,
+        "val_temperature": 0.0,
+        "val_top_p": 1.0,
         "vllm_cfg": {"http_server_serving_chat_kwargs": serving_chat_kwargs},
     }
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
@@ -176,9 +188,46 @@ def _build_server(monkeypatch, serving_chat_kwargs):
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
         served_model_name="served-model", model="model-path"
     )
+    worker._vllm_replay_bundle = replay_bundle
 
-    worker._setup_vllm_openai_api_server(_FakeApp())
+    app = _FakeApp()
+    worker._setup_vllm_openai_api_server(app)
+    return worker, app
+
+
+def _build_server(monkeypatch, serving_chat_kwargs):
+    """Run the real server setup and hand back the three consumer stubs."""
+    _build_server_context(monkeypatch, serving_chat_kwargs)
     return _BUILT["renderer"], _BUILT["chat"], _BUILT["tokenize"]
+
+
+def _chat_handler(app):
+    return dict(app.routes)["/v1/chat/completions"]
+
+
+def _request(**overrides):
+    values = {
+        "stream": False,
+        "temperature": 1.0,
+        "top_k": None,
+        "top_p": 1.0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _raw_request(payload=None):
+    payload = payload or {"seed": 0, "temperature": 1.0, "top_p": 1.0}
+    return SimpleNamespace(
+        body=AsyncMock(
+            return_value=json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -243,3 +292,141 @@ def test_absent_kwargs_render_as_empty_dict(monkeypatch):
 
     assert renderer[0].kwargs["default_chat_template_kwargs"] == {}
     assert tokenization[0].kwargs["default_chat_template_kwargs"] == {}
+
+
+def test_default_off_reaches_live_chat_engine_without_reading_body(monkeypatch):
+    _, app = _build_server_context(monkeypatch, {})
+    live_generator = MagicMock()
+    live_generator.__aiter__.return_value = iter(())
+    serving_chat = _BUILT["chat"][0]
+    serving_chat.create_chat_completion = AsyncMock(return_value=live_generator)
+    raw_request = _raw_request()
+
+    asyncio.run(_chat_handler(app)(_request(), raw_request))
+
+    serving_chat.create_chat_completion.assert_awaited_once()
+    raw_request.body.assert_not_awaited()
+
+
+def test_replay_hit_returns_before_live_chat_engine(monkeypatch):
+    response = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {"content": "recorded", "role": "assistant"},
+            }
+        ],
+        "created": 1,
+        "id": "chatcmpl-recorded",
+        "model": "model",
+        "object": "chat.completion",
+    }
+    replay_bundle = MagicMock()
+    replay_bundle.replay_json_bytes.return_value = response
+    _, app = _build_server_context(monkeypatch, {}, replay_bundle=replay_bundle)
+    serving_chat = _BUILT["chat"][0]
+    serving_chat.create_chat_completion = AsyncMock()
+    raw_request = _raw_request()
+
+    http_response = asyncio.run(_chat_handler(app)(_request(), raw_request))
+
+    assert http_response.status_code == 200
+    assert json.loads(http_response.body) == response
+    replay_bundle.replay_json_bytes.assert_called_once_with(
+        raw_request.body.return_value, streaming=False
+    )
+    serving_chat.create_chat_completion.assert_not_awaited()
+
+
+def test_sampling_assertions_run_before_replay(monkeypatch):
+    replay_bundle = MagicMock()
+    _, app = _build_server_context(monkeypatch, {}, replay_bundle=replay_bundle)
+
+    with pytest.raises(AssertionError, match="matches neither"):
+        asyncio.run(
+            _chat_handler(app)(
+                _request(temperature=0.5),
+                _raw_request({"seed": 0, "temperature": 0.5, "top_p": 1.0}),
+            )
+        )
+
+    replay_bundle.replay_json_bytes.assert_not_called()
+
+
+def test_replay_miss_is_http_error_without_live_fallback(monkeypatch):
+    replay_bundle = MagicMock()
+    replay_bundle.replay_json_bytes.side_effect = VllmReplayMissError(
+        "captured-cohort replay miss for request_sha256=" + "0" * 64
+    )
+    _, app = _build_server_context(monkeypatch, {}, replay_bundle=replay_bundle)
+    serving_chat = _BUILT["chat"][0]
+    serving_chat.create_chat_completion = AsyncMock()
+
+    http_response = asyncio.run(_chat_handler(app)(_request(), _raw_request()))
+
+    assert http_response.status_code == 409
+    assert json.loads(http_response.body)["error"]["code"] == "replay_miss"
+    serving_chat.create_chat_completion.assert_not_awaited()
+
+
+def _required_worker_config() -> dict:
+    return {
+        "_replay_data_parallel_size": 1,
+        "vllm_cfg": {
+            "async_engine": True,
+            "expert_parallel_size": 1,
+            "expose_http_server": True,
+            "replay_bundle_sha256": "0" * 64,
+            "replay_required": True,
+            "tensor_parallel_size": 4,
+        },
+        "vllm_kwargs": {},
+    }
+
+
+def test_required_replay_startup_fails_before_base_worker_when_bundle_env_is_lost(
+    monkeypatch,
+):
+    monkeypatch.delenv(REPLAY_BUNDLE_ENV, raising=False)
+    monkeypatch.delenv(REPLAY_BUNDLE_SHA256_ENV, raising=False)
+    base_init = MagicMock()
+    monkeypatch.setattr(
+        vllm_worker_async.BaseVllmGenerationWorker, "__init__", base_init
+    )
+
+    with pytest.raises(VllmReplayConfigurationError, match=REPLAY_BUNDLE_ENV):
+        VllmAsyncGenerationWorkerImpl(
+            _required_worker_config(), bundle_indices=[0, 1, 2, 3]
+        )
+
+    base_init.assert_not_called()
+
+
+def test_required_replay_is_loaded_and_attested_before_base_worker(monkeypatch):
+    monkeypatch.setenv(REPLAY_BUNDLE_ENV, "/immutable/replay.json")
+    replay = MagicMock()
+    load_replay = MagicMock(return_value=replay)
+    monkeypatch.setattr(vllm_worker_async, "load_vllm_replay_from_config", load_replay)
+    observed_replay_at_base_init = []
+
+    def fake_base_init(worker, *_args, **_kwargs):
+        observed_replay_at_base_init.append(worker._vllm_replay_bundle)
+        worker.is_model_owner = True
+
+    monkeypatch.setattr(
+        vllm_worker_async.BaseVllmGenerationWorker, "__init__", fake_base_init
+    )
+    config = _required_worker_config()
+
+    worker = VllmAsyncGenerationWorkerImpl(
+        config, bundle_indices=[0, 1, 2, 3], defer_model_load=False
+    )
+
+    assert worker._vllm_replay_bundle is replay
+    assert observed_replay_at_base_init == [replay]
+    load_replay.assert_called_once()
+    load_call = load_replay.call_args
+    assert load_call.args == (config["vllm_cfg"],)
+    assert load_call.kwargs["data_parallel_size"] == 1
+    assert load_call.kwargs["actor_identity"].startswith("pid:")

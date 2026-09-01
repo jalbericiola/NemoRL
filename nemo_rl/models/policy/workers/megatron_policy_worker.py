@@ -79,6 +79,8 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
+    SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+    _get_mcore_shared_prefix_training_capability,
     build_inference_model,
     finalize_megatron_setup,
     handle_model_import,
@@ -871,6 +873,12 @@ class MegatronPolicyWorkerImpl(
             unsupported.append("draft-model training")
         if self.cfg["megatron_cfg"].get("use_fused_linear_logprobs", False):
             unsupported.append("fused linear logprobs")
+        peft_config = self.cfg["megatron_cfg"].get("peft")
+        if peft_config is not None and peft_config["enabled"]:
+            unsupported.append(
+                "PEFT/LoRA adapters (set policy.megatron_cfg.peft.enabled=false; "
+                "adapter dropout and shared-prefix gradient semantics are unvalidated)"
+            )
         if self.delegate_pack_to_model:
             unsupported.append("model-owned sequence packing")
         if self.model_slices_context_parallel_inputs:
@@ -887,8 +895,16 @@ class MegatronPolicyWorkerImpl(
                 "shared-prefix train mode could not resolve the MCore model config"
             )
         mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
-        if mtp_num_layers is not None and mtp_num_layers > 0:
-            unsupported.append("MTP")
+        if (
+            mtp_num_layers is not None
+            and mtp_num_layers > 0
+            and SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY
+            not in _get_mcore_shared_prefix_training_capability()
+        ):
+            unsupported.append(
+                "MTP without MCore capability "
+                f"{SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY!r}"
+            )
         tp_size = int(getattr(model_config, "tensor_model_parallel_size", 1))
         sequence_parallel = bool(getattr(model_config, "sequence_parallel", False))
         if tp_size == 1 and sequence_parallel:
@@ -1513,6 +1529,12 @@ class MegatronPolicyWorkerImpl(
                 "a train step is already open; "
                 "call finish_train_step or abort_train_step before begin"
             )
+        # MCore's MTP tracker is process-global and setup/dummy forwards can
+        # populate it before the first streamed optimizer step. Establish the
+        # split step boundary here so finish reports this step alone. The
+        # collector also clears after a successful finish; clearing at begin
+        # additionally prevents an aborted/failed step from leaking forward.
+        self._clear_mtp_metrics_tracker()
         # Match sync train() inference-state reset (line 332-340).
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -1633,6 +1655,23 @@ class MegatronPolicyWorkerImpl(
 
         state["local_valid_seqs"] = state["local_valid_seqs"] + call_local_seqs
         state["local_valid_toks"] = state["local_valid_toks"] + call_local_toks
+
+        # Match the synchronous train path: Hybrid MTP consumes the same
+        # completion-only mask as the policy loss, but the streamed split API
+        # bypasses process_global_batch(), where this tensor is normally
+        # attached.  Attach it before shared-prefix planning so the planner can
+        # materialize and CP-shard it in the exact star-token order.
+        model_config = self._get_model_config()
+        mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+        if mtp_num_layers is not None and mtp_num_layers > 0:
+            if "token_mask" not in data or "sample_mask" not in data:
+                raise ValueError(
+                    "MTP training requires token_mask and sample_mask on every "
+                    "streamed microbatch"
+                )
+            data["mtp_loss_mask"] = data["token_mask"] * data[
+                "sample_mask"
+            ].unsqueeze(-1)
 
         # The number of chunks per optimizer step is a first-class property of
         # this path — it decides how many times gradients are accumulated before
@@ -1855,6 +1894,10 @@ class MegatronPolicyWorkerImpl(
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        # MTP parameters have their own clipping/grad-norm group when
+        # mtp_detach_heads=True. The value exists only on the owning PP stage,
+        # so reduce it across model parallel ranks before exposing metrics.
+        mtp_grad_norm = self.optimizer.grad_norms_by_group.get("mtp")
 
         pg_collection = get_pg_collection(self.model)
         update_successful = logical_and_across_model_parallel_group(
@@ -1865,6 +1908,9 @@ class MegatronPolicyWorkerImpl(
         )
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, mp_group=pg_collection.mp
+        )
+        mtp_grad_norm = reduce_max_stat_across_model_parallel_group(
+            mtp_grad_norm, mp_group=pg_collection.mp
         )
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
@@ -2000,6 +2046,15 @@ class MegatronPolicyWorkerImpl(
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
+
+        # Match the synchronous train path: reduce and clear MCore's per-depth
+        # tracker, broadcast last-PP-stage loss/acceptance metrics, and attach
+        # the MP-reduced MTP grad norm under the same public contract.
+        self._collect_mtp_metrics(
+            metrics,
+            state["total_num_microbatches"],
+            mtp_grad_norm,
+        )
 
         self._train_step_state = None
         return metrics
@@ -2409,6 +2464,19 @@ class MegatronPolicyWorkerImpl(
                 mtp_metrics["grad_norm"] = float(mtp_grad_norm)
             if mtp_metrics:
                 metrics["mtp_metrics"] = mtp_metrics
+
+    def _clear_mtp_metrics_tracker(self) -> None:
+        """Clear process-global MTP logging state at a split-step boundary."""
+        model_config = self._get_model_config()
+        mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+        if mtp_num_layers is not None and mtp_num_layers > 0:
+            # Imported lazily for the same cloudpickle isolation reason as
+            # get_mtp_metrics in _collect_mtp_metrics.
+            from megatron.core.transformer.multi_token_prediction import (
+                MTPLossLoggingHelper,
+            )
+
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
 
     def _set_mtp_grad_scale_func(self, func):
         """Set mtp_grad_scale_func on the model config for MTP loss scaling."""

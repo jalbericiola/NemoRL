@@ -15,6 +15,7 @@
 """Tests for destination-local vLLM refit loading."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -34,6 +35,7 @@ class _FakeExpertOwner:
         tp_rank=0,
         tp_size=1,
         backend_name="TRITON",
+        is_act_and_mul=True,
     ):
         self.use_ep = use_ep
         self._expert_map = expert_map
@@ -42,6 +44,7 @@ class _FakeExpertOwner:
             tp_rank=tp_rank,
             tp_size=tp_size,
             num_logical_experts=4,
+            is_act_and_mul=is_act_and_mul,
             moe_parallel_config=SimpleNamespace(enable_eplb=False),
         )
         self.quant_config = None
@@ -79,13 +82,16 @@ def test_destination_local_copy_matches_vllm_full_weight_tp_loading():
         is_act_and_mul=True,
         moe_parallel_config=SimpleNamespace(tp_size=2),
     )
-    reference_w13 = _expert_param((2, 8, 6), owner)
-    reference_w2 = _expert_param((2, 6, 4), owner)
-    destination_w13 = _expert_param((2, 8, 6), owner)
-    destination_w2 = _expert_param((2, 6, 4), owner)
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    # Compare the two loaders on canonical, unpadded storage. vLLM's full
+    # loader also supports a larger padded hidden dimension by narrowing the
+    # destination before copying, but destination-local refit deliberately
+    # rejects partial writes so that an unexpected layout cannot leave stale
+    # values in the unfilled region.
+    reference_w13 = _expert_param((2, 8, 4), owner)
+    reference_w2 = _expert_param((2, 4, 4), owner)
+    destination_w13 = _expert_param((2, 8, 4), owner)
+    destination_w2 = _expert_param((2, 4, 4), owner)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     full_w1 = torch.arange(64, dtype=torch.float32).reshape(2, 8, 4)
     full_w3 = full_w1 + 100
     full_w2 = torch.arange(64, dtype=torch.float32).reshape(2, 4, 8) + 200
@@ -111,15 +117,9 @@ def test_destination_local_copy_matches_vllm_full_weight_tp_loading():
         tp_rank=1,
     )
 
-    ext._load_destination_local_expert_group(
-        "w13", destination_w13, "w1", list(enumerate(full_w1[:, 4:]))
-    )
-    ext._load_destination_local_expert_group(
-        "w13", destination_w13, "w3", list(enumerate(full_w3[:, 4:]))
-    )
-    ext._load_destination_local_expert_group(
-        "w2", destination_w2, "w2", list(enumerate(full_w2[:, :, 4:]))
-    )
+    ext._load_destination_local_expert_group("w13", destination_w13, "w1", list(enumerate(full_w1[:, 4:])))
+    ext._load_destination_local_expert_group("w13", destination_w13, "w3", list(enumerate(full_w3[:, 4:])))
+    ext._load_destination_local_expert_group("w2", destination_w2, "w2", list(enumerate(full_w2[:, :, 4:])))
 
     torch.testing.assert_close(destination_w13, reference_w13)
     torch.testing.assert_close(destination_w2, reference_w2)
@@ -152,14 +152,10 @@ def test_refit_load_weights_dispatches_to_sharded_path_when_enabled():
     )
 
     loaded = []
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext.checkpoint_engine = SimpleNamespace(shard_expert_weights=True)
     ext.model_runner = SimpleNamespace(
-        model=SimpleNamespace(
-            load_weights=lambda **_kwargs: pytest.fail("used full loader")
-        ),
+        model=SimpleNamespace(load_weights=lambda **_kwargs: pytest.fail("used full loader")),
         vllm_config=SimpleNamespace(model_config=SimpleNamespace(architectures=[])),
     )
     ext._load_sharded_expert_weights = lambda weights: loaded.extend(weights)
@@ -177,9 +173,7 @@ def test_checkpoint_refit_worker_falls_back_to_full_loader():
     )
 
     loaded = []
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext.checkpoint_engine = SimpleNamespace(shard_expert_weights=False)
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(load_weights=lambda *, weights: loaded.extend(weights)),
@@ -200,14 +194,10 @@ def test_checkpoint_refit_preserves_nonsharded_fp8_path(monkeypatch):
     )
 
     loaded = []
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext.checkpoint_engine = SimpleNamespace(shard_expert_weights=False)
     ext.model_runner = SimpleNamespace(
-        model=SimpleNamespace(
-            load_weights=lambda **_kwargs: pytest.fail("used full loader")
-        ),
+        model=SimpleNamespace(load_weights=lambda **_kwargs: pytest.fail("used full loader")),
         vllm_config=SimpleNamespace(model_config=SimpleNamespace(architectures=[])),
     )
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
@@ -231,14 +221,10 @@ def test_refit_load_weights_rejects_sharded_fp8_path(monkeypatch):
         VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext.checkpoint_engine = SimpleNamespace(shard_expert_weights=True)
     ext.model_runner = SimpleNamespace(
-        model=SimpleNamespace(
-            load_weights=lambda **_kwargs: pytest.fail("used full loader")
-        ),
+        model=SimpleNamespace(load_weights=lambda **_kwargs: pytest.fail("used full loader")),
         vllm_config=SimpleNamespace(model_config=SimpleNamespace(architectures=[])),
     )
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
@@ -253,14 +239,10 @@ def test_checkpoint_engine_weight_layout_reports_ep_and_pp_ownership(monkeypatch
         VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
-    owner = _FakeExpertOwner(
-        use_ep=True, expert_map=torch.tensor([-1, 0, -1, 1], dtype=torch.int32)
-    )
+    owner = _FakeExpertOwner(use_ep=True, expert_map=torch.tensor([-1, 0, -1, 1], dtype=torch.int32))
     w13 = _expert_param((2, 8, 4), owner)
     w2 = _expert_param((2, 4, 4), owner)
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
             named_parameters=lambda: [
@@ -276,9 +258,7 @@ def test_checkpoint_engine_weight_layout_reports_ep_and_pp_ownership(monkeypatch
 
     layout = ext._checkpoint_engine_weight_layout()
 
-    assert layout["expert_params"][
-        "model.layers.0.mlp.experts.routed_experts.w13_weight"
-    ] == {
+    assert layout["expert_params"]["model.layers.0.mlp.experts.routed_experts.w13_weight"] == {
         "tp_rank": 0,
         "tp_size": 1,
         "local_expert_ids": [1, 3],
@@ -294,14 +274,10 @@ def test_checkpoint_engine_weight_layout_rejects_shuffled_backend():
 
     owner = _FakeExpertOwner(use_ep=True, backend_name="FLASHINFER_TRTLLM")
     param = _expert_param((2, 8, 4), owner)
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
-            named_parameters=lambda: [
-                ("model.layers.0.mlp.experts.routed_experts.w13_weight", param)
-            ]
+            named_parameters=lambda: [("model.layers.0.mlp.experts.routed_experts.w13_weight", param)]
         )
     )
     with pytest.raises(ValueError, match="canonical unquantized Triton"):
@@ -317,14 +293,10 @@ def test_checkpoint_engine_weight_layout_rejects_transposed_experts():
     owner = _FakeExpertOwner(use_ep=True)
     param = _expert_param((2, 8, 4), owner)
     param.is_transposed = True
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
-            named_parameters=lambda: [
-                ("model.layers.0.mlp.experts.routed_experts.w13_weight", param)
-            ]
+            named_parameters=lambda: [("model.layers.0.mlp.experts.routed_experts.w13_weight", param)]
         )
     )
     with pytest.raises(ValueError, match="canonical expert-weight orientation"):
@@ -349,9 +321,7 @@ def test_checkpoint_engine_weight_layout_rejects_experts_outside_routed_experts(
     # completes: the layout guard runs after it, and that is what must fire.
     owner = _FakeExpertOwner(use_ep=False)
     param = _expert_param((2, 8, 4), owner)
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
             named_parameters=lambda: [
@@ -370,14 +340,10 @@ def test_sharded_refit_directly_loads_full_ep_owned_experts():
         VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
-    owner = _FakeExpertOwner(
-        use_ep=True, expert_map=torch.tensor([-1, 0, -1, 1], dtype=torch.int32)
-    )
+    owner = _FakeExpertOwner(use_ep=True, expert_map=torch.tensor([-1, 0, -1, 1], dtype=torch.int32))
     w13 = _expert_param((2, 8, 4), owner)
     w2 = _expert_param((2, 4, 4), owner)
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
             named_parameters=lambda: [
@@ -424,24 +390,227 @@ def test_sharded_refit_directly_loads_full_ep_owned_experts():
     remaining = ext._load_sharded_expert_weight_groups(list(weights.items()))
 
     assert remaining == []
-    torch.testing.assert_close(
-        w13[0, :4], weights["model.layers.0.mlp.experts.1.gate_proj.weight"]
+    torch.testing.assert_close(w13[0, :4], weights["model.layers.0.mlp.experts.1.gate_proj.weight"])
+    torch.testing.assert_close(w13[1, :4], weights["model.layers.0.mlp.experts.3.gate_proj.weight"])
+    torch.testing.assert_close(w13[0, 4:], weights["model.layers.0.mlp.experts.1.up_proj.weight"])
+    torch.testing.assert_close(w13[1, 4:], weights["model.layers.0.mlp.experts.3.up_proj.weight"])
+    torch.testing.assert_close(w2[0], weights["model.layers.0.mlp.experts.1.down_proj.weight"])
+    torch.testing.assert_close(w2[1], weights["model.layers.0.mlp.experts.3.down_proj.weight"])
+
+
+@pytest.mark.vllm
+def test_sharded_refit_resolves_bridge_nemotron_h_and_loads_full_non_gated_w13():
+    """Bridge backbone/mixer names resolve to vLLM model/routed_experts names."""
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
-    torch.testing.assert_close(
-        w13[1, :4], weights["model.layers.0.mlp.experts.3.gate_proj.weight"]
+
+    owner = _FakeExpertOwner(
+        use_ep=True,
+        expert_map=torch.tensor([0], dtype=torch.int32),
+        is_act_and_mul=False,
     )
-    torch.testing.assert_close(
-        w13[0, 4:], weights["model.layers.0.mlp.experts.1.up_proj.weight"]
+    param_name = "model.layers.0.mixer.experts.routed_experts.w13_weight"
+    source_name = "backbone.layers.0.mixer.experts.0.up_proj.weight"
+    param = _expert_param((1, 4, 4), owner)
+    source = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
+    ext._nrl_named_parameters = {param_name: param}
+    ext.state_dict_info = {source_name: (torch.Size([4, 4]), torch.float32)}
+
+    remaining = ext._load_sharded_expert_weight_groups([(source_name, source)])
+
+    assert remaining == []
+    torch.testing.assert_close(param[0], source)
+
+
+def test_sharded_refit_rejects_gate_projection_for_non_gated_expert() -> None:
+    from nemo_rl.models.generation.vllm.refit_loader import (
+        VllmShardedExpertRefitMixin,
     )
-    torch.testing.assert_close(
-        w13[1, 4:], weights["model.layers.0.mlp.experts.3.up_proj.weight"]
+
+    owner = _FakeExpertOwner(
+        use_ep=True,
+        expert_map=torch.tensor([0], dtype=torch.int32),
+        is_act_and_mul=False,
     )
-    torch.testing.assert_close(
-        w2[0], weights["model.layers.0.mlp.experts.1.down_proj.weight"]
+    param_name = "model.layers.0.mixer.experts.routed_experts.w13_weight"
+    gate_name = "backbone.layers.0.mixer.experts.0.gate_proj.weight"
+    gate = torch.full((4, 4), 7.0)
+    param = _expert_param((1, 4, 4), owner)
+
+    class _Loader(VllmShardedExpertRefitMixin):
+        def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
+            return {param_name: param}
+
+    loader = _Loader()
+    loader.state_dict_info = {gate_name: (torch.Size([4, 4]), torch.float32)}
+
+    with pytest.raises(ValueError, match="Non-gated.*unexpected gate projection"):
+        loader._load_sharded_expert_weight_groups([(gate_name, gate)])
+
+    torch.testing.assert_close(param, torch.zeros_like(param))
+
+
+def test_sharded_refit_does_not_direct_load_native_mtp_expert_into_main_model() -> None:
+    """Native MTP experts remain available for the separate drafter loader."""
+    from nemo_rl.models.generation.vllm.refit_loader import (
+        VllmShardedExpertRefitMixin,
     )
-    torch.testing.assert_close(
-        w2[1], weights["model.layers.0.mlp.experts.3.down_proj.weight"]
+
+    owner = _FakeExpertOwner(
+        use_ep=True,
+        expert_map=torch.tensor([-1, 0], dtype=torch.int32),
+        is_act_and_mul=False,
     )
+    main_name = "model.layers.1.mixer.experts.routed_experts.w13_weight"
+    mtp_name = "mtp.layers.1.mixer.experts.1.up_proj.weight"
+    main_param = _expert_param((1, 4, 4), owner)
+    mtp_weight = torch.full((4, 4), 17.0)
+
+    class _Loader(VllmShardedExpertRefitMixin):
+        def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
+            return {main_name: main_param}
+
+    loader = _Loader()
+
+    remaining = loader._load_sharded_expert_weight_groups([(mtp_name, mtp_weight)])
+
+    assert remaining == [(mtp_name, mtp_weight)]
+    torch.testing.assert_close(main_param, torch.zeros_like(main_param))
+
+
+@pytest.mark.vllm
+def test_expert_component_coverage_accumulates_batches_and_excludes_remote_ids():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        _MainModelDestinationManifest,
+    )
+
+    owner = _FakeExpertOwner(
+        use_ep=True,
+        expert_map=torch.tensor([-1, 0, -1, 1], dtype=torch.int32),
+        is_act_and_mul=False,
+    )
+    w13_name = "model.layers.0.mixer.experts.routed_experts.w13_weight"
+    w2_name = "model.layers.0.mixer.experts.routed_experts.w2_weight"
+    params = {
+        w13_name: _expert_param((2, 4, 4), owner),
+        w2_name: _expert_param((2, 4, 4), owner),
+    }
+    sources = {
+        f"backbone.layers.0.mixer.experts.{expert_id}.{projection}_proj.weight"
+        for expert_id in range(4)
+        for projection in ("up", "down")
+    }
+    manifest = _MainModelDestinationManifest(params, sources)
+
+    # Checkpoint-engine buckets may split both experts and projections.
+    for expert_id in (1, 3):
+        up = f"backbone.layers.0.mixer.experts.{expert_id}.up_proj.weight"
+        down = f"backbone.layers.0.mixer.experts.{expert_id}.down_proj.weight"
+        manifest.record_direct_load({up: w13_name})
+        manifest.record_direct_load({down: w2_name})
+
+    manifest.require_complete()
+    assert not any(
+        f"experts.{expert_id}." in source_name for source_name in manifest.source_to_destination for expert_id in (0, 2)
+    )
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_local_expert",
+        "missing_up_shard",
+        "missing_down_shard",
+        "wrong_destination",
+    ],
+)
+def test_expert_component_coverage_rejects_incomplete_or_wrong_direct_group(failure):
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        _MainModelDestinationManifest,
+    )
+
+    owner = _FakeExpertOwner(
+        use_ep=True,
+        expert_map=torch.tensor([0, 1], dtype=torch.int32),
+        is_act_and_mul=False,
+    )
+    w13_name = "model.layers.0.mixer.experts.routed_experts.w13_weight"
+    w2_name = "model.layers.0.mixer.experts.routed_experts.w2_weight"
+    params = {
+        w13_name: _expert_param((2, 4, 4), owner),
+        w2_name: _expert_param((2, 4, 4), owner),
+    }
+    sources = {
+        f"backbone.layers.0.mixer.experts.{expert_id}.{projection}_proj.weight"
+        for expert_id in range(2)
+        for projection in ("up", "down")
+    }
+    manifest = _MainModelDestinationManifest(params, sources)
+    for expert_id in range(2):
+        up = f"backbone.layers.0.mixer.experts.{expert_id}.up_proj.weight"
+        down = f"backbone.layers.0.mixer.experts.{expert_id}.down_proj.weight"
+        if not (expert_id == 1 and failure in {"missing_local_expert", "missing_up_shard"}):
+            manifest.record_direct_load({up: w2_name if failure == "wrong_destination" else w13_name})
+        if failure == "missing_down_shard" and expert_id == 1:
+            continue
+        if not (failure == "missing_local_expert" and expert_id == 1):
+            manifest.record_direct_load({down: w2_name})
+
+    error = RuntimeError if failure == "wrong_destination" else ValueError
+    with pytest.raises(error):
+        manifest.require_complete()
+
+
+@pytest.mark.vllm
+def test_direct_component_coverage_rejects_swapped_targets():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        _MainModelDestinationManifest,
+    )
+
+    owner = _FakeExpertOwner(use_ep=False, is_act_and_mul=False)
+    w13_name = "model.layers.0.mixer.experts.routed_experts.w13_weight"
+    w2_name = "model.layers.0.mixer.experts.routed_experts.w2_weight"
+    up = "backbone.layers.0.mixer.experts.0.up_proj.weight"
+    down = "backbone.layers.0.mixer.experts.0.down_proj.weight"
+    manifest = _MainModelDestinationManifest(
+        {
+            w13_name: _expert_param((1, 4, 4), owner),
+            w2_name: _expert_param((1, 4, 4), owner),
+        },
+        {up, down},
+    )
+
+    manifest.record_direct_load({up: w2_name, down: w13_name})
+
+    with pytest.raises(RuntimeError, match="wrote.*expected"):
+        manifest.require_complete()
+
+
+@pytest.mark.vllm
+def test_gated_expert_schema_does_not_infer_non_gated_from_missing_gate_metadata():
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        _MainModelDestinationManifest,
+    )
+
+    owner = _FakeExpertOwner(use_ep=False, is_act_and_mul=True)
+    w13_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    w2_name = "model.layers.0.mlp.experts.routed_experts.w2_weight"
+    params = {
+        w13_name: _expert_param((1, 8, 4), owner),
+        w2_name: _expert_param((1, 4, 4), owner),
+    }
+    sources = {
+        "model.layers.0.mlp.experts.0.up_proj.weight",
+        "model.layers.0.mlp.experts.0.down_proj.weight",
+    }
+
+    manifest = _MainModelDestinationManifest(params, sources)
+
+    with pytest.raises(ValueError, match="missing source roles.*gate"):
+        manifest.require_complete()
 
 
 @pytest.mark.vllm
@@ -452,9 +621,7 @@ def test_sharded_refit_loads_sparse_local_expert_ids_individually():
 
     owner = _FakeExpertOwner(use_ep=False)
     param = _expert_param((3, 8, 4), owner)
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     expert_0 = torch.full((4, 4), 1.0)
     expert_2 = torch.full((4, 4), 2.0)
 
@@ -478,14 +645,10 @@ def test_sharded_refit_keeps_full_tp_weight_for_standard_loader():
 
     owner = _FakeExpertOwner(use_ep=False, tp_rank=0, tp_size=2)
     param = _expert_param((4, 8, 4), owner)
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
-            named_parameters=lambda: [
-                ("model.layers.0.mlp.experts.routed_experts.w13_weight", param)
-            ]
+            named_parameters=lambda: [("model.layers.0.mlp.experts.routed_experts.w13_weight", param)]
         )
     )
     name = "model.layers.0.mlp.experts.0.gate_proj.weight"
@@ -510,9 +673,7 @@ def test_sharded_refit_requires_bound_vllm_expert_loader():
     weight_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
     param = torch.nn.Parameter(torch.zeros(1, 8, 4), requires_grad=False)
     param.weight_loader = lambda *args, **kwargs: None
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext._nrl_named_parameters = {param_name: param}
     ext.state_dict_info = {weight_name: (torch.Size([8, 4]), torch.float32)}
 
@@ -530,9 +691,7 @@ def test_sharded_refit_rejects_noncanonical_expert_dimensions():
     weight_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
     owner = _FakeExpertOwner(use_ep=False)
     param = _expert_param((8, 4), owner)
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext._nrl_named_parameters = {param_name: param}
     ext.state_dict_info = {weight_name: (torch.Size([8, 4]), torch.float32)}
 
@@ -550,11 +709,37 @@ def test_sharded_refit_validates_source_shape_against_reported_tp_size():
     weight_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
     owner = _FakeExpertOwner(use_ep=False, tp_size=2)
     param = _expert_param((1, 8, 4), owner)
-    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
-        VllmInternalWorkerExtensionWithCheckpointEngine
-    )
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
     ext._nrl_named_parameters = {param_name: param}
     ext.state_dict_info = {weight_name: (torch.Size([8, 4]), torch.float32)}
 
     with pytest.raises(ValueError, match=r"expected \(4, 4\).*TP size 2"):
         ext._load_sharded_expert_weight_groups([(weight_name, torch.zeros(2, 4))])
+
+
+@pytest.mark.vllm
+def test_sharded_refit_rejects_undersized_destination_region_before_copy_or_coverage():
+    """Metadata-consistent source prefixes must not partially fill a target."""
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtensionWithCheckpointEngine,
+    )
+
+    param_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    weight_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
+    owner = _FakeExpertOwner(
+        use_ep=True,
+        expert_map=torch.tensor([0], dtype=torch.int32),
+    )
+    param = _expert_param((1, 8, 4), owner)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(VllmInternalWorkerExtensionWithCheckpointEngine)
+    ext._nrl_named_parameters = {param_name: param}
+    # The received shard agrees with the advertised state-dict shape, but it
+    # is smaller than the selected w1 half of the live destination (4x4).
+    ext.state_dict_info = {weight_name: (torch.Size([2, 4]), torch.float32)}
+    ext._record_direct_main_load = MagicMock()
+
+    with pytest.raises(ValueError, match=r"destination region requires \(4, 4\)"):
+        ext._load_sharded_expert_weight_groups([(weight_name, torch.ones(2, 4))])
+
+    torch.testing.assert_close(param, torch.zeros_like(param))
+    ext._record_direct_main_load.assert_not_called()

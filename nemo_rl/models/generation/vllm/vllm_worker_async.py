@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import os
 import threading
 import time
 import uuid
@@ -53,6 +54,17 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
+)
+from nemo_rl.utils.vllm_replay_bundle import (
+    REPLAY_BUNDLE_ENV,
+    REPLAY_BUNDLE_SHA256_ENV,
+    VllmReplayBundle,
+    VllmReplayConfigurationError,
+    VllmReplayRequestError,
+    load_vllm_replay_from_config,
+    reject_vllm_direct_async_generation_during_replay,
+    validate_vllm_replay_environment_contract,
+    validate_vllm_replay_worker_topology,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -99,6 +111,36 @@ class VllmAsyncGenerationWorkerImpl(
         self.server_thread = None
         self.base_url = None
         self.http_server = None
+        self._vllm_replay_bundle: VllmReplayBundle | None = None
+
+        # A model owner must attest replay intent and topology before the base
+        # constructor can load a model or create a live engine. Required mode
+        # is carried in Hydra config, independently of the two environment
+        # variables that identify the immutable bundle file.
+        if bundle_indices is not None:
+            vllm_cfg = config["vllm_cfg"]
+            contract = validate_vllm_replay_environment_contract(vllm_cfg)
+            replay_environment_present = bool(
+                os.environ.get(REPLAY_BUNDLE_ENV)
+                or os.environ.get(REPLAY_BUNDLE_SHA256_ENV)
+            )
+            replay_enabled = contract.required or replay_environment_present
+            if replay_enabled and "_replay_data_parallel_size" not in config:
+                raise VllmReplayConfigurationError(
+                    "replay model owner is missing allocator-derived "
+                    "_replay_data_parallel_size"
+                )
+            outer_data_parallel_size = config.get("_replay_data_parallel_size", 1)
+            attested_data_parallel_size = validate_vllm_replay_worker_topology(
+                vllm_cfg,
+                config.get("vllm_kwargs", {}),
+                outer_data_parallel_size=outer_data_parallel_size,
+            )
+            self._vllm_replay_bundle = load_vllm_replay_from_config(
+                vllm_cfg,
+                data_parallel_size=attested_data_parallel_size,
+                actor_identity=f"pid:{os.getpid()}",
+            )
 
         super().__init__(
             config,
@@ -344,6 +386,12 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
+
+    def get_vllm_replay_state(self) -> dict[str, Any]:
+        """Return a secret-free summary of captured-cohort replay progress."""
+        if self._vllm_replay_bundle is None:
+            return {"enabled": False}
+        return self._vllm_replay_bundle.state_summary()
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
@@ -773,6 +821,26 @@ class VllmAsyncGenerationWorkerImpl(
                 f"val_top_p={generation_config['val_top_p']})"
             )
 
+            # Sampling assertions intentionally remain above replay. A captured
+            # response must not let an off-policy request bypass this boundary.
+            if self._vllm_replay_bundle is not None:
+                try:
+                    replay_response = self._vllm_replay_bundle.replay_json_bytes(
+                        await raw_request.body(), streaming=request.stream is True
+                    )
+                except VllmReplayRequestError as error:
+                    return JSONResponse(
+                        content={
+                            "error": {
+                                "message": str(error),
+                                "type": "nemorl_vllm_replay_error",
+                                "code": error.error_code,
+                            }
+                        },
+                        status_code=error.status_code,
+                    )
+                return JSONResponse(content=replay_response)
+
             try:
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
@@ -1014,6 +1082,12 @@ class VllmAsyncGenerationWorkerImpl(
             raise RuntimeError(
                 "generate_async can only be used when async_engine is enabled in vLLM config."
             )
+
+        reject_vllm_direct_async_generation_during_replay(
+            self.cfg["vllm_cfg"],
+            method_name="generate_async",
+            replay_bundle_loaded=self._vllm_replay_bundle is not None,
+        )
 
         # Handle empty input case
         if len(data["input_ids"]) == 0:
@@ -1301,6 +1375,12 @@ class VllmAsyncGenerationWorkerImpl(
                 "generate_text_async can only be used when async_engine is enabled in vLLM config."
             )
 
+        reject_vllm_direct_async_generation_during_replay(
+            self.cfg["vllm_cfg"],
+            method_name="generate_text_async",
+            replay_bundle_loaded=self._vllm_replay_bundle is not None,
+        )
+
         # Handle empty input case
         if len(data["prompts"]) == 0:
             return
@@ -1537,11 +1617,12 @@ class VllmAsyncGenerationWorkerImpl(
             else:
                 worker_results = result_or_coro
 
-            worker_result = worker_results[0]
+            worker_results = cast(list[bool], worker_results)
 
-            if not worker_result:
+            if not worker_results or not all(worker_results):
                 print(
-                    f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
+                    "Error: Worker failed nccl_reshard_refit. "
+                    f"Results: {worker_results}"
                 )
                 return False
             await self._reset_encoder_cache_after_weight_update()

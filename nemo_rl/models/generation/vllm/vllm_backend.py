@@ -21,11 +21,16 @@ from typing import Any, Literal
 
 import torch
 import zmq
+from torch.distributed.tensor.placement_types import Shard
 
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineMixin,
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
+)
+from nemo_rl.models.generation.vllm.refit_layout import (
+    parse_hf_expert_weight,
+    resolve_vllm_expert_parameter_name,
 )
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
@@ -57,7 +62,7 @@ except ImportError:
     )
 
 
-WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
+WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard", "checkpoint_engine"]
 WeightUpdateFinalizer = Callable[[], None]
 
 
@@ -90,13 +95,9 @@ class _IPCWeightManifest:
         duplicate_keys.update(self.loaded_keys & batch_keys)
         unexpected_keys = batch_keys - self.expected_keys
         if duplicate_keys:
-            self.errors.append(
-                _format_refit_key_error("duplicate keys", duplicate_keys)
-            )
+            self.errors.append(_format_refit_key_error("duplicate keys", duplicate_keys))
         if unexpected_keys:
-            self.errors.append(
-                _format_refit_key_error("unexpected keys", unexpected_keys)
-            )
+            self.errors.append(_format_refit_key_error("unexpected keys", unexpected_keys))
         return None if self.errors else batch_keys
 
     def record_loaded(self, keys: set[str]) -> None:
@@ -117,6 +118,314 @@ class _IPCWeightManifest:
             raise IPCWeightManifestError("; ".join(details))
 
 
+_QKV_SOURCE_RE = re.compile(r"^(?P<prefix>.+)\.(?P<role>q_proj|k_proj|v_proj)\.weight$")
+_DENSE_GATE_UP_SOURCE_RE = re.compile(r"^(?P<prefix>.+)\.(?P<role>gate_proj|up_proj)\.weight$")
+_GROUPED_EXPERT_SOURCE_RE = re.compile(
+    r"^(?P<prefix>.+\.(?:mlp|mixer)\.experts)\." r"(?P<role>gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+def _refit_parameter_alias(name: str) -> str:
+    """Normalize only architecture-owned name aliases, not tensor roles."""
+    layer_match = re.search(r"(?:^|\.)(layers\.\d+\..+)$", name)
+    relative_name = layer_match.group(1) if layer_match is not None else name
+    return relative_name.replace(".routed_experts.", ".")
+
+
+def _resolve_refit_destination_name(candidate: str, destination_names: Iterable[str]) -> str | None:
+    destinations = set(destination_names)
+    if candidate in destinations:
+        return candidate
+    alias = _refit_parameter_alias(candidate)
+    matches = sorted(name for name in destinations if _refit_parameter_alias(name) == alias)
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous vLLM refit destination alias for {candidate!r}: {matches}")
+    return matches[0] if matches else None
+
+
+def _vllm_model_type(model_runner: Any, model: Any) -> str | None:
+    """Read the HF model type across vLLM's public and model-local configs."""
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    candidates = (
+        getattr(getattr(model, "config", None), "model_type", None),
+        getattr(getattr(model_config, "hf_config", None), "model_type", None),
+        getattr(model_config, "model_type", None),
+    )
+    return next((value for value in candidates if isinstance(value, str)), None)
+
+
+def _is_quantized_vllm_model(model_runner: Any, model: Any) -> bool:
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    return any(
+        value is not None
+        for value in (
+            getattr(vllm_config, "quant_config", None),
+            getattr(model, "quant_config", None),
+        )
+    )
+
+
+def _expected_local_expert_ids(param: torch.nn.Parameter) -> set[int] | None:
+    """Return global expert IDs owned by this destination, when inspectable."""
+    owner = getattr(getattr(param, "weight_loader", None), "__self__", None)
+    if bool(getattr(owner, "use_ep", False)):
+        expert_map = getattr(owner, "_expert_map", None)
+        if expert_map is None:
+            raise RuntimeError("Strict refit coverage cannot inspect local expert ownership.")
+        return {
+            expert_id for expert_id, local_id in enumerate(expert_map.detach().cpu().tolist()) if int(local_id) >= 0
+        }
+    if param.ndim == 3:
+        return set(range(param.shape[0]))
+    return None
+
+
+def _expert_uses_gated_activation(param: torch.nn.Parameter) -> bool:
+    """Read vLLM's authoritative fused-MoE storage contract.
+
+    Missing source metadata must never be interpreted as evidence that a gate
+    does not exist.  vLLM's ``is_act_and_mul`` controls whether ``w13`` stores
+    two input projections; default to gated (the stricter requirement) when an
+    older loader does not expose the flag.
+    """
+    owner = getattr(getattr(param, "weight_loader", None), "__self__", None)
+    moe_config = getattr(owner, "moe_config", None)
+    return bool(getattr(moe_config, "is_act_and_mul", True))
+
+
+class _MainModelDestinationManifest:
+    """Track destination and fused-source coverage across one strict refit.
+
+    A destination-name set alone is insufficient: vLLM returns the same fused
+    ``qkv_proj``, ``gate_up_proj``, or ``w13`` name after loading any one source
+    component.  This manifest therefore derives the expected source-component
+    contract from the trainer's state-dict metadata and requires each fused
+    component to be independently accepted by the loader.  Direct expert and
+    NCCL paths contribute exact source names transaction-wide.
+    """
+
+    def __init__(
+        self,
+        expected_params: dict[str, torch.nn.Parameter],
+        expected_source_names: Iterable[str],
+        *,
+        include_native_mtp_sources: bool = False,
+        context: str = "main-model",
+    ) -> None:
+        self.expected_names = set(expected_params)
+        self.loaded_names: set[str] = set()
+        self.accepted_source_names: set[str] = set()
+        self.source_to_destination: dict[str, str] = {}
+        self._component_roles: dict[str, dict[int | None, dict[str, set[str]]]] = {}
+        self.schema_errors: list[str] = []
+        self.tracking_errors: list[str] = []
+        self.context = context
+
+        for source_name in expected_source_names:
+            source_namespace = set(source_name.split("."))
+            if not include_native_mtp_sources and source_namespace.intersection({"mtp", "draft"}):
+                continue
+            component = self._resolve_source_component(
+                source_name,
+                expected_params,
+                target_is_mtp_drafter=include_native_mtp_sources,
+            )
+            if component is None:
+                continue
+            destination_name, role, expert_id = component
+            if expert_id is not None:
+                local_expert_ids = _expected_local_expert_ids(expected_params[destination_name])
+                if local_expert_ids is not None and expert_id not in local_expert_ids:
+                    continue
+            self.source_to_destination[source_name] = destination_name
+            self._component_roles.setdefault(destination_name, {}).setdefault(expert_id, {}).setdefault(
+                role, set()
+            ).add(source_name)
+
+        self._validate_source_schema(expected_params)
+
+    @staticmethod
+    def _resolve_source_component(
+        source_name: str,
+        expected_params: dict[str, torch.nn.Parameter],
+        *,
+        target_is_mtp_drafter: bool = False,
+    ) -> tuple[str, str, int | None] | None:
+        expert_weight = parse_hf_expert_weight(source_name)
+        if expert_weight is not None:
+            destination = resolve_vllm_expert_parameter_name(
+                expert_weight.parameter_name,
+                expected_params,
+                target_is_mtp_drafter=target_is_mtp_drafter,
+            )
+            if destination is None:
+                return None
+            projection = source_name.rsplit(".", 2)[-2]
+            return (
+                destination,
+                projection.removesuffix("_proj"),
+                expert_weight.expert_id,
+            )
+
+        grouped_match = _GROUPED_EXPERT_SOURCE_RE.match(source_name)
+        if grouped_match is not None:
+            role = grouped_match.group("role").removesuffix("_proj")
+            destination_leaf = "w2_weight" if role == "down" else "w13_weight"
+            candidate = f"{grouped_match.group('prefix')}.routed_experts." f"{destination_leaf}"
+            destination = resolve_vllm_expert_parameter_name(
+                candidate,
+                expected_params,
+                target_is_mtp_drafter=target_is_mtp_drafter,
+            )
+            return (destination, role, None) if destination is not None else None
+
+        qkv_match = _QKV_SOURCE_RE.match(source_name)
+        if qkv_match is not None:
+            role = qkv_match.group("role")[0]
+            candidate = f"{qkv_match.group('prefix')}.qkv_proj.weight"
+            destination = _resolve_refit_destination_name(candidate, expected_params)
+            return (destination, role, None) if destination is not None else None
+
+        gate_up_match = _DENSE_GATE_UP_SOURCE_RE.match(source_name)
+        if gate_up_match is not None and ".experts." not in source_name:
+            role = gate_up_match.group("role").removesuffix("_proj")
+            candidate = f"{gate_up_match.group('prefix')}.gate_up_proj.weight"
+            destination = _resolve_refit_destination_name(candidate, expected_params)
+            return (destination, role, None) if destination is not None else None
+
+        # Preserve exact source-key association for ordinary 1:1 parameters as
+        # well. Prefix-only HF/vLLM aliases (for example backbone.layers ->
+        # model.layers) remain safe to resolve through the same layer-relative
+        # matcher; architecture-specific renames that cannot be proven stay on
+        # destination-only coverage.
+        destination = _resolve_refit_destination_name(source_name, expected_params)
+        return (destination, "direct", None) if destination is not None else None
+
+    def _validate_source_schema(self, expected_params: dict[str, torch.nn.Parameter]) -> None:
+        for destination_name, param in expected_params.items():
+            role_groups = self._component_roles.get(destination_name, {})
+            if destination_name.endswith(("w13_bias", "w2_bias")):
+                # The pinned Nano/RLVR41 contract has ``mlp_bias=False``.  A
+                # biased fused-MoE layout packs expert-indexed HF bias sources
+                # into shared vLLM destinations, but the current refit
+                # metadata does not expose enough slice identity to prove that
+                # every expert bias was written.  Never let a single returned
+                # destination name masquerade as complete coverage for that
+                # unsupported variant.
+                self.schema_errors.append(f"{destination_name}: strict fused expert-bias coverage " "is unsupported")
+            elif destination_name.endswith("qkv_proj.weight"):
+                self._require_roles(destination_name, role_groups, {"q", "k", "v"})
+            elif destination_name.endswith("gate_up_proj.weight"):
+                self._require_roles(destination_name, role_groups, {"gate", "up"})
+            elif destination_name.endswith("w13_weight"):
+                expected_ids = _expected_local_expert_ids(param)
+                required_roles = {"up"}
+                if _expert_uses_gated_activation(param):
+                    required_roles.add("gate")
+                self._require_roles(
+                    destination_name,
+                    role_groups,
+                    required_roles,
+                    expected_expert_ids=expected_ids,
+                )
+            elif destination_name.endswith("w2_weight"):
+                self._require_roles(
+                    destination_name,
+                    role_groups,
+                    {"down"},
+                    expected_expert_ids=_expected_local_expert_ids(param),
+                )
+
+    def _require_roles(
+        self,
+        destination_name: str,
+        role_groups: dict[int | None, dict[str, set[str]]],
+        required_roles: set[str],
+        *,
+        expected_expert_ids: set[int] | None = None,
+    ) -> None:
+        grouped_roles = role_groups.get(None)
+        if grouped_roles is not None:
+            missing_roles = required_roles - set(grouped_roles)
+            if missing_roles:
+                self.schema_errors.append(f"{destination_name}: missing source roles " f"{sorted(missing_roles)}")
+            return
+
+        expert_ids = (
+            expected_expert_ids
+            if expected_expert_ids is not None
+            else {expert_id for expert_id in role_groups if expert_id is not None}
+        )
+        if not expert_ids:
+            missing_roles = required_roles - set(role_groups.get(None, {}))
+            self.schema_errors.append(
+                f"{destination_name}: no source components for roles " f"{sorted(missing_roles or required_roles)}"
+            )
+            return
+        for expert_id in sorted(expert_ids):
+            roles = role_groups.get(expert_id, {})
+            missing_roles = required_roles - set(roles)
+            if missing_roles:
+                self.schema_errors.append(
+                    f"{destination_name}: expert {expert_id} missing source roles " f"{sorted(missing_roles)}"
+                )
+
+    def expects_component_source(self, source_name: str) -> bool:
+        return source_name in self.source_to_destination
+
+    def component_destination(self, source_name: str) -> str:
+        return self.source_to_destination[source_name]
+
+    def record_loader_result(self, source_names: set[str], loaded_names: set[str] | None) -> None:
+        if not isinstance(loaded_names, set):
+            self.tracking_errors.append("the vLLM loader did not report loaded destination parameter names")
+            return
+        self.loaded_names.update(loaded_names)
+        for source_name in source_names:
+            destination_name = self.source_to_destination.get(source_name)
+            if destination_name is not None and destination_name in loaded_names:
+                self.accepted_source_names.add(source_name)
+
+    def record_direct_load(
+        self,
+        source_destinations: dict[str, str],
+        additional_destination_names: set[str] | None = None,
+    ) -> None:
+        self.loaded_names.update(source_destinations.values())
+        self.loaded_names.update(additional_destination_names or set())
+        for source_name, actual_destination in source_destinations.items():
+            destination_name = self.source_to_destination.get(source_name)
+            if destination_name is not None and destination_name == actual_destination:
+                self.accepted_source_names.add(source_name)
+            elif destination_name is not None:
+                self.tracking_errors.append(
+                    f"direct source {source_name!r} wrote {actual_destination!r}, " f"expected {destination_name!r}"
+                )
+
+    def record_loaded_destinations(self, loaded_names: set[str] | None) -> None:
+        self.record_loader_result(set(), loaded_names)
+
+    def require_valid_schema(self) -> None:
+        """Reject an impossible strict source contract before any transfer."""
+        if self.schema_errors:
+            raise ValueError(f"Incomplete vLLM {self.context} refit source schema: " + "; ".join(self.schema_errors))
+
+    def require_complete(self) -> None:
+        if self.tracking_errors:
+            raise RuntimeError(f"Strict {self.context} refit coverage failed: " + "; ".join(self.tracking_errors))
+
+        details = list(self.schema_errors)
+        missing_names = self.expected_names - self.loaded_names
+        if missing_names:
+            details.append(_format_refit_key_error("missing destination parameters", missing_names))
+        missing_sources = set(self.source_to_destination) - self.accepted_source_names
+        if missing_sources:
+            details.append(_format_refit_key_error("missing required source components", missing_sources))
+        if details:
+            raise ValueError(f"Incomplete vLLM {self.context} refit coverage: " + "; ".join(details))
+
+
 class NixlVllmWorker(VllmWorker):
     """vLLM worker that establishes NIXL/UCX before vLLM initialization."""
 
@@ -131,9 +440,7 @@ def fix_gemma3_vision_weight_name(key: str) -> str:
 
     When performing refit, the vision-tower weight paths are flattened. This unflattens them.
     """
-    return re.sub(
-        r"vision_tower\.(?!vision_model\.)", "vision_tower.vision_model.", key
-    )
+    return re.sub(r"vision_tower\.(?!vision_model\.)", "vision_tower.vision_model.", key)
 
 
 def _read_mtp_layer_weights_from_checkpoint(
@@ -162,18 +469,39 @@ def _read_mtp_layer_weights_from_checkpoint(
     with open(index_path) as f:
         weight_map = json.load(f)["weight_map"]
 
+    # Some architectures expose MTP as appended transformer layers (for
+    # example model.layers.52.*), while Nemotron-H exports its complete
+    # predictor under a native mtp.layers.* namespace. Preserve native names:
+    # vLLM's architecture-specific drafter loader owns their mapping.
+    native_mtp_names = {name for name in weight_map if name.startswith("mtp.")}
+    config_path = os.path.join(model_path, "config.json")
+    if native_mtp_names and os.path.exists(config_path):
+        with open(config_path) as f:
+            hf_config = json.load(f)
+        if str(hf_config.get("model_type", "")).startswith("nemotron_h"):
+            predictor_count = int(hf_config.get("num_nextn_predict_layers", 0))
+            predictor_pattern = str(hf_config.get("mtp_hybrid_override_pattern", ""))
+            expected_native_layers = set(range(predictor_count * len(predictor_pattern)))
+            native_layer_re = re.compile(r"^mtp\.layers\.(\d+)\.")
+            actual_native_layers = {
+                int(match.group(1)) for name in native_mtp_names if (match := native_layer_re.match(name)) is not None
+            }
+            if not expected_native_layers or actual_native_layers != expected_native_layers:
+                raise ValueError(
+                    "Incomplete Nemotron-H native MTP checkpoint: expected physical "
+                    f"layers {sorted(expected_native_layers)}, found "
+                    f"{sorted(actual_native_layers)}"
+                )
     layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
     shard_to_names: dict[str, list[str]] = {}
     for name, shard in weight_map.items():
         match = layer_re.search(name)
-        if match is not None and int(match.group(1)) in mtp_layer_indices:
+        if name in native_mtp_names or (match is not None and int(match.group(1)) in mtp_layer_indices):
             shard_to_names.setdefault(shard, []).append(name)
 
     weights: list[tuple[str, torch.Tensor]] = []
     for shard, names in shard_to_names.items():
-        with safe_open(
-            os.path.join(model_path, shard), framework="pt", device="cpu"
-        ) as reader:
+        with safe_open(os.path.join(model_path, shard), framework="pt", device="cpu") as reader:
             for name in names:
                 weights.append((name, reader.get_tensor(name)))
     return weights
@@ -185,6 +513,10 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+    _nrl_main_destination_manifest: _MainModelDestinationManifest | None = None
+    _nrl_nccl_reshard_destination_names: set[str] | None = None
+    _nrl_nccl_reshard_source_destinations: dict[str, str] | None = None
+    _nrl_refit_source_names: set[str] | None = None
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -193,15 +525,138 @@ class VllmInternalWorkerExtension:
             self._nrl_named_parameters = params
         return params
 
-    def _load_full_hf_weights(
-        self, policy_weights: list[tuple[str, torch.Tensor]]
+    def _load_full_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
+        self._record_refit_source_names(name for name, _tensor in policy_weights)
+        manifest = getattr(self, "_nrl_main_destination_manifest", None)
+        if manifest is None:
+            self.model_runner.model.load_weights(weights=policy_weights)
+            return
+        self._load_model_weights_with_manifest(self.model_runner.model, policy_weights, manifest)
+
+    @staticmethod
+    def _load_model_weights_with_manifest(
+        model: Any,
+        weights: list[tuple[str, torch.Tensor]],
+        manifest: _MainModelDestinationManifest,
+    ) -> set[str] | None:
+        """Load fused components independently so acceptance is observable."""
+        loaded_union: set[str] = set()
+        tracking_failed = False
+        remaining_weights: list[tuple[str, torch.Tensor]] = []
+        component_cohorts: list[tuple[list[tuple[str, torch.Tensor]], set[str]]] = []
+        for name, tensor in weights:
+            if not manifest.expects_component_source(name):
+                remaining_weights.append((name, tensor))
+                continue
+            destination_name = manifest.component_destination(name)
+            for cohort_weights, cohort_destinations in component_cohorts:
+                if destination_name not in cohort_destinations:
+                    cohort_weights.append((name, tensor))
+                    cohort_destinations.add(destination_name)
+                    break
+            else:
+                component_cohorts.append(([(name, tensor)], {destination_name}))
+
+        # Each cohort contains at most one source for any fused destination.
+        # A returned destination can therefore be attributed to exactly one
+        # component, while q/k/v and expert role+ID cohorts from every layer are
+        # loaded together instead of rebuilding vLLM's loader maps per tensor.
+        for cohort_weights, _cohort_destinations in component_cohorts:
+            source_names = {name for name, _tensor in cohort_weights}
+            loaded_names = model.load_weights(weights=cohort_weights)
+            manifest.record_loader_result(source_names, loaded_names)
+            if isinstance(loaded_names, set):
+                loaded_union.update(loaded_names)
+            else:
+                tracking_failed = True
+
+        if remaining_weights:
+            loaded_names = model.load_weights(weights=remaining_weights)
+            manifest.record_loader_result({name for name, _tensor in remaining_weights}, loaded_names)
+            if isinstance(loaded_names, set):
+                loaded_union.update(loaded_names)
+            else:
+                tracking_failed = True
+        return None if tracking_failed else loaded_union
+
+    def _record_refit_source_names(self, source_names: Iterable[str]) -> None:
+        active_source_names = getattr(self, "_nrl_refit_source_names", None)
+        if active_source_names is not None:
+            active_source_names.update(source_names)
+
+    def _record_main_destination_names(self, loaded_names: set[str] | None) -> None:
+        """Record destinations initialized by one batch in the active refit."""
+        manifest = getattr(self, "_nrl_main_destination_manifest", None)
+        if manifest is not None:
+            manifest.record_loaded_destinations(loaded_names)
+
+    def _record_direct_main_load(
+        self,
+        source_destinations: dict[str, str],
+        additional_destination_names: set[str] | None = None,
     ) -> None:
-        self.model_runner.model.load_weights(weights=policy_weights)
+        """Record exact sources written without calling vLLM's loader."""
+        self._record_refit_source_names(source_destinations)
+        manifest = getattr(self, "_nrl_main_destination_manifest", None)
+        if manifest is not None:
+            manifest.record_direct_load(source_destinations, additional_destination_names)
+
+    def _strict_nemotron_h_refit_model_type(self) -> str | None:
+        model_type = _vllm_model_type(self.model_runner, self.model_runner.model)
+        if isinstance(model_type, str) and model_type.startswith("nemotron_h"):
+            return model_type
+        return None
+
+    def _new_main_destination_manifest(self, transport: WeightUpdateTransport) -> _MainModelDestinationManifest | None:
+        """Build strict coverage only for the qualified Nemotron-H BF16 path."""
+        model = self.model_runner.model
+        model_type = self._strict_nemotron_h_refit_model_type()
+        if model_type is None:
+            return None
+        real_quant_probe = getattr(self, "_is_real_quant_model", None)
+        is_real_quant = bool(real_quant_probe()) if callable(real_quant_probe) else False
+        if _is_quantized_vllm_model(self.model_runner, model) or is_real_quant:
+            # A receiver-side rejection here could deadlock IPC/collective or
+            # checkpoint-engine senders that have already been dispatched.
+            # Preserve the established quantized refit path, but state the
+            # qualification boundary explicitly: RLVR41 is BF16 and strict
+            # source-component coverage is not claimed for quantized models.
+            logger.warning(
+                "Strict Nemotron-H source-component refit coverage is disabled "
+                "for quantized vLLM model_type=%s; source-component and "
+                "destination completeness are not validated by this path, and "
+                "the existing quantized loading behavior is being preserved.",
+                model_type,
+            )
+            return None
+
+        logger.info(
+            "Strict Nemotron-H BF16 refit coverage active for model_type=%s " "transport=%s",
+            model_type,
+            transport,
+        )
+        if transport == "nccl_reshard":
+            refit_info = getattr(self, "nccl_reshard_refit_info", None)
+            if refit_info is None:
+                raise RuntimeError("Nemotron-H NCCL-reshard refit metadata was not prepared.")
+            source_names = {
+                param_info["name"]
+                for layer_name in refit_info["layer_names"]
+                for param_info in refit_info["per_layer_params"][layer_name]
+            }
+            source_names.update(refit_info.get("misc_meta", {}))
+        else:
+            state_dict_info = getattr(self, "state_dict_info", None)
+            if state_dict_info is None:
+                raise RuntimeError("Strict Nemotron-H refit coverage requires prepared " "state-dict metadata.")
+            source_names = set(state_dict_info)
+        return _MainModelDestinationManifest(self._get_named_parameters(), source_names)
 
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         if fp8.is_fp8_model(self.model_runner.vllm_config):
+            self._record_refit_source_names(name for name, _tensor in policy_weights)
             fp8.load_weights(policy_weights, self.model_runner)
             return
         self._load_full_hf_weights(policy_weights)
@@ -237,9 +692,7 @@ class VllmInternalWorkerExtension:
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         # Place vLLM ranks after all training ranks so all training workers can join
-        rank = train_world_size + resolve_rollout_rank(
-            rank_prefix, world_size - train_world_size
-        )
+        rank = train_world_size + resolve_rollout_rank(rank_prefix, world_size - train_world_size)
 
         self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             master_address=ip, port=port, rank=rank, world_size=world_size
@@ -301,16 +754,14 @@ class VllmInternalWorkerExtension:
     def maybe_init_zmq(self):
         """Initialize the ZMQ socket if it doesn't exist."""
         if not hasattr(self, "zmq_socket"):
-            self.zmq_context = zmq.Context()  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+            self.zmq_context = (
+                zmq.Context()
+            )  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             self.zmq_socket = self.zmq_context.socket(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
                 zmq.REP
             )
-            self.zmq_socket.setsockopt(
-                zmq.SNDTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 120000
-            )  # set timeout to 120 seconds
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 120000)  # set timeout to 120 seconds
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 120000)  # set timeout to 120 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
@@ -321,7 +772,21 @@ class VllmInternalWorkerExtension:
             state_dict_info (dict): A dictionary containing the info for refit.
                 e.g. {tensor_name: (shape, dtype)}
         """
+        had_previous_state = hasattr(self, "state_dict_info")
+        previous_state = getattr(self, "state_dict_info", None)
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        try:
+            manifest = self._new_main_destination_manifest("collective")
+            if manifest is not None:
+                manifest.require_valid_schema()
+        except BaseException:
+            # Preparation happens before sender dispatch. Do not retain an
+            # invalid strict manifest as the metadata for a later transaction.
+            if had_previous_state:
+                self.state_dict_info = previous_state
+            else:
+                del self.state_dict_info
+            raise
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
@@ -428,20 +893,17 @@ class VllmInternalWorkerExtension:
         draft_owner = getattr(self.model_runner, "drafter", None)
         return getattr(draft_owner, "model", None) if draft_owner else None
 
-    def _load_draft_weights(
-        self, draft_weights: list[tuple[str, torch.Tensor]]
-    ) -> None:
+    def _load_draft_weights(self, draft_weights: list[tuple[str, torch.Tensor]]) -> set[str] | None:
         if not draft_weights:
-            return
+            return set()
+        self._record_refit_source_names(f"draft.{name}" for name, _tensor in draft_weights)
 
         draft_model = self._get_drafter_model()
         if draft_model is None:
-            logger.warning(
-                "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
-            )
-            return
+            logger.warning("[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update.")
+            return None
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
-        draft_model.load_weights(weights=draft_weights)
+        return draft_model.load_weights(weights=draft_weights)
 
     def _mtp_drafter_refit_enabled(self) -> bool:
         """Whether MTP drafter weights should be refreshed from the refit stream.
@@ -498,9 +960,7 @@ class VllmInternalWorkerExtension:
             process_weights_after_loading,
         )
 
-        draft_model_config = (
-            self.model_runner.vllm_config.speculative_config.draft_model_config
-        )
+        draft_model_config = self.model_runner.vllm_config.speculative_config.draft_model_config
         with set_current_vllm_config(self.model_runner.vllm_config):
             process_weights_after_loading(draft_model, draft_model_config, self.device)
 
@@ -547,7 +1007,37 @@ class VllmInternalWorkerExtension:
                 f"include MTP layer weights to run deepseek_mtp speculative decoding."
             )
 
-        self._load_draft_weights(weights)
+        draft_model_type = getattr(getattr(draft_model, "config", None), "model_type", None)
+        if (
+            isinstance(draft_model_type, str)
+            and draft_model_type.startswith("nemotron_h")
+            and any(name.startswith("mtp.") for name, _ in weights)
+        ):
+            if getattr(draft_model, "quant_config", None) is not None:
+                raise RuntimeError(
+                    "Strict native Nemotron-H MTP coverage is currently "
+                    "supported only for non-quantized vLLM drafters."
+                )
+            expected_params = {
+                name: param
+                for name, param in draft_model.named_parameters()
+                if re.match(r"^model\.layers\.\d+\.", name)
+            }
+            if not expected_params:
+                raise RuntimeError(
+                    "The native Nemotron-H MTP drafter exposes no physical " "model.layers.* parameters to validate."
+                )
+            weights = self._trim_vocab_padding(draft_model, weights)
+            manifest = _MainModelDestinationManifest(
+                expected_params,
+                (name for name, _tensor in weights),
+                include_native_mtp_sources=True,
+                context="native Nemotron-H MTP",
+            )
+            self._load_model_weights_with_manifest(draft_model, weights, manifest)
+            manifest.require_complete()
+        else:
+            self._load_draft_weights(weights)
 
         # The MTP block contains MoE experts whose weights need post-load
         # processing (e.g. grouped-GEMM layout), matching the main-model path.
@@ -556,9 +1046,7 @@ class VllmInternalWorkerExtension:
             process_weights_after_loading,
         )
 
-        draft_model_config = (
-            self.model_runner.vllm_config.speculative_config.draft_model_config
-        )
+        draft_model_config = self.model_runner.vllm_config.speculative_config.draft_model_config
         with set_current_vllm_config(self.model_runner.vllm_config):
             process_weights_after_loading(draft_model, draft_model_config, self.device)
         # Mark that the MTP drafter is served from a one-time disk load so refit
@@ -578,10 +1066,7 @@ class VllmInternalWorkerExtension:
         weights, dispatches policy weights through the configured refit loader,
         and loads draft weights into the drafter model.
         """
-        if (
-            "Gemma3ForConditionalGeneration"
-            in self.model_runner.vllm_config.model_config.architectures
-        ):
+        if "Gemma3ForConditionalGeneration" in self.model_runner.vllm_config.model_config.architectures:
             for idx, (key, weight) in enumerate(weights):
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
@@ -607,27 +1092,53 @@ class VllmInternalWorkerExtension:
         return self._sparse_delta_applier
 
     @contextmanager
-    def _weight_update_lifecycle(
-        self, transport: WeightUpdateTransport
-    ) -> Iterator[WeightUpdateFinalizer]:
+    def _weight_update_lifecycle(self, transport: WeightUpdateTransport) -> Iterator[WeightUpdateFinalizer]:
         """Provide setup/finalization around a transport-owned weight update."""
-        del transport
         from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
         )
 
+        manifest = self._new_main_destination_manifest(transport)
+        bulk_destination_names: set[str] | None = None
+        bulk_source_destinations: dict[str, str] | None = None
+        if transport == "nccl_reshard":
+            bulk_destination_names = getattr(self, "_nrl_nccl_reshard_destination_names", None)
+            bulk_source_destinations = getattr(self, "_nrl_nccl_reshard_source_destinations", None)
+            if manifest is not None and (bulk_destination_names is None or bulk_source_destinations is None):
+                raise RuntimeError("NCCL-reshard source/destination coverage was not prepared " "before refit.")
+        self._nrl_refit_source_names = set()
+        self._nrl_main_destination_manifest = manifest
+        if transport == "nccl_reshard" and bulk_source_destinations:
+            assert bulk_destination_names is not None
+            # The bulk path writes these registered parameters directly and
+            # validates a LocalParamSpec for every source tensor. The lifecycle
+            # begins only after all bulk receives complete successfully, so
+            # seed their exact source components before loading misc tensors.
+            self._record_direct_main_load(bulk_source_destinations, bulk_destination_names)
+
         def finalize() -> None:
-            with set_current_vllm_config(self.model_runner.vllm_config):
-                process_weights_after_loading(
-                    self.model_runner.model, self.model_config, self.device
+            source_names = getattr(self, "_nrl_refit_source_names", None)
+            if not source_names:
+                raise RuntimeError(
+                    f"Refusing to finalize an empty {transport} weight update; " "the transaction received no weights."
                 )
+            if manifest is not None:
+                manifest.require_complete()
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                process_weights_after_loading(self.model_runner.model, self.model_config, self.device)
             self._maybe_process_mtp_drafter_after_loading()
 
-        yield finalize
-        # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
-        # this optional second pass, just as it was before lifecycle hooks.
-        self._maybe_process_fp8_kv_cache()
+        try:
+            yield finalize
+            # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
+            # this optional second pass, just as it was before lifecycle hooks.
+            self._maybe_process_fp8_kv_cache()
+        finally:
+            # A failed or completed transaction must never leak accumulated
+            # destinations or source tokens into the next refit.
+            self._nrl_main_destination_manifest = None
+            self._nrl_refit_source_names = None
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
@@ -674,9 +1185,7 @@ class VllmInternalWorkerExtension:
                         if batch_keys is None:
                             continue
 
-                        buffer = rebuild_cuda_tensor_from_ipc(
-                            ipc_handle, self.device.index
-                        )
+                        buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
                         weights = []
                         offset = 0
                         for key in list_keys:
@@ -685,11 +1194,7 @@ class VllmInternalWorkerExtension:
                                 shape = torch.Size(shape)
 
                             size_in_bytes = dtype.itemsize * shape.numel()
-                            weight = (
-                                buffer[offset : offset + size_in_bytes]
-                                .view(dtype=dtype)
-                                .view(shape)
-                            )
+                            weight = buffer[offset : offset + size_in_bytes].view(dtype=dtype).view(shape)
                             weights.append((key, weight))
                             offset += calculate_aligned_size(size_in_bytes)
 
@@ -704,13 +1209,8 @@ class VllmInternalWorkerExtension:
                         # The manifest only keeps the exception message; log
                         # the full traceback and the batch contents so loader
                         # failures stay diagnosable from worker logs.
-                        batch_desc = ", ".join(
-                            f"{k}: {tuple(w.shape)} {w.dtype}"
-                            for k, w in (weights or [])[:40]
-                        )
-                        logger.exception(
-                            "IPC weight batch load failed (batch: %s)", batch_desc
-                        )
+                        batch_desc = ", ".join(f"{k}: {tuple(w.shape)} {w.dtype}" for k, w in (weights or [])[:40])
+                        logger.exception("IPC weight batch load failed (batch: %s)", batch_desc)
                     finally:
                         # Synchronize before releasing or ACKing an IPC allocation,
                         # including when a loader failed after scheduling CUDA work.
@@ -745,14 +1245,11 @@ class VllmInternalWorkerExtension:
             )
             return False
 
-    @wrap_with_nvtx_name(
-        "vllm_internal_worker_extension/update_weights_from_collective"
-    )
+    @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_from_collective")
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
-            "state_dict_info is not prepared. "
-            "Please call prepare_refit_info when initializing the worker."
+            "state_dict_info is not prepared. " "Please call prepare_refit_info when initializing the worker."
         )
 
         try:
@@ -778,9 +1275,7 @@ class VllmInternalWorkerExtension:
         torch.cuda.empty_cache()
         return True
 
-    def update_weights_from_decoded_sparse_payload(
-        self, *payloads: bytes | str
-    ) -> dict[str, Any]:
+    def update_weights_from_decoded_sparse_payload(self, *payloads: bytes | str) -> dict[str, Any]:
         applier = self._get_sparse_delta_applier()
         return applier.update_weights_from_decoded_sparse_payload(*payloads)
 
@@ -800,13 +1295,36 @@ class VllmInternalWorkerExtension:
             restore_refit_info_placements,
         )
 
-        self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
-            restore_refit_info_placements(refit_info)
+        prepared_attributes = (
+            "nccl_reshard_refit_info",
+            "hf_to_local_param_map",
+            "_nrl_nccl_reshard_destination_names",
+            "_nrl_nccl_reshard_source_destinations",
         )
-        # Build HFToLocalParamMap (see nccl_reshard_utils)
-        self.hf_to_local_param_map = self.build_hf_to_local_param_map(  # pyrefly: ignore[implicitly-defined-attribute]
-            self.nccl_reshard_refit_info
-        )
+        previous_state = {name: (hasattr(self, name), getattr(self, name, None)) for name in prepared_attributes}
+        try:
+            self.nccl_reshard_refit_info = restore_refit_info_placements(
+                refit_info
+            )  # pyrefly: ignore[implicitly-defined-attribute]
+            # Build HFToLocalParamMap (see nccl_reshard_utils)
+            self.hf_to_local_param_map = (
+                self.build_hf_to_local_param_map(  # pyrefly: ignore[implicitly-defined-attribute]
+                    self.nccl_reshard_refit_info
+                )
+            )
+            manifest = self._new_main_destination_manifest("nccl_reshard")
+            if manifest is not None:
+                # Catch missing q/k/v, fused roles, and explicitly unsupported
+                # expert-bias schemas during coordinated setup, before the
+                # first nccl.m2n bulk write can mutate live vLLM parameters.
+                manifest.require_valid_schema()
+        except BaseException:
+            for name, (had_previous_value, previous_value) in previous_state.items():
+                if had_previous_value:
+                    setattr(self, name, previous_value)
+                elif hasattr(self, name):
+                    delattr(self, name)
+            raise
 
     def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
         """Build the vLLM-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
@@ -835,16 +1353,8 @@ class VllmInternalWorkerExtension:
             merged_slice: tuple[slice, ...] | None,
         ) -> LocalParamSpec:
             def pre(_base: torch.Tensor) -> RefitCtx:
-                value_region = (
-                    value_param.data
-                    if merged_slice is None
-                    else value_param.data[merged_slice]
-                )
-                scale_region = (
-                    scale_param.data
-                    if merged_slice is None
-                    else scale_param.data[merged_slice]
-                )
+                value_region = value_param.data if merged_slice is None else value_param.data[merged_slice]
+                scale_region = scale_param.data if merged_slice is None else scale_param.data[merged_slice]
                 return RefitCtx(
                     buf=torch.empty_like(value_region, dtype=torch.bfloat16),
                     extra={"value_region": value_region, "scale_region": scale_region},
@@ -868,50 +1378,169 @@ class VllmInternalWorkerExtension:
             for layer_name in refit_info["layer_names"]
             for param_info in refit_info["per_layer_params"][layer_name]
         }
+
+        def _destination_global_shape(
+            local_shape: torch.Size,
+            param_info: dict[str, Any],
+        ) -> tuple[int, ...] | None:
+            """Reconstruct a target's logical shape from its local storage.
+
+            Production NCCL metadata always carries the destination mesh and
+            placements.  A few legacy mapping-only unit fixtures omit them; a
+            TP=1 fixture is still provable, while a synthetic TP>1 fixture is
+            left to the slice-geometry checks below.
+            """
+            placements = param_info.get("dst_placements")
+            mesh = param_info.get("dst_mesh_info")
+            mesh_tensor = getattr(mesh, "mesh", getattr(mesh, "_mesh", None))
+            if placements is None or mesh_tensor is None:
+                if int(refit_info.get("gen_tp_size", 1)) == 1:
+                    return tuple(local_shape)
+                return None
+            if len(placements) != mesh_tensor.ndim:
+                raise ValueError(
+                    "build_hf_to_local_param_map: destination placement rank "
+                    f"{len(placements)} does not match mesh rank "
+                    f"{mesh_tensor.ndim} for {param_info['name']!r}"
+                )
+
+            global_shape = list(local_shape)
+            for mesh_dim, placement in enumerate(placements):
+                if not isinstance(placement, Shard):
+                    continue
+                tensor_dim = int(placement.dim) % len(global_shape)
+                global_shape[tensor_dim] *= int(mesh_tensor.shape[mesh_dim])
+            return tuple(global_shape)
+
+        # The real nccl.m2n API receives local tensors/meshes/placements but
+        # discards DTensorRef.global_shape.  Prove before any transfer that the
+        # selected live destination region implies exactly the advertised HF
+        # global shape.  This catches missing grouped experts as well as a
+        # direct non-gated w13/w2 or dense-down shape mismatch.
+        for hf_name, (vllm_param, merged_slice) in vllm_param_map_and_slices.items():
+            local_region = vllm_param.data if merged_slice is None else vllm_param.data[merged_slice]
+            param_info = param_info_by_name[hf_name]
+            if "global_shape" not in param_info:
+                raise ValueError("build_hf_to_local_param_map: missing global_shape metadata " f"for {hf_name!r}")
+            target_global_shape = _destination_global_shape(local_region.shape, param_info)
+            source_global_shape = tuple(param_info["global_shape"])
+            if target_global_shape is not None and target_global_shape != source_global_shape:
+                raise ValueError(
+                    "build_hf_to_local_param_map: source/destination shape "
+                    f"mismatch for {hf_name!r}: source global shape "
+                    f"{source_global_shape}, selected vLLM target implies "
+                    f"{target_global_shape}"
+                )
+
+        # Destination-name coverage cannot prove that every region of a fused
+        # tensor has a source. Validate the static NCCL map itself: a direct
+        # source must be the only writer for its target, while merged slices
+        # must be disjoint and cover one complete local dimension without gaps.
+        mappings_by_param: dict[
+            int,
+            list[tuple[str, torch.Tensor, tuple[slice, ...] | None]],
+        ] = {}
+        for hf_name, (vllm_param, merged_slice) in vllm_param_map_and_slices.items():
+            mappings_by_param.setdefault(id(vllm_param), []).append((hf_name, vllm_param, merged_slice))
+        for mappings in mappings_by_param.values():
+            direct_mappings = [item for item in mappings if item[2] is None]
+            if direct_mappings:
+                if len(mappings) != 1:
+                    raise ValueError(
+                        "build_hf_to_local_param_map: a direct target has "
+                        f"multiple source mappings {[item[0] for item in mappings]}"
+                    )
+                continue
+
+            intervals: list[tuple[int, int, int, str]] = []
+            for hf_name, vllm_param, merged_slice in mappings:
+                assert merged_slice is not None
+                normalized = tuple(merged_slice) + (slice(None),) * (vllm_param.ndim - len(merged_slice))
+                partial_dims: list[tuple[int, int, int]] = []
+                for dim, (dim_slice, dim_size) in enumerate(zip(normalized, vllm_param.shape)):
+                    if not isinstance(dim_slice, slice):
+                        raise ValueError(
+                            "build_hf_to_local_param_map: fused target slices "
+                            f"must use slices, got {dim_slice!r} for {hf_name!r}"
+                        )
+                    start, stop, step = dim_slice.indices(dim_size)
+                    if step != 1:
+                        raise ValueError(
+                            "build_hf_to_local_param_map: fused target slices " f"must be contiguous for {hf_name!r}"
+                        )
+                    if (start, stop) != (0, dim_size):
+                        partial_dims.append((dim, start, stop))
+                if len(partial_dims) != 1:
+                    raise ValueError(
+                        "build_hf_to_local_param_map: each merged source must "
+                        "cover exactly one partial target dimension; "
+                        f"{hf_name!r} covers {partial_dims}"
+                    )
+                dim, start, stop = partial_dims[0]
+                intervals.append((dim, start, stop, hf_name))
+
+            sliced_dims = {dim for dim, _start, _stop, _name in intervals}
+            if len(sliced_dims) != 1:
+                raise ValueError(
+                    "build_hf_to_local_param_map: fused source slices disagree " f"on target dimension: {intervals}"
+                )
+            sliced_dim = next(iter(sliced_dims))
+            ordered_intervals = sorted(intervals, key=lambda item: item[1])
+            cursor = 0
+            for _dim, start, stop, hf_name in ordered_intervals:
+                if start != cursor or stop <= start:
+                    raise ValueError(
+                        "build_hf_to_local_param_map: incomplete or overlapping "
+                        f"fused target coverage before {hf_name!r}: "
+                        f"expected offset {cursor}, got [{start}, {stop})"
+                    )
+                cursor = stop
+            target_size = mappings[0][1].shape[sliced_dim]
+            if cursor != target_size:
+                raise ValueError(
+                    "build_hf_to_local_param_map: incomplete fused target "
+                    f"coverage; covered [0, {cursor}), target size {target_size}"
+                )
+
         vllm_params = dict(self.model_runner.model.named_parameters())
         vllm_names_by_id = {id(param): name for name, param in vllm_params.items()}
         specs = {}
+        bulk_destination_names: set[str] = set()
+        bulk_source_destinations: dict[str, str] = {}
         for hf_name, (vllm_param, merged_slice) in vllm_param_map_and_slices.items():
+            vllm_name = vllm_names_by_id.get(id(vllm_param))
+            if vllm_name is None:
+                raise ValueError(
+                    f"build_hf_to_local_param_map: resolved vLLM target for "
+                    f"{hf_name!r} is not a registered model parameter"
+                )
+            bulk_destination_names.add(vllm_name)
+            bulk_source_destinations[hf_name] = vllm_name
             wire_dtype_value = param_info_by_name[hf_name].get("dtype")
             wire_dtype = (
-                wire_dtype_value
-                if isinstance(wire_dtype_value, torch.dtype)
-                else _STR_TO_DTYPE.get(wire_dtype_value)
+                wire_dtype_value if isinstance(wire_dtype_value, torch.dtype) else _STR_TO_DTYPE.get(wire_dtype_value)
             )
             if wire_dtype is None:
                 raise ValueError(
-                    f"build_hf_to_local_param_map: unsupported wire dtype "
-                    f"{wire_dtype_value!r} for {hf_name!r}"
+                    f"build_hf_to_local_param_map: unsupported wire dtype " f"{wire_dtype_value!r} for {hf_name!r}"
                 )
             if wire_dtype == torch.bfloat16 and vllm_param.dtype == torch.float8_e4m3fn:
-                vllm_name = vllm_names_by_id.get(id(vllm_param))
-                if vllm_name is None:
-                    raise ValueError(
-                        f"build_hf_to_local_param_map: resolved vLLM target for "
-                        f"{hf_name!r} is not a registered model parameter"
-                    )
                 scale_names = (
                     vllm_name + "_scale_from_checkpoint",
                     vllm_name + "_scale",
                 )
-                scale_name = next(
-                    (name for name in scale_names if name in vllm_params), None
-                )
-                scale_param = (
-                    vllm_params.get(scale_name) if scale_name is not None else None
-                )
+                scale_name = next((name for name in scale_names if name in vllm_params), None)
+                scale_param = vllm_params.get(scale_name) if scale_name is not None else None
                 if scale_param is None:
                     raise ValueError(
                         f"build_hf_to_local_param_map: MXFP8 target {vllm_name!r} "
                         f"for {hf_name!r} has no scale parameter among "
                         f"{scale_names!r}"
                     )
-                value_region = (
-                    vllm_param if merged_slice is None else vllm_param[merged_slice]
-                )
-                scale_region = (
-                    scale_param if merged_slice is None else scale_param[merged_slice]
-                )
+                assert scale_name is not None
+                bulk_destination_names.add(scale_name)
+                value_region = vllm_param if merged_slice is None else vllm_param[merged_slice]
+                scale_region = scale_param if merged_slice is None else scale_param[merged_slice]
                 if value_region.shape[-1] % 32 != 0:
                     raise ValueError(
                         f"build_hf_to_local_param_map: MXFP8 target for {hf_name!r} "
@@ -932,9 +1561,7 @@ class VllmInternalWorkerExtension:
                         f"build_hf_to_local_param_map: MXFP8 scale target "
                         f"{scale_name!r} has dtype {scale_param.dtype}, expected torch.uint8"
                     )
-                specs[hf_name] = _bf16_to_mxfp8_receiver_quant_spec(
-                    vllm_param, scale_param, merged_slice
-                )
+                specs[hf_name] = _bf16_to_mxfp8_receiver_quant_spec(vllm_param, scale_param, merged_slice)
             elif wire_dtype != vllm_param.dtype:
                 raise ValueError(
                     f"build_hf_to_local_param_map: wire dtype {wire_dtype} does not "
@@ -946,6 +1573,8 @@ class VllmInternalWorkerExtension:
                     if merged_slice is None
                     else _merged_param_spec(vllm_param, merged_slice)
                 )
+        self._nrl_nccl_reshard_destination_names = bulk_destination_names
+        self._nrl_nccl_reshard_source_destinations = bulk_source_destinations
         return HFToLocalParamMap(specs=specs)
 
     def _build_hf_to_gen_backend_mapping(self, refit_info):
@@ -977,13 +1606,6 @@ class VllmInternalWorkerExtension:
                 if p.get("grouped_expert_proj"):
                     hf_grouped[p["name"]] = p["grouped_expert_proj"]
 
-        # Check if this model uses gated MLP layer (e.g., SwiGLU, Gated ReLU^2)
-        has_gate = {
-            name.rsplit(".gate_proj.weight", 1)[0]
-            for name, proj in hf_grouped.items()
-            if proj == "gate_proj"
-        }
-
         # Resolve an HF FFN name to its vLLM param name.  The two differ only in
         # the module prefix before ``layers.N`` (e.g. NemotronH's HF ``backbone.``
         # vs vLLM ``model.``); the layer-relative suffix is identical.  Index the
@@ -1003,9 +1625,7 @@ class VllmInternalWorkerExtension:
         # ``...mlp.experts.routed_experts.w13_weight``).  Index the real names
         # with that segment dropped so either layout resolves; on a 0.20-style
         # model this index is identical to ``vllm_by_relative``.
-        vllm_by_relative_flat = {
-            _layer_relative(n).replace(".routed_experts.", "."): n for n in vllm_params
-        }
+        vllm_by_relative_flat = {_layer_relative(n).replace(".routed_experts.", "."): n for n in vllm_params}
 
         def _to_vllm_name(n: str) -> str:
             if n in vllm_params:
@@ -1027,9 +1647,7 @@ class VllmInternalWorkerExtension:
             if grouped_proj is not None:
                 # e.g.) expert_prefix = model.layers.3.mlp.experts
                 expert_prefix = hf_name.rsplit(f".{grouped_proj}.weight", 1)[0]
-                vllm_suffix = (
-                    "w2_weight" if grouped_proj == "down_proj" else "w13_weight"
-                )
+                vllm_suffix = "w2_weight" if grouped_proj == "down_proj" else "w13_weight"
                 # e.g.) vllm_name = model.layers.3.mlp.experts.w13_weight
                 vllm_name = _to_vllm_name(f"{expert_prefix}.{vllm_suffix}")
                 if vllm_name not in vllm_params:
@@ -1040,7 +1658,7 @@ class VllmInternalWorkerExtension:
                     )
                 # vllm_param is a torch.Tensor corresponding to the vllm_name
                 vllm_param = vllm_params[vllm_name]
-                if grouped_proj == "down_proj" or expert_prefix not in has_gate:
+                if grouped_proj == "down_proj" or not _expert_uses_gated_activation(vllm_param):
                     # Case for non-gated MLP layer or down_proj (w2)
                     # Weights are not merged, so the mapping is 1:1
                     mapping[hf_name] = (vllm_param, None)
@@ -1074,14 +1692,19 @@ class VllmInternalWorkerExtension:
                 prefix = hf_name[: -len(suffix)]
                 vllm_name = _to_vllm_name(prefix + "gate_up_proj.weight")
                 if vllm_name in vllm_params:
+                    gate_source_name = prefix + "gate_proj.weight"
+                    up_source_name = prefix + "up_proj.weight"
+                    missing_sources = {name for name in (gate_source_name, up_source_name) if name not in hf_shapes}
+                    if missing_sources:
+                        raise ValueError(
+                            "_build_hf_to_gen_backend_mapping: incomplete dense "
+                            "gate/up source family: "
+                            + _format_refit_key_error("missing source components", missing_sources)
+                        )
                     tp = refit_info.get("gen_tp_size", 1)
-                    gate_local = hf_shapes[prefix + "gate_proj.weight"][0] // tp
-                    up_local = hf_shapes[prefix + "up_proj.weight"][0] // tp
-                    sl = (
-                        slice(0, gate_local)
-                        if is_gate
-                        else slice(gate_local, gate_local + up_local)
-                    )
+                    gate_local = hf_shapes[gate_source_name][0] // tp
+                    up_local = hf_shapes[up_source_name][0] // tp
+                    sl = slice(0, gate_local) if is_gate else slice(gate_local, gate_local + up_local)
                     mapping[hf_name] = (vllm_params[vllm_name], (sl,))
                     continue
 
@@ -1118,9 +1741,7 @@ class VllmInternalWorkerExtension:
             )
             # spec.pre/post run on the caller's current stream (this stage's
             # stream); xferdtensor should use the same stream.
-            ctx = (
-                spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
-            )
+            ctx = spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
             dst_tensor = DTensorRef(ctx.buf, param_info["global_shape"])
             xferdtensor(
                 None,
@@ -1174,8 +1795,7 @@ class VllmInternalWorkerExtension:
             torch.cuda.synchronize()
             if torch.distributed.get_rank() == 0:
                 print(
-                    f"[nccl_reshard_refit] misc recv+load (gen side): "
-                    f"{time.perf_counter() - misc_t0:.2f}s",
+                    f"[nccl_reshard_refit] misc recv+load (gen side): " f"{time.perf_counter() - misc_t0:.2f}s",
                     flush=True,
                 )
             torch.cuda.empty_cache()
@@ -1197,8 +1817,7 @@ class VllmInternalWorkerExtension:
             return
 
         misc_state_dict_info = {
-            name: (tuple(meta["shape"]), _STR_TO_DTYPE[meta["dtype"]])
-            for name, meta in misc_meta.items()
+            name: (tuple(meta["shape"]), _STR_TO_DTYPE[meta["dtype"]]) for name, meta in misc_meta.items()
         }
 
         packed_broadcast_consumer(
@@ -1224,7 +1843,5 @@ class VllmInternalWorkerExtension:
         torch.cuda.profiler.stop()
 
 
-class VllmInternalWorkerExtensionWithCheckpointEngine(
-    VllmCheckpointEngineMixin, VllmInternalWorkerExtension
-):
+class VllmInternalWorkerExtensionWithCheckpointEngine(VllmCheckpointEngineMixin, VllmInternalWorkerExtension):
     """vLLM worker extension with checkpoint-engine refit support."""

@@ -3389,18 +3389,22 @@ def grpo_train(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
-                    metrics.update(
-                        _get_shared_prefix_observation_metrics(
-                            policy_config=master_config.policy,
-                            expected_group_size=master_config.grpo.num_generations_per_prompt,
-                            group_ids=repeated_batch[SHARED_PREFIX_GROUP_ID],
-                            prompt_token_ids=prompt_ids_for_adv,
-                            prompt_lengths=repeated_batch["length"],
-                            input_lengths=input_lengths,
-                            token_mask=token_mask,
-                            sample_mask=sample_mask,
+                    if (
+                        get_shared_prefix_training_config(master_config.policy).mode
+                        != "disabled"
+                    ):
+                        metrics.update(
+                            _get_shared_prefix_observation_metrics(
+                                policy_config=master_config.policy,
+                                expected_group_size=master_config.grpo.num_generations_per_prompt,
+                                group_ids=repeated_batch[SHARED_PREFIX_GROUP_ID],
+                                prompt_token_ids=prompt_ids_for_adv,
+                                prompt_lengths=repeated_batch["length"],
+                                input_lengths=input_lengths,
+                                token_mask=token_mask,
+                                sample_mask=sample_mask,
+                            )
                         )
-                    )
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
@@ -4343,6 +4347,10 @@ def async_grpo_train(
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size,
         drop_incomplete_targets_on_restore=False,
+        include_shared_prefix_metadata=(
+            get_shared_prefix_training_config(master_config.policy).mode
+            != "disabled"
+        ),
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
@@ -4946,16 +4954,23 @@ def async_grpo_train(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
-                    shared_prefix_observation_metrics = _get_shared_prefix_observation_metrics(
-                        policy_config=master_config.policy,
-                        expected_group_size=master_config.grpo.num_generations_per_prompt,
-                        group_ids=repeated_batch[SHARED_PREFIX_GROUP_ID],
-                        prompt_token_ids=prompt_ids_for_adv,
-                        prompt_lengths=repeated_batch["length"],
-                        input_lengths=input_lengths,
-                        token_mask=token_mask,
-                        sample_mask=sample_mask,
-                    )
+                    shared_prefix_observation_metrics = {}
+                    if (
+                        get_shared_prefix_training_config(master_config.policy).mode
+                        != "disabled"
+                    ):
+                        shared_prefix_observation_metrics = (
+                            _get_shared_prefix_observation_metrics(
+                                policy_config=master_config.policy,
+                                expected_group_size=master_config.grpo.num_generations_per_prompt,
+                                group_ids=repeated_batch[SHARED_PREFIX_GROUP_ID],
+                                prompt_token_ids=prompt_ids_for_adv,
+                                prompt_lengths=repeated_batch["length"],
+                                input_lengths=input_lengths,
+                                token_mask=token_mask,
+                                sample_mask=sample_mask,
+                            )
+                        )
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,

@@ -82,7 +82,9 @@ PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
     {
         INPUT_LENGTHS,
         SHARED_PREFIX_PROMPT_LENGTHS,
+        "response_token_lengths",
         "total_reward",
+        "truncated",
         SAMPLE_MASK,
     }
 )

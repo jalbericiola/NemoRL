@@ -20,7 +20,7 @@ the world_size compatibility validation that prevents confusing reshape errors
 when the cluster size is insufficient for the specified parallelism configuration.
 """
 
-from typing import Any, cast
+from typing import Any, Literal, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -213,6 +213,19 @@ def test_shared_prefix_observe_mode_is_backend_neutral() -> None:
     assert resolved_config.mode == "observe"
 
 
+@pytest.mark.parametrize("mode", ["disabled", "observe"])
+def test_shared_prefix_non_train_modes_allow_megatron_peft(
+    mode: Literal["disabled", "observe"],
+) -> None:
+    config = create_shared_prefix_train_config()
+    config["shared_prefix_training"] = {"mode": mode}
+    cast(dict[str, Any], config["megatron_cfg"])["peft"] = {"enabled": True}
+
+    resolved_config = validate_shared_prefix_training_config(config)
+
+    assert resolved_config.mode == mode
+
+
 def test_shared_prefix_train_mode_accepts_first_slice_topology() -> None:
     config = create_shared_prefix_train_config()
 
@@ -314,11 +327,6 @@ def test_shared_prefix_train_mode_rejects_unsupported_first_slice_topology(
             "sequence_parallel=true exactly when TP>1",
         ),
         (
-            {"mtp_num_layers": 1},
-            {},
-            "policy.megatron_cfg.mtp_num_layers=0",
-        ),
-        (
             {"cuda_graph_impl": "local"},
             {},
             "policy.megatron_cfg.cuda_graph_impl='none'",
@@ -346,6 +354,29 @@ def test_shared_prefix_train_mode_rejects_unsupported_runtime_features_early(
 
     with pytest.raises(ValueError, match=expected_config_path):
         validate_shared_prefix_training_config(config)
+
+
+def test_shared_prefix_train_mode_rejects_megatron_peft_early() -> None:
+    config = create_shared_prefix_train_config()
+    cast(dict[str, Any], config["megatron_cfg"])["peft"] = {"enabled": True}
+
+    with pytest.raises(
+        ValueError,
+        match=r"policy\.megatron_cfg\.peft\.enabled=false.*PEFT/LoRA",
+    ):
+        validate_shared_prefix_training_config(config)
+
+
+def test_shared_prefix_train_mode_defers_mtp_to_mcore_capability_validation() -> None:
+    config = create_shared_prefix_train_config()
+    cast(dict[str, Any], config["megatron_cfg"]).update(
+        {
+            "mtp_num_layers": 5,
+            "mtp_use_repeated_layer": True,
+        }
+    )
+
+    assert validate_shared_prefix_training_config(config).mode == "train"
 
 
 @pytest.mark.parametrize(

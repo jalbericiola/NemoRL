@@ -304,6 +304,7 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    nemo_gym_add_seed_per_rollout: false
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:

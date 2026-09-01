@@ -888,12 +888,48 @@ class AsyncNemoGymRolloutImpl:
             else self._generation_config["max_new_tokens"]
         )
 
+        seed_extra_body: dict[str, Any] | None = None
+        if self._generation_config.get("nemo_gym_add_seed_per_rollout", False):
+            metadata = responses_create_params.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise ValueError(
+                    "NeMo-Gym responses_create_params.metadata must be an object "
+                    "when nemo_gym_add_seed_per_rollout is enabled"
+                )
+
+            serialized_extra_body = metadata.get("extra_body", "{}")
+            if not isinstance(serialized_extra_body, str):
+                raise ValueError(
+                    "NeMo-Gym responses_create_params.metadata.extra_body must be "
+                    "a JSON-encoded object string when "
+                    "nemo_gym_add_seed_per_rollout is enabled"
+                )
+            try:
+                parsed_extra_body = json.loads(serialized_extra_body)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    "NeMo-Gym responses_create_params.metadata.extra_body must be "
+                    "valid JSON when nemo_gym_add_seed_per_rollout is enabled"
+                ) from error
+            if not isinstance(parsed_extra_body, dict):
+                raise ValueError(
+                    "NeMo-Gym responses_create_params.metadata.extra_body must "
+                    "decode to a JSON object when "
+                    "nemo_gym_add_seed_per_rollout is enabled"
+                )
+            seed_extra_body = parsed_extra_body
+
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
         rows = []
         for i in range(self._num_generations_per_prompt):
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
+            if seed_extra_body is not None:
+                row_metadata = row["responses_create_params"].setdefault("metadata", {})
+                row_extra_body = copy.deepcopy(seed_extra_body)
+                row_extra_body["seed"] = i
+                row_metadata["extra_body"] = json.dumps(row_extra_body)
             rows.append(row)
         return rows
 
@@ -1311,12 +1347,32 @@ class RolloutManager:
         # separately and terminates from within, since exhausting it is a statement
         # about the prompt rather than about the fleet.
         while infra_attempts < policy.max_infra_attempts:
+            # SingleController's registry owns the refit gate. Consult it for
+            # every attempt, not just the first prompt dispatch: otherwise an
+            # infrastructure retry can enter Gym after the controller has begun
+            # draining requests for a weight update.
+            wait_until_permitted = getattr(inflight_registry, "wait_until_permitted", None)
+            if wait_until_permitted is not None:
+                await wait_until_permitted()
+
             start_version = self._weight_version
             # Reserved inside the loop so each attempt owns a fresh group_id: rows a
             # failed attempt may have written cannot then collide with the retry's.
-            group_id = self._tq_buffer.reserve(
-                weight_version=start_version, target_step=target_step
-            )
+            group_id = self._tq_buffer.reserve(weight_version=start_version, target_step=target_step)
+            # Event.wait() may already have resolved when the controller clears
+            # the gate, so waiting above is not by itself an atomic admission cut.
+            # Recheck after reserve and immediately before the synchronous registry
+            # insertion. If refit won the race, roll back the empty reservation and
+            # retry without consuming either failure budget.
+            is_permitted = getattr(inflight_registry, "is_permitted", None)
+            if is_permitted is not None and not is_permitted():
+                removed = await self._tq_buffer.remove_group(group_id)
+                if removed != 1:
+                    raise RuntimeError(
+                        "Refit-gate rollback failed for reserved rollout group "
+                        f"{group_id!r}: removed {removed} groups"
+                    )
+                continue
             try:
                 # Registered per ATTEMPT, not per prompt: each retry reserves a fresh
                 # group_id, so the controller's registry must follow the attempt that
@@ -1327,9 +1383,7 @@ class RolloutManager:
                     inflight_registry[group_id] = (current_task, start_version)
                 # Unregister before commit so cancellation cannot interrupt it.
                 try:
-                    record = await self.run_rollout(
-                        input_sample, rollout_group_id=group_id
-                    )
+                    record = await self.run_rollout(input_sample, rollout_group_id=group_id)
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(group_id, None)

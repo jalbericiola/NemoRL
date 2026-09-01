@@ -18,11 +18,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from enum import Enum
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
+from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
+from tensorboard.plugins.hparams.metadata import SESSION_START_INFO_TAG
+from tensorboard.plugins.hparams.plugin_data_pb2 import HParamsPluginData
 
 from nemo_rl.utils.logger import (
     Logger,
@@ -165,6 +169,31 @@ class TestTensorboardLogger:
         mock_summary_writer.assert_called_once_with(log_dir=temp_dir)
 
     @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_finish_flushes_then_closes_exactly_once(self, mock_summary_writer, temp_dir):
+        """Repeated teardown cannot duplicate or reorder writer finalization."""
+        logger = TensorboardLogger({"log_dir": temp_dir}, log_dir=temp_dir)
+        writer = mock_summary_writer.return_value
+
+        logger.finish()
+        logger.finish()
+
+        assert writer.method_calls == [call.flush(), call.close()]
+
+    @patch("nemo_rl.utils.logger.SummaryWriter")
+    def test_finish_closes_after_flush_failure_and_remains_idempotent(self, mock_summary_writer, temp_dir):
+        """A failed flush still closes once and is not retried during teardown."""
+        logger = TensorboardLogger({"log_dir": temp_dir}, log_dir=temp_dir)
+        writer = mock_summary_writer.return_value
+        writer.flush.side_effect = RuntimeError("injected flush failure")
+
+        with pytest.raises(RuntimeError, match="injected flush failure"):
+            logger.finish()
+        logger.finish()
+
+        writer.flush.assert_called_once_with()
+        writer.close.assert_called_once_with()
+
+    @patch("nemo_rl.utils.logger.SummaryWriter")
     def test_log_metrics(self, mock_summary_writer, temp_dir):
         """Test logging metrics to TensorboardLogger."""
         cfg = {"log_dir": temp_dir}
@@ -259,6 +288,49 @@ class TestTensorboardLogger:
             "batch_size": 32,
             "model.hidden_size": 128,
         }
+
+    def test_real_writer_records_production_shaped_hparams(self, tmp_path):
+        """Unsupported config leaves are canonicalized into parseable HParams."""
+
+        class RunMode(Enum):
+            STRICT = "strict"
+
+        log_dir = tmp_path / "tensorboard"
+        logger = TensorboardLogger({}, log_dir=str(log_dir))
+        logger.log_hyperparams(
+            {
+                "epochs": 20,
+                "mode": RunMode.STRICT,
+                "model": {"path": Path("/models/nano")},
+                "optional_checkpoint": None,
+                "topology": (
+                    "nano",
+                    Path("/models/draft"),
+                    RunMode.STRICT,
+                    None,
+                    (2, 4),
+                ),
+            }
+        )
+        logger.finish()
+
+        session_starts = []
+        for event_path in log_dir.rglob("events.out.tfevents.*"):
+            for event in EventFileLoader(str(event_path)).Load():
+                for value in event.summary.value:
+                    if value.tag == SESSION_START_INFO_TAG:
+                        session_starts.append(
+                            HParamsPluginData.FromString(value.metadata.plugin_data.content).session_start_info
+                        )
+
+        assert len(session_starts) == 1
+        hparams = session_starts[0].hparams
+        # PyTorch's documented None contract is omission, not a sentinel.
+        assert set(hparams) == {"epochs", "mode", "model.path", "topology"}
+        assert hparams["epochs"].number_value == 20
+        assert hparams["mode"].string_value == "strict"
+        assert hparams["model.path"].string_value == "/models/nano"
+        assert hparams["topology"].string_value == ('["nano","/models/draft","strict",null,[2,4]]')
 
     @patch("nemo_rl.utils.logger.SummaryWriter")
     def test_coerce_to_scalar_python_primitives(self, mock_summary_writer, temp_dir):
@@ -1058,6 +1130,7 @@ class TestRayGpuMonitorLogger:
 
             # Verify flush was called
             mock_flush.assert_called_once()
+            mock_thread.return_value.join.assert_called_once_with()
 
             # Verify monitor state
             assert monitor.is_running is False
@@ -1571,6 +1644,92 @@ class TestLogger:
         yield temp_dir
         shutil.rmtree(temp_dir)
 
+    def test_finish_joins_monitor_and_flushes_tail_before_tensorboard_close(self):
+        """The monitor cannot write to TensorBoard after its writer is closed."""
+        events: list[str] = []
+
+        class RecordingThread:
+            def join(self) -> None:
+                events.append("monitor_join")
+
+        tensorboard = object.__new__(TensorboardLogger)
+        tensorboard._finished = False
+        tensorboard.writer = MagicMock()
+        tensorboard.writer.add_scalar.side_effect = lambda name, value, step: events.append(f"monitor_flush:{name}")
+        tensorboard.writer.flush.side_effect = lambda: events.append("tensorboard_flush")
+        tensorboard.writer.close.side_effect = lambda: events.append("tensorboard_close")
+
+        logger = object.__new__(Logger)
+        logger._finished = False
+        logger.loggers = [tensorboard]
+        logger.gpu_monitor = RayGpuMonitorLogger(
+            collection_interval=10.0,
+            flush_interval=60.0,
+            metric_prefix="ray",
+            step_metric="ray/ray_step",
+            parent_logger=logger,
+        )
+        logger.gpu_monitor.collection_thread = RecordingThread()
+        logger.gpu_monitor.is_running = True
+        logger.gpu_monitor.metrics_buffer = [
+            {
+                "step": 4,
+                "metrics": {"node.0.gpu.0.util": 75.0},
+            }
+        ]
+
+        logger.finish()
+        logger.finish()
+
+        assert events == [
+            "monitor_join",
+            "monitor_flush:ray/node.0.gpu.0.util",
+            "monitor_flush:ray/ray/ray_step",
+            "tensorboard_flush",
+            "tensorboard_close",
+        ]
+        assert logger.gpu_monitor.metrics_buffer == []
+
+    def test_finish_attempts_all_teardown_and_raises_first_error_once(self):
+        """One teardown failure cannot skip later backends or trigger retries."""
+        events: list[str] = []
+        monitor_error = RuntimeError("injected monitor shutdown failure")
+        first_backend_error = ValueError("injected first backend failure")
+
+        monitor = MagicMock()
+
+        def stop_monitor() -> None:
+            events.append("monitor_stop")
+            raise monitor_error
+
+        monitor.stop.side_effect = stop_monitor
+
+        first_backend = MagicMock()
+
+        def finish_first_backend() -> None:
+            events.append("first_backend_finish")
+            raise first_backend_error
+
+        first_backend.finish.side_effect = finish_first_backend
+        second_backend = MagicMock()
+        second_backend.finish.side_effect = lambda: events.append("second_backend_finish")
+
+        logger = object.__new__(Logger)
+        logger._finished = False
+        logger.gpu_monitor = monitor
+        logger.loggers = [first_backend, second_backend]
+
+        with pytest.raises(RuntimeError) as exc_info:
+            logger.finish()
+        logger.finish()
+
+        assert exc_info.value is monitor_error
+        assert events == [
+            "monitor_stop",
+            "first_backend_finish",
+            "second_backend_finish",
+        ]
+
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     def test_init_no_loggers(self, mock_tb_logger, mock_wandb_logger, temp_dir):
@@ -1613,7 +1772,7 @@ class TestLogger:
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.SwanlabLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
-    def test_init_swanlab_only(self, mock_tb_logger, mock_swanlab_logger, temp_dir):
+    def test_init_swanlab_only(self, mock_tb_logger, mock_swanlab_logger, mock_wandb_logger, temp_dir):
         """Test initialization with only SwanlabLogger enabled."""
         cfg = {
             "wandb_enabled": False,
@@ -1631,6 +1790,7 @@ class TestLogger:
         swanlab_cfg = mock_swanlab_logger.call_args[0][0]
         assert swanlab_cfg == {"project": "test-project"}
         mock_tb_logger.assert_not_called()
+        mock_wandb_logger.assert_not_called()
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")

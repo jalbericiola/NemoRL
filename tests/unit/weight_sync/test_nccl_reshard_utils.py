@@ -185,18 +185,12 @@ def test_mesh_info_exposes_rank_grid():
         (8, 8, 8, 1, 1, (8,), {"tp": 0}),
     ],
 )
-def test_build_mesh_info_shape_and_dim_map(
-    num_gpus, rank_offset, tp, ep, pp, exp_shape, exp_dim_map
-):
-    mesh, dim_map = build_mesh_info(
-        num_gpus, rank_offset, tp_size=tp, ep_size=ep, pp_size=pp
-    )
+def test_build_mesh_info_shape_and_dim_map(num_gpus, rank_offset, tp, ep, pp, exp_shape, exp_dim_map):
+    mesh, dim_map = build_mesh_info(num_gpus, rank_offset, tp_size=tp, ep_size=ep, pp_size=pp)
     assert tuple(mesh.mesh.shape) == exp_shape
     assert dim_map == exp_dim_map
     # Ranks are a contiguous row-major interval [offset, offset + num_gpus).
-    assert mesh.mesh.flatten().tolist() == list(
-        range(rank_offset, rank_offset + num_gpus)
-    )
+    assert mesh.mesh.flatten().tolist() == list(range(rank_offset, rank_offset + num_gpus))
 
 
 def test_build_mesh_info_dp_only():
@@ -313,19 +307,11 @@ def test_get_placements_tp_only_mesh():
     # FFN row-parallel -> Shard(1)
     assert _shard_dim_at(get_placements("a.mlp.down_proj.weight", dm, 2), dm, "tp") == 1
     # non-FFN (attention) -> Replicate (takes the misc path, not bulk-sharded)
-    assert all(
-        isinstance(p, Replicate)
-        for p in get_placements("a.self_attn.q_proj.weight", dm, 2)
-    )
+    assert all(isinstance(p, Replicate) for p in get_placements("a.self_attn.q_proj.weight", dm, 2))
     # router gate -> Replicate
-    assert all(
-        isinstance(p, Replicate) for p in get_placements("a.mlp.gate.weight", dm, 2)
-    )
+    assert all(isinstance(p, Replicate) for p in get_placements("a.mlp.gate.weight", dm, 2))
     # 1-D param -> all Replicate regardless of rule
-    assert all(
-        isinstance(p, Replicate)
-        for p in get_placements("a.mlp.gate_proj.weight", dm, 1)
-    )
+    assert all(isinstance(p, Replicate) for p in get_placements("a.mlp.gate_proj.weight", dm, 1))
 
 
 def test_get_placements_2d_mesh_shards_only_tp_axis():
@@ -348,14 +334,8 @@ def test_get_placements_expert_tp_shifts_by_one():
     # prepended expert dim. gate_proj (col, dim0) -> Shard(1); down_proj (row,
     # dim1) -> Shard(2).
     dm = {"tp": 0}
-    assert (
-        _shard_dim_at(get_placements("a.mlp.experts.gate_proj.weight", dm, 3), dm, "tp")
-        == 1
-    )
-    assert (
-        _shard_dim_at(get_placements("a.mlp.experts.down_proj.weight", dm, 3), dm, "tp")
-        == 2
-    )
+    assert _shard_dim_at(get_placements("a.mlp.experts.gate_proj.weight", dm, 3), dm, "tp") == 1
+    assert _shard_dim_at(get_placements("a.mlp.experts.down_proj.weight", dm, 3), dm, "tp") == 2
 
 
 # --------------------------------------------------------------------------
@@ -398,9 +378,7 @@ def test_group_expert_params_collapses_to_grouped_hf_entries():
     # Per-expert numeric-index entries are gone; non-expert passes through.
     assert not any(".experts.0." in k or ".experts.1." in k for k in grouped)
     assert "model.layers.0.self_attn.q_proj.weight" in grouped
-    assert (
-        "grouped_expert_proj" not in grouped["model.layers.0.self_attn.q_proj.weight"]
-    )
+    assert "grouped_expert_proj" not in grouped["model.layers.0.self_attn.q_proj.weight"]
 
 
 def test_group_expert_params_no_experts_is_identity():
@@ -411,6 +389,24 @@ def test_group_expert_params_no_experts_is_identity():
         }
     }
     assert group_expert_params_in_metadata(md) == md
+
+
+def test_group_expert_params_rejects_noncontiguous_expert_ids():
+    md = _moe_metadata(num_experts=3)
+    for name in list(md):
+        if ".experts.1." in name:
+            del md[name]
+
+    with pytest.raises(ValueError, match="non-contiguous expert ids"):
+        group_expert_params_in_metadata(md)
+
+
+def test_group_expert_params_rejects_projection_cardinality_mismatch():
+    md = _moe_metadata(num_experts=3)
+    del md["model.layers.0.mlp.experts.2.up_proj.weight"]
+
+    with pytest.raises(ValueError, match="mismatched expert ids"):
+        group_expert_params_in_metadata(md)
 
 
 # --------------------------------------------------------------------------

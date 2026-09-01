@@ -27,13 +27,11 @@ from safetensors.torch import save_file
 
 
 def _make_collective_update_extension(backend):
-    ext = backend.VllmInternalWorkerExtension.__new__(
-        backend.VllmInternalWorkerExtension
-    )
+    ext = backend.VllmInternalWorkerExtension.__new__(backend.VllmInternalWorkerExtension)
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
-    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.model_runner = SimpleNamespace(model=SimpleNamespace(named_parameters=lambda: []), vllm_config=object())
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
@@ -56,7 +54,14 @@ def _write_sharded_checkpoint(model_dir, shards):
         json.dump({"metadata": {}, "weight_map": weight_map}, f)
 
 
-def _make_extension_with_drafter(mtp_start_layer_idx, num_mtp_layers):
+def _make_extension_with_drafter(
+    mtp_start_layer_idx,
+    num_mtp_layers,
+    *,
+    model_type=None,
+    destination_names=(),
+    loaded_names=None,
+):
     """Build a VllmInternalWorkerExtension with a mocked drafter and stubbed refit."""
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtension,
@@ -64,21 +69,80 @@ def _make_extension_with_drafter(mtp_start_layer_idx, num_mtp_layers):
 
     ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
     ext.device = torch.device("cpu")
-    predictor = SimpleNamespace(
-        mtp_start_layer_idx=mtp_start_layer_idx, num_mtp_layers=num_mtp_layers
+    predictor = SimpleNamespace(mtp_start_layer_idx=mtp_start_layer_idx, num_mtp_layers=num_mtp_layers)
+
+    class _NonGatedMoeOwner:
+        def __init__(self):
+            self.use_ep = False
+            self.moe_config = SimpleNamespace(is_act_and_mul=False)
+
+        def weight_loader(self, *_args, **_kwargs):
+            raise AssertionError("unit-test weight loader should not be called")
+
+    owner = _NonGatedMoeOwner()
+    destination_params = {}
+    for name in destination_names:
+        shape = (1, 4, 4) if name.endswith(("w13_weight", "w2_weight")) else (1,)
+        param = torch.nn.Parameter(torch.empty(shape))
+        if name.endswith(("w13_weight", "w2_weight")):
+            param.weight_loader = owner.weight_loader
+        destination_params[name] = param
+
+    def load_weights(*, weights):
+        if callable(loaded_names):
+            return loaded_names(weights)
+        return loaded_names
+
+    draft_model = SimpleNamespace(
+        model=predictor,
+        config=SimpleNamespace(model_type=model_type),
+        quant_config=None,
+        named_parameters=lambda: list(destination_params.items()),
+        named_modules=lambda: [],
+        load_weights=MagicMock(side_effect=load_weights),
     )
     ext.model_runner = MagicMock()
-    ext.model_runner.drafter.model = SimpleNamespace(model=predictor)
+    ext.model_runner.drafter.model = draft_model
     # Isolate this test from _load_draft_weights internals.
-    ext._load_draft_weights = MagicMock()
+    ext._load_draft_weights = MagicMock(return_value=loaded_names)
     return ext
+
+
+def _make_strict_refit_extension(
+    backend,
+    *,
+    destination_params,
+    source_names,
+    load_weights,
+    model_type="nemotron_h",
+    quant_config=None,
+):
+    """Build a lifecycle-capable strict main-model refit fixture."""
+    ext = backend.VllmInternalWorkerExtension.__new__(backend.VllmInternalWorkerExtension)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type=model_type),
+        quant_config=quant_config,
+        named_parameters=lambda: list(destination_params.items()),
+        load_weights=MagicMock(side_effect=load_weights),
+    )
+    ext.model_runner = SimpleNamespace(
+        model=model,
+        vllm_config=SimpleNamespace(
+            quant_config=quant_config,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
+        ),
+    )
+    ext.state_dict_info = {name: object() for name in source_names}
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+    return ext, model
 
 
 def _patch_vllm_postload(monkeypatch):
     """Stub the vLLM post-load helpers imported inside load_mtp_weights_from_disk."""
-    monkeypatch.setattr(
-        "vllm.config.set_current_vllm_config", lambda cfg: contextlib.nullcontext()
-    )
+    monkeypatch.setattr("vllm.config.set_current_vllm_config", lambda cfg: contextlib.nullcontext())
     process_weights = MagicMock()
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
@@ -87,9 +151,7 @@ def _patch_vllm_postload(monkeypatch):
     return process_weights
 
 
-def _make_mtp_refit_extension(
-    *, method="mtp", from_disk=False, has_drafter=True, draft_model_config=None
-):
+def _make_mtp_refit_extension(*, method="mtp", from_disk=False, has_drafter=True, draft_model_config=None):
     """Build an extension for exercising the MTP-refit drafter gating.
 
     The drafter here is fed from the refit stream (co-trained MTP layer), as
@@ -106,11 +168,7 @@ def _make_mtp_refit_extension(
     ext.device = torch.device("cpu")
     ext._mtp_drafter_from_disk = from_disk
 
-    spec_config = (
-        None
-        if method is None
-        else SimpleNamespace(method=method, draft_model_config=draft_model_config)
-    )
+    spec_config = None if method is None else SimpleNamespace(method=method, draft_model_config=draft_model_config)
     drafter_model = SimpleNamespace(load_weights=MagicMock()) if has_drafter else None
     ext.model_runner = SimpleNamespace(
         vllm_config=SimpleNamespace(speculative_config=spec_config),
@@ -121,9 +179,7 @@ def _make_mtp_refit_extension(
 
 @pytest.mark.vllm
 @pytest.mark.parametrize("with_mtp", [False, True])
-def test_update_weights_from_collective_processes_weights_after_loading(
-    monkeypatch, with_mtp
-):
+def test_update_weights_from_collective_processes_weights_after_loading(monkeypatch, with_mtp):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     call_order = []
@@ -144,9 +200,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(
         ext._mtp_drafter_from_disk = False
         ext.model_runner.drafter = SimpleNamespace(model=draft_model)
         ext.model_runner.vllm_config = SimpleNamespace(
-            speculative_config=SimpleNamespace(
-                method="mtp", draft_model_config=draft_model_config
-            )
+            speculative_config=SimpleNamespace(method="mtp", draft_model_config=draft_model_config)
         )
 
     @contextlib.contextmanager
@@ -163,6 +217,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(
     def load_weights(weights):
         call_order.append("load")
         assert weights == [("model.weight", "weight-value")]
+        ext._record_refit_source_names(name for name, _weight in weights)
 
     def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
         call_order.append("broadcast")
@@ -173,9 +228,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(
 
     ext._load_weights = load_weights
     ext._maybe_process_fp8_kv_cache = lambda: call_order.append("kv")
-    monkeypatch.setattr(
-        vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
-    )
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer)
     monkeypatch.setattr(vllm_backend.gc, "collect", lambda: call_order.append("gc"))
     monkeypatch.setattr(
         vllm_backend.torch.cuda,
@@ -203,16 +256,437 @@ def test_update_weights_from_collective_processes_weights_after_loading(
 
 
 @pytest.mark.vllm
+def test_main_destination_coverage_accumulates_across_refit_batches(monkeypatch):
+    """Every fused Q/K/V and gate/up source is independently accepted."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    destination_names = [
+        "model.layers.0.self_attn.qkv_proj.weight",
+        "model.layers.0.mlp.gate_up_proj.weight",
+    ]
+    source_names = [
+        "backbone.layers.0.self_attn.q_proj.weight",
+        "backbone.layers.0.self_attn.k_proj.weight",
+        "backbone.layers.0.self_attn.v_proj.weight",
+        "backbone.layers.0.mlp.gate_proj.weight",
+        "backbone.layers.0.mlp.up_proj.weight",
+    ]
+
+    def load_weights(*, weights):
+        return {
+            destination_names[0] if ".self_attn." in source_name else destination_names[1]
+            for source_name, _tensor in weights
+        }
+
+    ext, model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={name: torch.nn.Parameter(torch.empty(1)) for name in destination_names},
+        source_names=source_names,
+        load_weights=load_weights,
+    )
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        ext._load_full_hf_weights([(name, name.rsplit(".", 2)[-2]) for name in source_names])
+        finalize()
+
+    process_weights.assert_called_once_with(model, ext.model_config, ext.device)
+    # Three cohorts suffice: q+gate, k+up, then v. The loader is not invoked
+    # once per tensor/layer.
+    assert model.load_weights.call_count == 3
+    ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
+    ext._maybe_process_fp8_kv_cache.assert_called_once_with()
+    assert ext._nrl_main_destination_manifest is None
+    assert ext._nrl_refit_source_names is None
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("skipped_role", ["q_proj", "k_proj", "v_proj"])
+def test_main_fused_qkv_coverage_rejects_skipped_source(monkeypatch, skipped_role):
+    """One returned qkv destination cannot hide any skipped source component."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    destination = "model.layers.0.mixer.qkv_proj.weight"
+    source_names = [f"backbone.layers.0.mixer.{role}.weight" for role in ("q_proj", "k_proj", "v_proj")]
+
+    def load_weights(*, weights):
+        return set() if skipped_role in weights[0][0] else {destination}
+
+    ext, _model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={destination: torch.nn.Parameter(torch.empty(1))},
+        source_names=source_names,
+        load_weights=load_weights,
+    )
+    _patch_vllm_postload(monkeypatch)
+
+    with pytest.raises(ValueError, match="missing required source components"):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            ext._load_full_hf_weights([(name, name) for name in source_names])
+            finalize()
+
+    assert ext._nrl_main_destination_manifest is None
+    assert ext._nrl_refit_source_names is None
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_rejects_invalid_strict_schema_before_transfer():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    destination = "model.layers.0.mixer.qkv_proj.weight"
+    source_names = {f"backbone.layers.0.mixer.{role}.weight" for role in ("q_proj", "k_proj")}
+    ext, _model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={destination: torch.nn.Parameter(torch.empty(1))},
+        source_names={"old.weight"},
+        load_weights=lambda **_kwargs: {destination},
+    )
+    previous_state = ext.state_dict_info
+
+    with pytest.raises(ValueError, match="missing source roles.*v"):
+        ext.prepare_refit_info({name: object() for name in source_names})
+
+    assert ext.state_dict_info is previous_state
+    assert ext._nrl_main_destination_manifest is None
+    assert ext._nrl_refit_source_names is None
+
+
+@pytest.mark.vllm
+def test_prepare_nccl_refit_info_rolls_back_invalid_strict_schema(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    destination = "model.layers.0.mixer.qkv_proj.weight"
+    q_source = "backbone.layers.0.mixer.q_proj.weight"
+    ext, _model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={destination: torch.nn.Parameter(torch.empty(1))},
+        source_names=set(),
+        load_weights=lambda **_kwargs: {destination},
+    )
+    old_refit_info = object()
+    old_param_map = object()
+    old_destinations = {"old.destination"}
+    old_pairs = {"old.source": "old.destination"}
+    ext.nccl_reshard_refit_info = old_refit_info
+    ext.hf_to_local_param_map = old_param_map
+    ext._nrl_nccl_reshard_destination_names = old_destinations
+    ext._nrl_nccl_reshard_source_destinations = old_pairs
+
+    monkeypatch.setattr(
+        "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
+        lambda info: info,
+    )
+
+    def build_map(_info):
+        ext._nrl_nccl_reshard_destination_names = {destination}
+        ext._nrl_nccl_reshard_source_destinations = {q_source: destination}
+        return object()
+
+    ext.build_hf_to_local_param_map = build_map
+    invalid_info = {
+        "layer_names": ["backbone.layers.0"],
+        "per_layer_params": {
+            "backbone.layers.0": [{"name": q_source}],
+        },
+        "misc_meta": {},
+    }
+
+    with pytest.raises(ValueError, match="missing source roles"):
+        ext.prepare_nccl_reshard_refit_info(invalid_info)
+
+    assert ext.nccl_reshard_refit_info is old_refit_info
+    assert ext.hf_to_local_param_map is old_param_map
+    assert ext._nrl_nccl_reshard_destination_names is old_destinations
+    assert ext._nrl_nccl_reshard_source_destinations is old_pairs
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("accepted_role", ["gate_proj", "up_proj"])
+def test_main_fused_gate_up_coverage_rejects_one_component(monkeypatch, accepted_role):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    destination = "model.layers.0.mlp.gate_up_proj.weight"
+    source_names = [f"backbone.layers.0.mlp.{role}.weight" for role in ("gate_proj", "up_proj")]
+
+    def load_weights(*, weights):
+        return {destination} if accepted_role in weights[0][0] else set()
+
+    ext, _model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={destination: torch.nn.Parameter(torch.empty(1))},
+        source_names=source_names,
+        load_weights=load_weights,
+    )
+    _patch_vllm_postload(monkeypatch)
+
+    with pytest.raises(ValueError, match="missing required source components"):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            ext._load_full_hf_weights([(name, name) for name in source_names])
+            finalize()
+
+
+@pytest.mark.vllm
+def test_main_destination_coverage_rejects_silent_partial_load(monkeypatch):
+    """A complete source transfer cannot hide a destination skipped by vLLM."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    missing_name = "model.layers.0.mlp.down_proj.weight"
+    ext, _model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={
+            name: torch.nn.Parameter(torch.empty(1)) for name in {"model.embed_tokens.weight", missing_name}
+        },
+        source_names={"model.embed_tokens.weight", missing_name},
+        load_weights=lambda **_kwargs: {"model.embed_tokens.weight"},
+    )
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    with pytest.raises(ValueError, match="missing destination parameters.*down_proj"):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            ext._load_full_hf_weights([("model.embed_tokens.weight", "embed")])
+            finalize()
+
+    process_weights.assert_not_called()
+    ext._maybe_process_mtp_drafter_after_loading.assert_not_called()
+    ext._maybe_process_fp8_kv_cache.assert_not_called()
+    assert ext._nrl_main_destination_manifest is None
+
+
+@pytest.mark.vllm
+def test_main_destination_coverage_requires_loader_tracking(monkeypatch):
+    """A vLLM API regression that drops loaded-name reporting fails closed."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={"model.weight": torch.nn.Parameter(torch.empty(1))},
+        source_names={"model.weight"},
+        load_weights=lambda **_kwargs: None,
+    )
+    _patch_vllm_postload(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="did not report loaded destination"):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            ext._load_full_hf_weights([("model.weight", "weight")])
+            finalize()
+
+    assert ext._nrl_main_destination_manifest is None
+
+
+@pytest.mark.vllm
+def test_main_destination_coverage_includes_nccl_reshard_bulk_targets(monkeypatch):
+    """Direct bulk destinations combine with misc vLLM-loader destinations."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    bulk_name = "model.layers.0.mlp.gate_up_proj.weight"
+    misc_name = "model.embed_tokens.weight"
+    gate_name = "backbone.layers.0.mlp.gate_proj.weight"
+    up_name = "backbone.layers.0.mlp.up_proj.weight"
+    ext, model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={
+            bulk_name: torch.nn.Parameter(torch.empty(2, 1)),
+            misc_name: torch.nn.Parameter(torch.empty(1)),
+        },
+        source_names=set(),
+        load_weights=lambda **_kwargs: {misc_name},
+    )
+    ext.nccl_reshard_refit_info = {
+        "layer_names": ["layer0"],
+        "per_layer_params": {"layer0": [{"name": gate_name}, {"name": up_name}]},
+        "misc_meta": {misc_name: {}},
+    }
+    ext._nrl_nccl_reshard_destination_names = {bulk_name}
+    ext._nrl_nccl_reshard_source_destinations = {
+        gate_name: bulk_name,
+        up_name: bulk_name,
+    }
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+        ext._load_full_hf_weights([(misc_name, "embed")])
+        finalize()
+
+    process_weights.assert_called_once_with(model, ext.model_config, ext.device)
+
+
+@pytest.mark.vllm
+def test_nccl_direct_source_coverage_rejects_swapped_targets(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    source0 = "backbone.layers.0.mlp.down_proj.weight"
+    source1 = "backbone.layers.1.mlp.down_proj.weight"
+    destination0 = "model.layers.0.mlp.down_proj.weight"
+    destination1 = "model.layers.1.mlp.down_proj.weight"
+    ext, _model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={
+            destination0: torch.nn.Parameter(torch.empty(1)),
+            destination1: torch.nn.Parameter(torch.empty(1)),
+        },
+        source_names=set(),
+        load_weights=lambda **_kwargs: set(),
+    )
+    ext.nccl_reshard_refit_info = {
+        "layer_names": ["layer0", "layer1"],
+        "per_layer_params": {
+            "layer0": [{"name": source0}],
+            "layer1": [{"name": source1}],
+        },
+        "misc_meta": {},
+    }
+    ext._nrl_nccl_reshard_destination_names = {destination0, destination1}
+    ext._nrl_nccl_reshard_source_destinations = {
+        source0: destination1,
+        source1: destination0,
+    }
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="wrote.*expected"):
+        with ext._weight_update_lifecycle("nccl_reshard") as finalize:
+            finalize()
+
+    process_weights.assert_not_called()
+    assert ext._nrl_main_destination_manifest is None
+    assert ext._nrl_refit_source_names is None
+
+
+@pytest.mark.vllm
+def test_generic_loader_returning_none_remains_compatible(monkeypatch):
+    """Strict loaded-name tracking does not silently broaden to other models."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={"model.weight": torch.nn.Parameter(torch.empty(1))},
+        source_names={"model.weight"},
+        load_weights=lambda **_kwargs: None,
+        model_type="llama",
+    )
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        ext._load_full_hf_weights([("model.weight", "weight")])
+        finalize()
+
+    process_weights.assert_called_once()
+
+
+@pytest.mark.vllm
+def test_main_manifest_excludes_draft_and_wrapped_mtp_namespaces(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    destination = "model.layers.0.mixer.qkv_proj.weight"
+    main_sources = [f"backbone.layers.0.mixer.{role}.weight" for role in ("q_proj", "k_proj", "v_proj")]
+    auxiliary_sources = [f"draft.model.layers.0.mixer.{role}.weight" for role in ("q_proj", "k_proj", "v_proj")] + [
+        f"language_model.mtp.layers.0.mixer.{role}.weight" for role in ("q_proj", "k_proj", "v_proj")
+    ]
+    ext, model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={destination: torch.nn.Parameter(torch.empty(1))},
+        source_names=main_sources + auxiliary_sources,
+        load_weights=lambda **_kwargs: {destination},
+    )
+    _patch_vllm_postload(monkeypatch)
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        ext._load_full_hf_weights([(name, name) for name in main_sources])
+        finalize()
+
+    assert model.load_weights.call_count == 3
+
+
+@pytest.mark.vllm
+def test_main_manifest_rejects_unsupported_fused_expert_biases(monkeypatch):
+    """Destination names alone cannot prove per-expert fused-bias coverage."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    destinations = {
+        "model.layers.0.mixer.experts.routed_experts.w13_bias",
+        "model.layers.0.mixer.experts.routed_experts.w2_bias",
+    }
+    source_names = {
+        "backbone.layers.0.mixer.experts.0.up_proj.bias",
+        "backbone.layers.0.mixer.experts.0.down_proj.bias",
+    }
+    ext, _model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={name: torch.nn.Parameter(torch.empty(1)) for name in destinations},
+        source_names=source_names,
+        # Simulate the strongest destination-only result: both fused targets
+        # were reported despite there being no per-expert acceptance proof.
+        load_weights=lambda **_kwargs: destinations,
+    )
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    with pytest.raises(ValueError, match="fused expert-bias coverage is unsupported"):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            ext._load_full_hf_weights([(name, name) for name in source_names])
+            finalize()
+
+    process_weights.assert_not_called()
+    assert ext._nrl_main_destination_manifest is None
+    assert ext._nrl_refit_source_names is None
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("loaded_names", [None, {"model.weight"}])
+def test_quantized_nemotron_h_refit_marks_strict_coverage_unsupported(monkeypatch, caplog, loaded_names):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    quant_config = object()
+    ext, model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={"model.weight": torch.nn.Parameter(torch.empty(1))},
+        source_names={"model.weight"},
+        load_weights=lambda **_kwargs: loaded_names,
+        model_type="nemotron_h_puzzle",
+        quant_config=quant_config,
+    )
+    _patch_vllm_postload(monkeypatch)
+
+    with caplog.at_level("WARNING"):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            ext._load_full_hf_weights([("model.weight", "weight")])
+            finalize()
+
+    model.load_weights.assert_called_once()
+    assert "coverage is disabled for quantized" in caplog.text
+
+
+@pytest.mark.vllm
+def test_zero_batch_transaction_fails_and_resets_without_strict_manifest(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, _model = _make_strict_refit_extension(
+        vllm_backend,
+        destination_params={"model.weight": torch.nn.Parameter(torch.empty(1))},
+        source_names={"model.weight"},
+        load_weights=lambda **_kwargs: None,
+        model_type="llama",
+    )
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="empty collective weight update"):
+        with ext._weight_update_lifecycle("collective") as finalize:
+            finalize()
+
+    process_weights.assert_not_called()
+    assert ext._nrl_main_destination_manifest is None
+    assert ext._nrl_refit_source_names is None
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     "method_name",
-    ["update_weights_via_ipc_zmq", "update_weights_from_collective"],
+    [
+        "update_weights_via_ipc_zmq",
+        "update_weights_from_collective",
+        "nccl_reshard_refit",
+    ],
 )
-@pytest.mark.parametrize(
-    "worker_results, expected", [([True, True], True), ([True, False], False)]
-)
-def test_sync_weight_updates_check_every_internal_worker(
-    method_name, worker_results, expected
-):
+@pytest.mark.parametrize("worker_results, expected", [([True, True], True), ([True, False], False)])
+def test_sync_weight_updates_check_every_internal_worker(method_name, worker_results, expected):
     """A failure on a later PP rank must not be hidden by rank zero success."""
     from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 
@@ -227,14 +701,14 @@ def test_sync_weight_updates_check_every_internal_worker(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "method_name",
-    ["update_weights_via_ipc_zmq_async", "update_weights_from_collective_async"],
+    [
+        "update_weights_via_ipc_zmq_async",
+        "update_weights_from_collective_async",
+        "nccl_reshard_refit_async",
+    ],
 )
-@pytest.mark.parametrize(
-    "worker_results, expected", [([True, True], True), ([True, False], False)]
-)
-async def test_async_weight_updates_check_every_internal_worker(
-    method_name, worker_results, expected
-):
+@pytest.mark.parametrize("worker_results, expected", [([True, True], True), ([True, False], False)])
+async def test_async_weight_updates_check_every_internal_worker(method_name, worker_results, expected):
     """Async refit also reports failures from every internal PP rank."""
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
         VllmAsyncGenerationWorkerImpl,
@@ -340,9 +814,7 @@ def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatc
         def send(self, payload):
             self.sent.append(payload)
 
-    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
-        vllm_backend.VllmInternalWorkerExtension
-    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(vllm_backend.VllmInternalWorkerExtension)
     ext.state_dict_info = {"model.weight": (torch.Size([1]), torch.float32)}
     ext.zmq_socket = FakeSocket()
     ext.maybe_init_zmq = lambda: None
@@ -426,10 +898,214 @@ def test_load_mtp_weights_from_disk_loads_only_mtp_layer(tmp_path, monkeypatch):
 
 
 @pytest.mark.vllm
+def test_load_mtp_weights_from_disk_supports_nemotron_h_native_namespace(tmp_path, monkeypatch):
+    """Nemotron-H's physical MTP blocks remain in the native mtp.layers namespace."""
+    model_dir = tmp_path / "ckpt"
+    first = torch.randn(4, 4)
+    expert = torch.randn(4, 4)
+    _write_sharded_checkpoint(
+        model_dir,
+        {
+            "model-00001-of-00002.safetensors": {
+                "model.layers.0.mixer.weight": torch.randn(4, 4),
+            },
+            "model-00002-of-00002.safetensors": {
+                "mtp.layers.0.eh_proj.weight": first,
+                "mtp.layers.1.mixer.experts.0.up_proj.weight": expert,
+            },
+        },
+    )
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "mtp_hybrid_override_pattern": "*E",
+            }
+        )
+    )
+    destination_names = {
+        "model.layers.0.eh_proj.weight",
+        "model.layers.1.mixer.experts.w13_weight",
+    }
+    ext = _make_extension_with_drafter(
+        mtp_start_layer_idx=52,
+        num_mtp_layers=1,
+        model_type="nemotron_h",
+        destination_names=destination_names,
+        loaded_names=destination_names,
+    )
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    assert ext.load_mtp_weights_from_disk(str(model_dir)) is True
+
+    draft_model = ext.model_runner.drafter.model
+    loaded = dict(item for call in draft_model.load_weights.call_args_list for item in call.kwargs["weights"])
+    assert set(loaded) == {
+        "mtp.layers.0.eh_proj.weight",
+        "mtp.layers.1.mixer.experts.0.up_proj.weight",
+    }
+    assert torch.equal(loaded["mtp.layers.0.eh_proj.weight"], first)
+    assert torch.equal(loaded["mtp.layers.1.mixer.experts.0.up_proj.weight"], expert)
+    process_weights.assert_called_once()
+
+
+@pytest.mark.vllm
+def test_load_native_nemotron_h_mtp_rejects_silent_partial_destination_load(tmp_path, monkeypatch):
+    """Source-layer presence is insufficient when vLLM silently skips a tensor."""
+    model_dir = tmp_path / "ckpt"
+    _write_sharded_checkpoint(
+        model_dir,
+        {
+            "model-00001-of-00001.safetensors": {
+                "mtp.layers.0.eh_proj.weight": torch.randn(4, 4),
+                "mtp.layers.1.mixer.experts.0.up_proj.weight": torch.randn(4, 4),
+            }
+        },
+    )
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "mtp_hybrid_override_pattern": "*E",
+            }
+        )
+    )
+    expected_names = {
+        "model.layers.0.eh_proj.weight",
+        "model.layers.1.mixer.experts.w13_weight",
+        "model.layers.1.final_layernorm.weight",
+    }
+    ext = _make_extension_with_drafter(
+        mtp_start_layer_idx=52,
+        num_mtp_layers=1,
+        model_type="nemotron_h",
+        destination_names=expected_names,
+        loaded_names=expected_names - {"model.layers.1.final_layernorm.weight"},
+    )
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    with pytest.raises(ValueError, match="missing destination parameters.*final_layernorm"):
+        ext.load_mtp_weights_from_disk(str(model_dir))
+
+    process_weights.assert_not_called()
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("missing_or_skipped", ["missing_v", "skipped_k"])
+def test_native_nemotron_h_mtp_qkv_coverage_requires_every_source(tmp_path, monkeypatch, missing_or_skipped):
+    """A qkv destination cannot hide a missing or silently skipped component."""
+    model_dir = tmp_path / "ckpt"
+    roles = ["q_proj", "k_proj"]
+    if missing_or_skipped != "missing_v":
+        roles.append("v_proj")
+    _write_sharded_checkpoint(
+        model_dir,
+        {
+            "model-00001-of-00001.safetensors": {
+                f"mtp.layers.0.mixer.{role}.weight": torch.randn(4, 4) for role in roles
+            }
+        },
+    )
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "mtp_hybrid_override_pattern": "M",
+            }
+        )
+    )
+    destination = "model.layers.0.mixer.qkv_proj.weight"
+
+    def loaded_names(weights):
+        source_name = weights[0][0]
+        if missing_or_skipped == "skipped_k" and ".k_proj." in source_name:
+            return set()
+        return {destination}
+
+    ext = _make_extension_with_drafter(
+        mtp_start_layer_idx=52,
+        num_mtp_layers=1,
+        model_type="nemotron_h",
+        destination_names={destination},
+        loaded_names=loaded_names,
+    )
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    with pytest.raises(ValueError, match="missing (?:source roles|required source components)"):
+        ext.load_mtp_weights_from_disk(str(model_dir))
+
+    process_weights.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_native_nemotron_h_mtp_coverage_requires_loader_tracking(tmp_path, monkeypatch):
+    model_dir = tmp_path / "ckpt"
+    _write_sharded_checkpoint(
+        model_dir,
+        {"model-00001-of-00001.safetensors": {"mtp.layers.0.eh_proj.weight": torch.randn(4, 4)}},
+    )
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "mtp_hybrid_override_pattern": "*",
+            }
+        )
+    )
+    ext = _make_extension_with_drafter(
+        mtp_start_layer_idx=52,
+        num_mtp_layers=1,
+        model_type="nemotron_h",
+        destination_names={"model.layers.0.eh_proj.weight"},
+        loaded_names=None,
+    )
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="did not report loaded destination"):
+        ext.load_mtp_weights_from_disk(str(model_dir))
+
+    process_weights.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_nemotron_h_native_mtp_reader_rejects_missing_physical_block(tmp_path):
+    """The native namespace must cover every block in depth × hybrid pattern."""
+    import json
+
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        _read_mtp_layer_weights_from_checkpoint,
+    )
+
+    model_dir = tmp_path / "ckpt"
+    _write_sharded_checkpoint(
+        model_dir,
+        {
+            "model-00001-of-00001.safetensors": {
+                "mtp.layers.0.eh_proj.weight": torch.randn(4, 4),
+            }
+        },
+    )
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "nemotron_h",
+                "num_nextn_predict_layers": 1,
+                "mtp_hybrid_override_pattern": "*E",
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="expected physical layers.*0, 1"):
+        _read_mtp_layer_weights_from_checkpoint(str(model_dir), {52})
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize("is_last_rank", [False, True])
-def test_load_mtp_weights_from_disk_without_drafter(
-    tmp_path, monkeypatch, is_last_rank
-):
+def test_load_mtp_weights_from_disk_without_drafter(tmp_path, monkeypatch, is_last_rank):
     """Only the pipeline stage that owns the drafter requires it to exist."""
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtension,
@@ -454,9 +1130,7 @@ def test_load_mtp_weights_from_disk_without_drafter(
 
 
 @pytest.mark.vllm
-def test_load_mtp_weights_from_disk_raises_when_mtp_weights_missing(
-    tmp_path, monkeypatch
-):
+def test_load_mtp_weights_from_disk_raises_when_mtp_weights_missing(tmp_path, monkeypatch):
     """A checkpoint without the MTP layer(s) fails loudly instead of silently."""
     model_dir = tmp_path / "ckpt"
     _write_sharded_checkpoint(
@@ -517,9 +1191,7 @@ def test_load_weights_routes_only_policy_weights_to_mtp_drafter(monkeypatch):
 )
 def test_mtp_drafter_refit_enabled(method, from_disk, has_drafter, expected):
     """The refit-into-drafter path only fires for a co-trained MTP drafter."""
-    ext, _ = _make_mtp_refit_extension(
-        method=method, from_disk=from_disk, has_drafter=has_drafter
-    )
+    ext, _ = _make_mtp_refit_extension(method=method, from_disk=from_disk, has_drafter=has_drafter)
     assert ext._mtp_drafter_refit_enabled() is expected
 
 
@@ -561,16 +1233,12 @@ def test_maybe_refit_mtp_drafter_noop_when_gated(method, from_disk):
 def test_maybe_process_mtp_drafter_after_loading_when_enabled(monkeypatch):
     """The refit MTP drafter is finalized against its own draft_model_config."""
     draft_model_config = object()
-    ext, drafter_model = _make_mtp_refit_extension(
-        method="mtp", from_disk=False, draft_model_config=draft_model_config
-    )
+    ext, drafter_model = _make_mtp_refit_extension(method="mtp", from_disk=False, draft_model_config=draft_model_config)
     process_weights = _patch_vllm_postload(monkeypatch)
 
     ext._maybe_process_mtp_drafter_after_loading()
 
-    process_weights.assert_called_once_with(
-        drafter_model, draft_model_config, ext.device
-    )
+    process_weights.assert_called_once_with(drafter_model, draft_model_config, ext.device)
 
 
 @pytest.mark.vllm

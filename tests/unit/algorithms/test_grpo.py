@@ -2437,6 +2437,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         enable_router_replay=False,
         routed_experts_dtype="int16",
         use_fastokens=False,
+        rollout_fan_in=None,
     )
 
 
@@ -2809,6 +2810,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         enable_router_replay=False,
         routed_experts_dtype="int16",
         use_fastokens=False,
+        rollout_fan_in=None,
     )
 
 
@@ -3541,6 +3543,14 @@ def test_periodic_validation_starts_at_configured_step(
             master_config.data_plane = {"enabled": True}
             stack.enter_context(
                 mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo_sync.group_id_from_sample_id",
+                    side_effect=AssertionError(
+                        "disabled shared-prefix mode must not parse sample IDs"
+                    ),
+                )
             )
             validate_target = "nemo_rl.algorithms.grpo_sync.validate_sync"
         elif train_func is async_grpo_train:

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal, TypedDict
 
@@ -41,7 +42,7 @@ class HfExpertWeight:
 
 
 _HF_EXPERT_WEIGHT_RE = re.compile(
-    r"^(?P<prefix>.+\.mlp\.experts)\."
+    r"^(?P<prefix>.+\.(?:mlp|mixer)\.experts)\."
     r"(?P<expert_id>\d+)\."
     r"(?P<projection>gate_proj|up_proj|down_proj)\.weight$"
 )
@@ -71,6 +72,57 @@ def parse_hf_expert_weight(name: str) -> HfExpertWeight | None:
     )
 
 
+def _expert_parameter_namespace(name: str) -> Literal["main", "mtp"]:
+    """Return the model namespace that owns an expert parameter."""
+    if re.search(r"(?:^|\.)mtp\.layers\.\d+\.", name) is not None:
+        return "mtp"
+    return "main"
+
+
+def _expert_parameter_alias(name: str) -> tuple[Literal["main", "mtp"], str]:
+    """Return a prefix-independent, namespace-preserving expert alias."""
+    layer_match = re.search(r"(?:^|\.)(layers\.\d+\..+)$", name)
+    relative_name = layer_match.group(1) if layer_match is not None else name
+    return (
+        _expert_parameter_namespace(name),
+        relative_name.replace(".routed_experts.", "."),
+    )
+
+
+def resolve_vllm_expert_parameter_name(
+    candidate: str,
+    available_names: Iterable[str],
+    *,
+    target_is_mtp_drafter: bool = False,
+) -> str | None:
+    """Resolve HF/vLLM prefix and ``routed_experts`` namespace aliases.
+
+    Nemotron-H exports ``backbone.layers.*.mixer.experts`` while vLLM owns
+    ``model.layers.*.mixer.experts.routed_experts``.  Matching the layer-local
+    suffix keeps this conversion explicit without hard-coding either main-model
+    prefix. Native ``mtp.layers.*`` parameters belong to vLLM's separate
+    drafter and must never alias a main-model ``model.layers.*`` parameter.
+    Ambiguous aliases are rejected instead of selecting a target
+    nondeterministically. ``target_is_mtp_drafter`` is reserved for a drafter
+    whose own vLLM parameter names use ``model.layers.*``; main-model refit
+    callers must keep the fail-closed default.
+    """
+    available = set(available_names)
+    if candidate in available:
+        return candidate
+
+    alias = _expert_parameter_alias(candidate)
+    matches = sorted(
+        name
+        for name in available
+        if _expert_parameter_alias(name) == alias
+        or (target_is_mtp_drafter and alias[0] == "mtp" and _expert_parameter_alias(name) == ("main", alias[1]))
+    )
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous vLLM expert parameter alias for {candidate!r}: {matches}")
+    return matches[0] if matches else None
+
+
 def select_hf_weight_for_vllm_target(
     name: str,
     tensor: torch.Tensor,
@@ -83,16 +135,24 @@ def select_hf_weight_for_vllm_target(
     tensor-parallel MoE layers shard every expert tensor while expert-parallel
     layers place complete experts on selected ranks.
     """
-    if any(
-        name.startswith(prefix) for prefix in target_layout["missing_weight_prefixes"]
-    ):
+    if any(name.startswith(prefix) for prefix in target_layout["missing_weight_prefixes"]):
         return None
 
     expert_weight = parse_hf_expert_weight(name)
     if expert_weight is None:
         return tensor
 
-    param_layout = target_layout["expert_params"].get(expert_weight.parameter_name)
+    resolved_parameter_name = resolve_vllm_expert_parameter_name(
+        expert_weight.parameter_name, target_layout["expert_params"]
+    )
+    if resolved_parameter_name is None and _expert_parameter_namespace(expert_weight.parameter_name) == "mtp":
+        # The checkpoint-engine layout describes only the main vLLM model.
+        # Native MTP weights remain in the policy stream so the receiver can
+        # route their full tensors to the separately-owned MTP drafter.
+        return tensor
+    param_layout = (
+        target_layout["expert_params"].get(resolved_parameter_name) if resolved_parameter_name is not None else None
+    )
     if param_layout is None:
         # A missing expert parameter belongs to another pipeline stage.
         return None

@@ -124,8 +124,8 @@ class TestAggregateStepMetrics:
 
     def test_moe_and_mtp_metrics_are_prefixed(self) -> None:
         result = {
-            "moe_metrics": {"load_balance": [1.0, 3.0]},
-            "mtp_metrics": {"acc": [2.0, 2.0]},
+            "moe_metrics": {"load_balance": 4.0},
+            "mtp_metrics": {"acc": 4.0},
         }
         out = aggregate_step_metrics(result)
         assert out["moe/load_balance"] == pytest.approx(4.0)
@@ -136,14 +136,68 @@ class TestReduceAdvantagePumpMetrics:
     def test_reward_and_advantages_and_tokens(self) -> None:
         out = reduce_advantage_pump_metrics(
             rewards=[torch.tensor([1.0, 3.0])],
+            verifier_rewards=[torch.tensor([0.5, 1.5])],
             masked_advantages=[torch.tensor([-1.0, 0.0, 2.0])],
             sequence_lengths=[4, 6],
         )
         assert out["reward"] == pytest.approx(2.0)
+        assert out["verifier_reward"] == pytest.approx(1.0)
+        assert out["reward_processing_delta"] == pytest.approx(1.0)
         assert out["advantages/mean"] == pytest.approx(1.0 / 3.0)
         assert out["advantages/max"] == pytest.approx(2.0)
         assert out["advantages/min"] == pytest.approx(-1.0)
         assert out["total_num_tokens"] == pytest.approx(10.0)
+
+    def test_reward_reduction_weights_rows_across_uneven_chunks(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            rewards=[torch.empty(0), torch.tensor([1.0, 3.0]), torch.tensor([5.0])],
+            verifier_rewards=[
+                torch.empty(0),
+                torch.tensor([0.0, 2.0]),
+                torch.tensor([4.0]),
+            ],
+            masked_advantages=[],
+            sequence_lengths=[],
+        )
+
+        assert out["reward"] == pytest.approx(3.0)
+        assert out["verifier_reward"] == pytest.approx(2.0)
+        assert out["reward_processing_delta"] == pytest.approx(1.0)
+
+    def test_empty_reward_tensors_do_not_emit_nan_metrics(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            rewards=[torch.empty(0)],
+            verifier_rewards=[torch.empty(0)],
+            masked_advantages=[],
+            sequence_lengths=[],
+        )
+
+        assert "reward" not in out
+        assert "verifier_reward" not in out
+        assert "reward_processing_delta" not in out
+
+    @pytest.mark.parametrize(
+        ("rewards", "verifier_rewards"),
+        [
+            ([torch.tensor([1.0])], []),
+            ([torch.tensor([1.0, 2.0])], [torch.tensor([1.0])]),
+        ],
+    )
+    def test_reward_reduction_rejects_misaligned_cohorts(
+        self,
+        rewards: list[torch.Tensor],
+        verifier_rewards: list[torch.Tensor],
+    ) -> None:
+        with pytest.raises(
+            ValueError,
+            match="processed and verifier reward cohorts must align chunk-for-chunk",
+        ):
+            reduce_advantage_pump_metrics(
+                rewards=rewards,
+                verifier_rewards=verifier_rewards,
+                masked_advantages=[],
+                sequence_lengths=[],
+            )
 
     def test_empty_advantages_tensor_yields_zeros(self) -> None:
         out = reduce_advantage_pump_metrics(

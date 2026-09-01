@@ -47,6 +47,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.vllm_replay_bundle import VllmReplayConfigurationError
 
 model_name = "Qwen/Qwen3-0.6B"
 # Define basic vLLM test config
@@ -141,6 +142,24 @@ basic_dtensor_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+
+def test_required_replay_rejects_actual_generation_dp_before_worker_creation():
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"].update(
+        {
+            "async_engine": True,
+            "expose_http_server": True,
+            "replay_bundle_sha256": "0" * 64,
+            "replay_required": True,
+            "tensor_parallel_size": 4,
+        }
+    )
+    cluster = MagicMock()
+    cluster.world_size.return_value = 8
+
+    with pytest.raises(VllmReplayConfigurationError, match="data-parallel size 1"):
+        VllmGeneration(cluster, config)
 
 
 def test_context_capped_max_new_tokens():

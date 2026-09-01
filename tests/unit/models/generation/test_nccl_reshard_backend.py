@@ -27,14 +27,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch.distributed.tensor.placement_types import Shard
 
 pytest.importorskip("vllm")  # module-top `import vllm` in vllm_backend
 
 from nemo_rl.models.generation.vllm.vllm_backend import (  # noqa: E402
+    _MainModelDestinationManifest,
     VllmInternalWorkerExtension,
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import (  # noqa: E402
     HFToLocalParamMap,
+    MeshInfo,
 )
 
 pytestmark = pytest.mark.vllm
@@ -59,6 +62,21 @@ def _make_ext(vllm_params):
 
 def _param(*shape):
     return torch.empty(*shape)
+
+
+class _FakeMoeOwner:
+    def __init__(self, *, is_act_and_mul):
+        self.moe_config = SimpleNamespace(is_act_and_mul=is_act_and_mul)
+
+    def weight_loader(self, *_args, **_kwargs):
+        raise AssertionError("mapping tests must not invoke the weight loader")
+
+
+def _moe_param(*shape, is_act_and_mul):
+    param = _param(*shape)
+    owner = _FakeMoeOwner(is_act_and_mul=is_act_and_mul)
+    param.weight_loader = owner.weight_loader
+    return param
 
 
 def test_build_mapping_ffn_only():
@@ -138,25 +156,222 @@ def test_build_mapping_non_gated_expert_up_is_direct():
                 {
                     "name": "model.layers.0.mlp.experts.up_proj.weight",
                     "global_shape": [E, 64, H],
+                    "dtype": "torch.float32",
                     "grouped_expert_proj": "up_proj",
                 },
                 {
                     "name": "model.layers.0.mlp.experts.down_proj.weight",
                     "global_shape": [E, H, 64],
+                    "dtype": "torch.float32",
                     "grouped_expert_proj": "down_proj",
                 },
             ]
         },
     }
-    w13 = _param(E, 64, H)
-    w2 = _param(E, H, 64)
+    w13 = _moe_param(E, 64, H, is_act_and_mul=False)
+    w2 = _moe_param(E, H, 64, is_act_and_mul=False)
     vllm_params = {
         "model.layers.0.mlp.experts.w13_weight": w13,
         "model.layers.0.mlp.experts.w2_weight": w2,
     }
-    mapping = _make_ext(vllm_params)._build_hf_to_gen_backend_mapping(refit_info)
+    ext = _make_ext(vllm_params)
+    mapping = ext._build_hf_to_gen_backend_mapping(refit_info)
     assert mapping["model.layers.0.mlp.experts.up_proj.weight"] == (w13, None)
     assert mapping["model.layers.0.mlp.experts.down_proj.weight"] == (w2, None)
+    pmap = ext.build_hf_to_local_param_map(refit_info)
+    assert pmap.get("model.layers.0.mlp.experts.up_proj.weight").pre is None
+
+
+def test_pinned_nemotron_h_128_expert_non_gated_map_transaction():
+    """Qualify Nano's non-gated E=128 grouped-map and coverage contract."""
+    num_experts, hidden_size, intermediate_size = 128, 4, 8
+    up_name = "backbone.layers.0.mixer.experts.up_proj.weight"
+    down_name = "backbone.layers.0.mixer.experts.down_proj.weight"
+    w13_name = "model.layers.0.mixer.experts.routed_experts.w13_weight"
+    w2_name = "model.layers.0.mixer.experts.routed_experts.w2_weight"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["backbone.layers.0"],
+        "per_layer_params": {
+            "backbone.layers.0": [
+                {
+                    "name": up_name,
+                    "global_shape": [
+                        num_experts,
+                        intermediate_size,
+                        hidden_size,
+                    ],
+                    "dtype": "torch.float32",
+                    "grouped_expert_proj": "up_proj",
+                },
+                {
+                    "name": down_name,
+                    "global_shape": [
+                        num_experts,
+                        hidden_size,
+                        intermediate_size,
+                    ],
+                    "dtype": "torch.float32",
+                    "grouped_expert_proj": "down_proj",
+                },
+            ]
+        },
+    }
+    params = {
+        w13_name: _moe_param(
+            num_experts,
+            intermediate_size,
+            hidden_size,
+            is_act_and_mul=False,
+        ),
+        w2_name: _moe_param(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            is_act_and_mul=False,
+        ),
+    }
+    ext = _make_ext(params)
+
+    pmap = ext.build_hf_to_local_param_map(refit_info)
+
+    assert pmap.get(up_name).pre is None
+    assert pmap.get(down_name).pre is None
+    assert ext._nrl_nccl_reshard_source_destinations == {
+        up_name: w13_name,
+        down_name: w2_name,
+    }
+    manifest = _MainModelDestinationManifest(params, {up_name, down_name})
+    manifest.record_direct_load(ext._nrl_nccl_reshard_source_destinations)
+    manifest.require_complete()
+
+
+def test_build_hf_to_local_param_map_rejects_missing_fused_half():
+    target = _param(8, 4)
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": "model.layers.0.mlp.gate_proj.weight",
+                    "global_shape": [4, 4],
+                    "dtype": "torch.float32",
+                }
+            ]
+        },
+    }
+    ext = _make_ext({"model.layers.0.mlp.gate_up_proj.weight": target})
+
+    with pytest.raises(ValueError, match="incomplete dense gate/up source family"):
+        ext.build_hf_to_local_param_map(refit_info)
+
+
+@pytest.mark.parametrize("projection", ["gate_proj", "up_proj"])
+def test_build_hf_to_local_param_map_rejects_missing_gated_expert_half(
+    projection,
+):
+    source_name = f"model.layers.0.mlp.experts.{projection}.weight"
+    target = _moe_param(2, 8, 4, is_act_and_mul=True)
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": source_name,
+                    "global_shape": [2, 4, 4],
+                    "dtype": "torch.float32",
+                    "grouped_expert_proj": projection,
+                }
+            ]
+        },
+    }
+    ext = _make_ext({"model.layers.0.mlp.experts.w13_weight": target})
+
+    with pytest.raises(ValueError, match="incomplete.*fused target coverage"):
+        ext.build_hf_to_local_param_map(refit_info)
+
+
+def test_build_hf_to_local_param_map_rejects_duplicate_fused_half():
+    target = _param(8, 4)
+    gate = "model.layers.0.mlp.gate_proj.weight"
+    up = "model.layers.0.mlp.up_proj.weight"
+    refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": gate,
+                    "global_shape": [4, 4],
+                    "dtype": "torch.float32",
+                },
+                {
+                    "name": up,
+                    "global_shape": [4, 4],
+                    "dtype": "torch.float32",
+                },
+            ]
+        },
+    }
+    ext = _make_ext({"model.layers.0.mlp.gate_up_proj.weight": target})
+    ext._build_hf_to_gen_backend_mapping = lambda _info: {
+        gate: (target, (slice(0, 4),)),
+        up: (target, (slice(0, 4),)),
+    }
+
+    with pytest.raises(ValueError, match="incomplete or overlapping"):
+        ext.build_hf_to_local_param_map(refit_info)
+
+
+def test_build_hf_to_local_param_map_rejects_missing_grouped_expert_cardinality():
+    source_name = "model.layers.0.mlp.experts.up_proj.weight"
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": source_name,
+                    # Metadata omitted one of the four logical experts.
+                    "global_shape": [3, 64, 16],
+                    "dtype": "torch.float32",
+                    "grouped_expert_proj": "up_proj",
+                    "dst_mesh_info": MeshInfo(torch.arange(2)),
+                    "dst_placements": [Shard(0)],
+                }
+            ]
+        },
+    }
+    target = _moe_param(2, 64, 16, is_act_and_mul=False)
+    ext = _make_ext({"model.layers.0.mlp.experts.w13_weight": target})
+
+    with pytest.raises(ValueError, match="source/destination shape mismatch"):
+        ext.build_hf_to_local_param_map(refit_info)
+
+
+def test_build_hf_to_local_param_map_rejects_wrong_direct_shape():
+    source_name = "model.layers.0.mlp.down_proj.weight"
+    refit_info = {
+        "gen_tp_size": 2,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": source_name,
+                    "global_shape": [16, 64],
+                    "dtype": "torch.float32",
+                    "dst_mesh_info": MeshInfo(torch.arange(2)),
+                    "dst_placements": [Shard(1)],
+                }
+            ]
+        },
+    }
+    # A local second dimension of 31 implies global 62, not the advertised 64.
+    ext = _make_ext({source_name: _param(16, 31)})
+
+    with pytest.raises(ValueError, match=r"implies \(16, 62\)"):
+        ext.build_hf_to_local_param_map(refit_info)
 
 
 def test_build_mapping_resolves_routed_experts_submodule():
@@ -291,6 +506,10 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip():
     pmap = ext.build_hf_to_local_param_map(refit_info)
     assert isinstance(pmap, HFToLocalParamMap)
     assert pmap.get("does.not.exist") is None
+    assert (
+        ext._nrl_nccl_reshard_source_destinations["model.layers.0.mlp.gate_proj.weight"]
+        == "model.layers.0.mlp.gate_up_proj.weight"
+    )
 
     # Direct param: base aliases the live vLLM tensor (.data is a distinct object
     # sharing storage, so compare data_ptr), no hooks (received in place).
@@ -338,6 +557,12 @@ def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
                     "grouped_expert_proj": "gate_proj",
                 },
                 {
+                    "name": "model.layers.0.mlp.experts.up_proj.weight",
+                    "global_shape": [E, Pl, H],
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": "up_proj",
+                },
+                {
                     "name": "model.layers.0.mlp.experts.down_proj.weight",
                     "global_shape": [E, H, Pl],
                     "dtype": "torch.bfloat16",
@@ -362,9 +587,7 @@ def test_build_hf_to_local_param_map_quantizes_bf16_for_mxfp8(monkeypatch):
     def fake_quantize(weight):
         return (
             torch.full_like(weight, 3, dtype=torch.float8_e4m3fn),
-            torch.full(
-                (*weight.shape[:-1], weight.shape[-1] // 32), 7, dtype=torch.uint8
-            ),
+            torch.full((*weight.shape[:-1], weight.shape[-1] // 32), 7, dtype=torch.uint8),
         )
 
     monkeypatch.setattr(
@@ -493,9 +716,7 @@ def test_build_hf_to_local_param_map_quantizes_dense_gate_and_up_for_mxfp8(
         },
     }
     gate_up = torch.zeros(2 * intermediate_size, hidden_size, dtype=torch.float8_e4m3fn)
-    gate_up_scale = torch.zeros(
-        2 * intermediate_size, hidden_size // 32, dtype=torch.uint8
-    )
+    gate_up_scale = torch.zeros(2 * intermediate_size, hidden_size // 32, dtype=torch.uint8)
     ext = _make_ext(
         {
             "model.layers.0.mlp.gate_up_proj.weight": gate_up,
@@ -552,9 +773,7 @@ def test_build_hf_to_local_param_map_keeps_matching_blockwise_fp8_storage():
     w2 = torch.empty(E, H, P, dtype=torch.float8_e4m3fn)
     ext = _make_ext({"model.layers.0.mlp.experts.w2_weight": w2})
 
-    spec = ext.build_hf_to_local_param_map(refit_info).get(
-        "model.layers.0.mlp.experts.down_proj.weight"
-    )
+    spec = ext.build_hf_to_local_param_map(refit_info).get("model.layers.0.mlp.experts.down_proj.weight")
 
     assert spec is not None
     assert spec.base.data_ptr() == w2.data_ptr()
@@ -579,9 +798,7 @@ def test_build_hf_to_local_param_map_rejects_wire_dtype_mismatch():
     down = torch.empty(hidden_size, intermediate_size, dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="wire dtype torch.float32 does not match"):
-        _make_ext(
-            {"model.layers.0.mlp.down_proj.weight": down}
-        ).build_hf_to_local_param_map(refit_info)
+        _make_ext({"model.layers.0.mlp.down_proj.weight": down}).build_hf_to_local_param_map(refit_info)
 
 
 def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_scale_shape():
@@ -622,9 +839,7 @@ def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_scale_shape():
         ("invalid_k", "must have K divisible by 32"),
     ],
 )
-def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_metadata(
-    case: str, error: str
-) -> None:
+def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_metadata(case: str, error: str) -> None:
     H, E = 32, 2
     P = 63 if case == "invalid_k" else 64
     wire_dtype = "torch.unknown" if case == "unknown_wire_dtype" else "torch.bfloat16"
@@ -646,8 +861,8 @@ def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_metadata(
     vllm_params = {"model.layers.0.mlp.experts.w2_weight": w2}
     if case != "missing_scale":
         scale_dtype = torch.float32 if case == "invalid_scale_dtype" else torch.uint8
-        vllm_params["model.layers.0.mlp.experts.w2_weight_scale_from_checkpoint"] = (
-            torch.empty(E, H, max(P // 32, 1), dtype=scale_dtype)
+        vllm_params["model.layers.0.mlp.experts.w2_weight_scale_from_checkpoint"] = torch.empty(
+            E, H, max(P // 32, 1), dtype=scale_dtype
         )
 
     with pytest.raises(ValueError, match=error):

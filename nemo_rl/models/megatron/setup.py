@@ -273,6 +273,10 @@ SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY = "hybrid_star_moe_expert_bia
 SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY = (
     "hybrid_star_full_uniform_recompute_v1"
 )
+SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY = "hybrid_star_mtp_dense_heads_v1"
+SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY = (
+    "hybrid_star_positionless_attention_v1"
+)
 
 
 def destroy_parallel_state():
@@ -507,6 +511,16 @@ def _validate_shared_prefix_model_capability(
     if shared_prefix_config.mode != "train":
         return
 
+    megatron_config = config.get("megatron_cfg")
+    if megatron_config is not None:
+        peft_config = megatron_config.get("peft")
+        if peft_config is not None and peft_config["enabled"]:
+            raise NotImplementedError(
+                "policy.shared_prefix_training.mode=train currently requires "
+                "policy.megatron_cfg.peft.enabled=false; PEFT/LoRA adapter dropout "
+                "and shared-prefix gradient semantics have not been validated."
+            )
+
     if not isinstance(model_cfg, HybridModelProvider):
         raise NotImplementedError(
             "policy.shared_prefix_training.mode=train currently supports only "
@@ -607,11 +621,13 @@ def _validate_shared_prefix_model_capability(
         )
 
     if model_cfg.mtp_num_layers is not None and model_cfg.mtp_num_layers > 0:
-        raise NotImplementedError(
-            "policy.shared_prefix_training.mode=train resolved "
-            f"model_cfg.mtp_num_layers={model_cfg.mtp_num_layers}; "
-            "policy.megatron_cfg.mtp_num_layers must be 0."
-        )
+        if SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY not in capabilities:
+            raise NotImplementedError(
+                "policy.shared_prefix_training.mode=train with MTP requires MCore "
+                "dense-head reconstruction capability "
+                f"{SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY!r}; resolved "
+                f"model_cfg.mtp_num_layers={model_cfg.mtp_num_layers}."
+            )
 
     if model_cfg.cuda_graph_impl != "none":
         raise NotImplementedError(
@@ -653,9 +669,17 @@ def _validate_shared_prefix_model_capability(
             "The provider must resolve full attention (window_size=None or (-1, -1))."
         )
 
-    if model_cfg.position_embedding_type != "rope":
+    if model_cfg.position_embedding_type == "none":
+        if SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY not in capabilities:
+            raise NotImplementedError(
+                "policy.shared_prefix_training.mode=train with positionless attention "
+                "requires MCore capability "
+                f"{SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY!r}."
+            )
+    elif model_cfg.position_embedding_type != "rope":
         raise NotImplementedError(
-            "policy.shared_prefix_training.mode=train requires standard RoPE; resolved "
+            "policy.shared_prefix_training.mode=train supports only standard RoPE or "
+            "positionless Hybrid attention; resolved "
             f"model_cfg.position_embedding_type={model_cfg.position_embedding_type!r}."
         )
 
@@ -1239,6 +1263,17 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_router_load_balancing_type = config["megatron_cfg"][
         "moe_router_load_balancing_type"
     ]
+    # These provider fields may carry nonzero defaults even when the policy
+    # recipe explicitly disables the corresponding router regularizer.  Copy
+    # them by key presence (rather than truthiness) so zero and null overrides
+    # survive into the resolved model config inspected by capability guards.
+    for field_name in (
+        "moe_aux_loss_coeff",
+        "moe_z_loss_coeff",
+        "moe_input_jitter_eps",
+    ):
+        if field_name in config["megatron_cfg"]:
+            setattr(model_cfg, field_name, config["megatron_cfg"][field_name])
     # Set this to 0.0 to disable updates to the moe router expert bias
     model_cfg.moe_router_bias_update_rate = config["megatron_cfg"][
         "moe_router_bias_update_rate"

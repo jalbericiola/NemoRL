@@ -50,37 +50,27 @@ from tensordict import NonTensorData, NonTensorStack, TensorDict
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.grpo import (
-    GRPOSaveState,
+    GRPOSaveState, _should_log_nemo_gym_responses,
     _write_latest_checkpoint_status,
-    compute_and_apply_seq_logprob_error_masking,
-)
+    compute_and_apply_seq_logprob_error_masking, scale_rewards)
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.shared_prefix_metrics import (
-    SharedPrefixOpportunity,
-    combine_shared_prefix_opportunities,
-    observe_shared_prefix_opportunity,
-)
+    SharedPrefixOpportunity, combine_shared_prefix_opportunities,
+    observe_shared_prefix_opportunity)
 from nemo_rl.algorithms.single_controller_utils.config import (
-    AdvantageConfig,
-    MasterConfig,
-    validate_sampler_buffer_capacity,
-    validate_single_controller_config,
-)
-from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+    AdvantageConfig, MasterConfig, validate_sampler_buffer_capacity,
+    validate_single_controller_config)
+from nemo_rl.algorithms.single_controller_utils.setup import \
+    SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
-    aggregate_step_metrics,
-    fields_for_put,
-    reduce_advantage_pump_metrics,
-    squeeze_trailing_unit_dim,
-    tensor_field,
-)
+    aggregate_step_metrics, fields_for_put, reduce_advantage_pump_metrics,
+    squeeze_trailing_unit_dim, tensor_field)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.packing.shared_prefix_metadata import (
-    SHARED_PREFIX_GROUP_ID,
-    SHARED_PREFIX_PROMPT_LENGTHS,
-)
-from nemo_rl.data_plane.codec import unwrap_wire_stripped_payload
+    SHARED_PREFIX_GROUP_ID, SHARED_PREFIX_PROMPT_LENGTHS)
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.codec import unwrap_wire_stripped_payload
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -100,6 +90,48 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 # Logger this module also uses as `self._logger`.
 log = logging.getLogger(__name__)
 
+_ROLLOUT_ADMISSION_STATE_FILE = "rollout_admission.pt"
+_ROLLOUT_ADMISSION_STATE_VERSION = 2
+
+
+class _AdmissionInflightRegistry:
+    """Bind RolloutManager's attempt group ID to one durable prompt record.
+
+    ``RolloutManager.generate_and_push`` creates the group ID internally. Its
+    registry hook is therefore the only controller-side point at which the durable
+    admission ledger can learn the exact ID later serialized by TQReplayBuffer.
+    """
+
+    def __init__(
+        self,
+        backing: dict[str, tuple[asyncio.Task[None], int]],
+        group_record: dict[str, Any],
+        rollout_permitted: asyncio.Event,
+        registry_changed: asyncio.Event,
+    ) -> None:
+        self._backing = backing
+        self._group_record = group_record
+        self._rollout_permitted = rollout_permitted
+        self._registry_changed = registry_changed
+
+    async def wait_until_permitted(self) -> None:
+        """Block every rollout attempt, including retries, during refit."""
+        await self._rollout_permitted.wait()
+
+    def is_permitted(self) -> bool:
+        """Recheck admission synchronously immediately before registration."""
+        return self._rollout_permitted.is_set()
+
+    def __setitem__(self, group_id: str, value: tuple[asyncio.Task[None], int]) -> None:
+        self._group_record["group_id"] = group_id
+        self._backing[group_id] = value
+        self._registry_changed.set()
+
+    def pop(self, group_id: str, default: Any = None) -> Any:
+        value = self._backing.pop(group_id, default)
+        self._registry_changed.set()
+        return value
+
 
 def _resolve_train_dispatch_group_multiple(
     *,
@@ -111,9 +143,7 @@ def _resolve_train_dispatch_group_multiple(
     if shared_prefix_mode != "train":
         return 1
     if data_parallel_size < 1:
-        raise ValueError(
-            f"shared-prefix train mode requires positive DP size, got {data_parallel_size}"
-        )
+        raise ValueError(f"shared-prefix train mode requires positive DP size, got {data_parallel_size}")
     if num_prompts_per_step % data_parallel_size != 0:
         raise ValueError(
             "policy.shared_prefix_training.mode=train requires "
@@ -140,9 +170,7 @@ def _train_selection_group_bounds(
     if remaining_groups < 1:
         raise ValueError(f"remaining_groups must be positive, got {remaining_groups}")
     if configured_min_groups < 1:
-        raise ValueError(
-            f"configured_min_groups must be positive, got {configured_min_groups}"
-        )
+        raise ValueError(f"configured_min_groups must be positive, got {configured_min_groups}")
     if group_multiple < 1:
         raise ValueError(f"group_multiple must be positive, got {group_multiple}")
 
@@ -158,9 +186,7 @@ def _train_selection_group_bounds(
             "by a whole DP-width of prompt groups."
         )
 
-    rounded_minimum = (
-        (historical_minimum + group_multiple - 1) // group_multiple
-    ) * group_multiple
+    rounded_minimum = ((historical_minimum + group_multiple - 1) // group_multiple) * group_multiple
     exact_groups = min(rounded_minimum, remaining_groups)
     return exact_groups, exact_groups
 
@@ -199,12 +225,8 @@ def _reduce_shared_prefix_step_metrics(
         return {}
     combined = combine_shared_prefix_opportunities(opportunities)
     if combined.total_sequences <= 0:
-        raise RuntimeError(
-            "shared-prefix observation produced a step with no sequences"
-        )
-    if expected_total_tokens is not None and float(expected_total_tokens) != float(
-        combined.total_tokens
-    ):
+        raise RuntimeError("shared-prefix observation produced a step with no sequences")
+    if expected_total_tokens is not None and float(expected_total_tokens) != float(combined.total_tokens):
         raise RuntimeError(
             "shared-prefix observation did not cover the exact optimizer step: "
             f"observed total_num_tokens={combined.total_tokens}, "
@@ -228,22 +250,41 @@ def _string_object_field(data: TensorDict, field_name: str) -> list[str]:
             value = item
             break
     if isinstance(value, NonTensorStack):
-        items = value.tolist()
+        # TensorDict may preserve NumPy object columns as a stack of
+        # NonTensorData wrappers.  Walk the stack structurally: in some
+        # versions ``tolist()`` leaves those per-row payloads wrapped.
+        items = list(value.unbind(0))
     elif isinstance(value, NonTensorData):
-        items = [value.data]
+        payload = value.data
+        if isinstance(payload, np.ndarray) and payload.dtype == object:
+            if payload.ndim != 1:
+                raise TypeError(f"object field {field_name!r} must be a one-dimensional column")
+            items = payload.tolist()
+        elif isinstance(payload, (list, tuple)):
+            items = list(payload)
+        elif value.batch_dims:
+            items = list(value.unbind(0))
+        else:
+            items = [payload]
     elif isinstance(value, np.ndarray) and value.dtype == object:
+        if value.ndim != 1:
+            raise TypeError(f"object field {field_name!r} must be a one-dimensional column")
         items = value.tolist()
     else:
-        raise TypeError(
-            f"expected object field {field_name!r}; got {type(value).__name__}"
-        )
+        raise TypeError(f"expected object field {field_name!r}; got {type(value).__name__}")
+    if len(data.batch_size) != 1 or len(items) != data.batch_size[0]:
+        raise TypeError(f"object field {field_name!r} must contain exactly one value per row")
     decoded: list[str] = []
     for raw_item in items:
         decoded_item = unwrap_wire_stripped_payload(raw_item)
+        while isinstance(decoded_item, NonTensorData):
+            decoded_item = unwrap_wire_stripped_payload(decoded_item.data)
+        if isinstance(decoded_item, np.ndarray) and decoded_item.dtype == object:
+            if decoded_item.ndim != 0:
+                raise TypeError(f"object field {field_name!r} must contain scalar strings")
+            decoded_item = decoded_item.item()
         if not isinstance(decoded_item, str) or not decoded_item:
-            raise TypeError(
-                f"object field {field_name!r} must contain non-empty strings"
-            )
+            raise TypeError(f"object field {field_name!r} must contain non-empty strings")
         decoded.append(decoded_item)
     return decoded
 
@@ -286,17 +327,12 @@ class SingleControllerActor:
         self._partition_id: str = actor_args.partition_id
 
         self._master_config = master_config
-        self._shared_prefix_training_config = get_shared_prefix_training_config(
-            master_config.policy
-        )
+        self._shared_prefix_training_config = get_shared_prefix_training_config(master_config.policy)
         self._async_cfg = master_config.async_rl
         self._policy_logprobs_required = not (
-            master_config.loss_fn.force_on_policy_ratio
-            and master_config.grpo.seq_logprob_error_threshold is None
+            master_config.loss_fn.force_on_policy_ratio and master_config.grpo.seq_logprob_error_threshold is None
         )
-        self._reference_logprobs_required = not bool(
-            master_config.grpo.skip_reference_policy_logprobs_calculation
-        )
+        self._reference_logprobs_required = not bool(master_config.grpo.skip_reference_policy_logprobs_calculation)
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
@@ -304,17 +340,13 @@ class SingleControllerActor:
             shared_prefix_mode=self._shared_prefix_training_config.mode,
             num_prompts_per_step=master_config.grpo.num_prompts_per_step,
             data_parallel_size=(
-                int(self._trainer.data_parallel_size)
-                if self._shared_prefix_training_config.mode == "train"
-                else 1
+                int(self._trainer.data_parallel_size) if self._shared_prefix_training_config.mode == "train" else 1
             ),
         )
         if self._shared_prefix_training_config.mode == "train":
             _validate_train_dispatch_buffer_capacity(
                 num_prompts_per_step=master_config.grpo.num_prompts_per_step,
-                configured_min_groups=(
-                    master_config.async_rl.min_groups_for_streaming_train
-                ),
+                configured_min_groups=(master_config.async_rl.min_groups_for_streaming_train),
                 group_multiple=self._train_dispatch_group_multiple,
                 max_buffered_rollouts=master_config.async_rl.max_buffered_rollouts,
             )
@@ -344,9 +376,7 @@ class SingleControllerActor:
         # _thread.lock that Ray can't cloudpickle into the actor.
         self._logger = Logger(master_config.logger)  # type: ignore
         self._logger.log_hyperparams(master_config.model_dump())
-        self._logger.log_metrics(
-            setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
-        )
+        self._logger.log_metrics(setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup")
         self._timer = Timer()
 
         # Also built here, not on the driver: TimeoutChecker must capture
@@ -373,7 +403,19 @@ class SingleControllerActor:
 
         num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
         self._sampler = create_sampler(self._buffer, self._async_cfg.sampler)
-        self._sampler.set_dispatch_index(actor_args.save_state.current_step)
+        # The trainer step and rollout admission cursors are equal only on a fresh
+        # start. Lookahead makes admission run ahead, and the dataloader checkpoint is
+        # already positioned after those admitted batches. Persist the independent
+        # cursor plus the not-yet-trained batches so a restart can requeue only the
+        # in-flight groups omitted by TQReplayBuffer.state_dict().
+        self._next_rollout_admission: int = actor_args.save_state.current_step
+        self._pending_rollout_admissions: deque[dict[str, Any]] = deque()
+        self._rollout_admission_state_restored = False
+        # Ready replay rows inherited from a checkpoint that predates the identity
+        # ledger. Carry their exact IDs through v2 checkpoints until selected/evicted,
+        # so a second resume does not mistake them for a corrupt snapshot pair.
+        self._legacy_untracked_replay_group_ids: set[str] = set()
+        self._sampler.set_dispatch_index(self._next_rollout_admission)
         required_capacity = self._sampler.required_buffer_capacity(num_prompts_per_step)
         validate_sampler_buffer_capacity(
             self._async_cfg,
@@ -385,6 +427,12 @@ class SingleControllerActor:
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
+
+        # One atomic cut for dataloader advancement, reserve transfers, admission
+        # bookkeeping, and the replay snapshot paired with their checkpoint. It is
+        # deliberately separate from _rollout_permitted: already-admitted generation
+        # may finish while a checkpoint is being written.
+        self._rollout_admission_lock = asyncio.Lock()
 
         # Set only after _rollout_pump exhausts its configured epochs and all
         # dispatched tasks finish successfully. Rollout failures propagate
@@ -398,6 +446,9 @@ class SingleControllerActor:
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
 
         self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
+        # Wakes the refit drain when an attempt enters or leaves the generation
+        # section. The rollout gate alone cannot stop an already-admitted retry.
+        self._inflight_registry_changed = asyncio.Event()
 
         # Groups that will never arrive, keyed by the training step they were stamped
         # for. A sampler that matches batches to steps exactly (InOrderSampler) can only
@@ -430,20 +481,28 @@ class SingleControllerActor:
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released when the buffer
         # drops a group (sampler.evict or post-train buffer.remove).
-        self._buffer_capacity: asyncio.Semaphore = asyncio.Semaphore(
-            self._async_cfg.max_buffered_rollouts
-        )
+        self._buffer_capacity: asyncio.Semaphore = asyncio.Semaphore(self._async_cfg.max_buffered_rollouts)
+        self._restored_replay_group_count = 0
 
         self._trainer_version: int = actor_args.save_state.current_step
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
+            "verifier_rewards": [],
             "masked_advantages": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
         }
         self._step_shared_prefix_opportunities: list[SharedPrefixOpportunity] = []
+        # Match the legacy GRPO meaning of env.should_log_nemo_gym_responses:
+        # when Gym is not responsible for full response logging, preserve the
+        # exact tensors that reached SingleController training in a local JSONL.
+        # DataPlane samples are cleared chunk-by-chunk, so capture CPU records in
+        # _advantage_stage and flush the whole ordered optimizer step only after
+        # finish_train_step succeeds.
+        self._log_train_data = not _should_log_nemo_gym_responses(master_config)
+        self._step_train_data_records: list[dict[str, Any]] = []
 
         print(
             f"SingleControllerActor: "
@@ -461,7 +520,10 @@ class SingleControllerActor:
         # Synchronize weights before starting the pumps
         await self._sync_weights()
 
+        await self._maybe_restore_rollout_admission_state()
         await self._maybe_restore_replay_buffer()
+        self._finalize_rollout_admission_restore()
+        await self._discard_legacy_unstamped_replay()
         await self._maybe_restore_replacement_reserve()
 
         # Start the rollout and train pumps, plus the watchdog
@@ -472,17 +534,30 @@ class SingleControllerActor:
         # Only with fleet health on. Created unconditionally it would be a timer firing
         # every probe_interval_s for every run that does not use the feature, which is
         # the default.
-        probe_task = (
-            asyncio.create_task(self._gen_fleet_probe_pump())
-            if self._gen_fleet is not None
-            else None
-        )
+        probe_task = asyncio.create_task(self._gen_fleet_probe_pump()) if self._gen_fleet is not None else None
         if probe_task is not None:
             tasks.append(probe_task)
+        run_succeeded = False
+        primary_error_active = False
+        first_teardown_error: BaseException | None = None
+
+        def record_teardown_error(stage: str, error: BaseException) -> None:
+            """Retain the first cleanup failure while allowing cleanup to continue."""
+            nonlocal first_teardown_error
+            if first_teardown_error is None:
+                first_teardown_error = error
+            try:
+                print(
+                    f"Error during {stage}: {type(error).__name__}: {error}",
+                    flush=True,
+                )
+            except BaseException:
+                # A closed or broken output stream is another cleanup failure;
+                # it cannot be allowed to replace the active pump exception.
+                pass
+
         try:
-            done, _ = await asyncio.wait(
-                set(tasks), return_when=asyncio.FIRST_COMPLETED
-            )
+            done, _ = await asyncio.wait(set(tasks), return_when=asyncio.FIRST_COMPLETED)
             if probe_task is not None and probe_task in done:
                 # Loops forever like the watchdog, so finishing at all means it raised.
                 await probe_task
@@ -496,17 +571,61 @@ class SingleControllerActor:
                 # rollout pump leaves the train pump to drain committed groups.
                 await rollout_task
             await train_task
+            run_succeeded = True
+        except BaseException:
+            # Keep the active pump/train exception alive across every teardown
+            # attempt. The bare raise after finally preserves its traceback.
+            primary_error_active = True
+            raise
         finally:
             for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    task.cancel()
+                except BaseException as error:
+                    record_teardown_error("pump cancellation", error)
+
+            pumps_joined = False
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                pumps_joined = True
+            except BaseException as error:
+                record_teardown_error("pump join", error)
+
             try:
                 self._weight_synchronizer.shutdown()
-            except Exception as e:  # teardown must not mask the original failure
-                print(f"Error during weight-synchronizer shutdown: {e}", flush=True)
-            finally:
+            except BaseException as error:
+                record_teardown_error("weight-synchronizer shutdown", error)
+
+            # A terminal receipt is valid only after the main run succeeded and
+            # every pump is joined, so its counter snapshot is immutable.
+            if run_succeeded and pumps_joined:
+                try:
+                    terminal_metrics = dict(self._rollout_manager.stats.as_metrics())
+                    # Dict insertion order is the backend emission order. Append
+                    # the receipt last so it cannot precede its counter snapshot.
+                    terminal_metrics["rollout/counters_finalized"] = 1.0
+                    self._logger.log_metrics(
+                        terminal_metrics,
+                        step=self._train_steps,
+                        step_finished=True,
+                    )
+                except BaseException as error:
+                    record_teardown_error("terminal counter logging", error)
+
+            try:
                 self._logger.finish()
+            except BaseException as error:
+                record_teardown_error("logger shutdown", error)
+
+            try:
                 await asyncio.to_thread(self._checkpointer.shutdown)
+            except BaseException as error:
+                record_teardown_error("checkpointer shutdown", error)
+
+            # Cleanup failures are actionable only when there is no active
+            # pump/train failure for them to obscure.
+            if first_teardown_error is not None and not primary_error_active:
+                raise first_teardown_error
 
         return {
             "train_steps": self._train_steps,
@@ -526,6 +645,466 @@ class SingleControllerActor:
 
     # ── internal helpers ───────────────────────────────────────────────────
 
+    async def _maybe_restore_rollout_admission_state(self) -> None:
+        """Restore the rollout cursor and admitted-but-untrained prompt batches.
+
+        The dataloader state is captured after every batch yielded to the rollout
+        pump, including lookahead batches. The replay-buffer checkpoint, however,
+        intentionally omits unready slots. This small companion checkpoint closes
+        that gap: it owns the original prompt batches until their optimizer step
+        finishes, so missing groups can be regenerated without advancing the restored
+        dataloader a second time.
+        """
+        if self._last_checkpoint_path is None:
+            return
+        state_path = os.path.join(self._last_checkpoint_path, _ROLLOUT_ADMISSION_STATE_FILE)
+        if not os.path.exists(state_path):
+            print(
+                f"⚠️ No rollout admission checkpoint found at {state_path}. "
+                "Reconstructing the cursor from restored replay metadata; in-flight "
+                "rollouts from this legacy checkpoint cannot be recovered.",
+                flush=True,
+            )
+            return
+
+        state = await asyncio.to_thread(torch.load, state_path, weights_only=False)
+        if not isinstance(state, dict):
+            raise ValueError("rollout admission checkpoint must be a mapping, got " f"{type(state).__name__}")
+        required = {
+            "version",
+            "sampler_name",
+            "next_rollout_admission",
+            "pending_admissions",
+            "legacy_untracked_group_ids",
+        }
+        missing = required - set(state)
+        if missing:
+            raise ValueError(f"rollout admission checkpoint missing required keys: {missing}")
+        if state["version"] != _ROLLOUT_ADMISSION_STATE_VERSION:
+            raise ValueError("unsupported rollout admission checkpoint version: " f"{state['version']!r}")
+        saved_sampler_name = state["sampler_name"]
+        current_sampler_name = self._async_cfg.sampler.name
+        if saved_sampler_name != current_sampler_name:
+            raise ValueError(
+                "rollout admission checkpoint was saved with sampler "
+                f"{saved_sampler_name!r}, but this run uses "
+                f"{current_sampler_name!r}. Resume with the original sampler so "
+                "already-consumed dataloader batches retain their admission policy."
+            )
+
+        next_admission = state["next_rollout_admission"]
+        if (
+            not isinstance(next_admission, int)
+            or isinstance(next_admission, bool)
+            or next_admission < self._train_steps
+        ):
+            raise ValueError(
+                "rollout admission cursor must be an integer no smaller than the "
+                f"restored train step {self._train_steps}, got {next_admission!r}"
+            )
+
+        pending_state = state["pending_admissions"]
+        if not isinstance(pending_state, list):
+            raise ValueError("pending_admissions must be a list")
+        raw_legacy_group_ids = state["legacy_untracked_group_ids"]
+        if (
+            not isinstance(raw_legacy_group_ids, list)
+            or any(not isinstance(group_id, str) or not group_id for group_id in raw_legacy_group_ids)
+            or len(set(raw_legacy_group_ids)) != len(raw_legacy_group_ids)
+        ):
+            raise ValueError("legacy_untracked_group_ids must be a list of unique non-empty " "strings")
+        pending: deque[dict[str, Any]] = deque()
+        num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
+        seen_dispatch_indices: set[int] = set()
+        seen_group_ids: set[str] = set()
+        for index, raw in enumerate(pending_state):
+            if not isinstance(raw, dict):
+                raise ValueError(f"pending admission {index} must be a mapping, got " f"{type(raw).__name__}")
+            if set(raw) != {"dispatch_index", "admitted", "source", "groups"}:
+                raise ValueError(f"pending admission {index} has invalid keys: {set(raw)}")
+            admitted = raw["admitted"]
+            if not isinstance(admitted, bool):
+                raise ValueError(f"pending admission {index} admitted must be bool, got " f"{admitted!r}")
+            source = raw["source"]
+            if source not in {"dataloader", "reserve"}:
+                raise ValueError(f"pending admission {index} has invalid source={source!r}")
+            dispatch_index = raw["dispatch_index"]
+            dispatch_index_invalid = admitted and (
+                not isinstance(dispatch_index, int)
+                or isinstance(dispatch_index, bool)
+                or dispatch_index < 0
+                or dispatch_index >= next_admission
+                or dispatch_index in seen_dispatch_indices
+            )
+            if dispatch_index_invalid or (not admitted and dispatch_index is not None):
+                raise ValueError(
+                    f"pending admission {index} has invalid or duplicate "
+                    f"dispatch_index={dispatch_index!r} for next admission "
+                    f"{next_admission}"
+                )
+            if admitted:
+                seen_dispatch_indices.add(dispatch_index)
+            raw_groups = raw["groups"]
+            if not isinstance(raw_groups, list) or not (1 <= len(raw_groups) <= num_prompts_per_step):
+                raise ValueError(
+                    f"pending admission {index} must hold between 1 and " f"{num_prompts_per_step} group record(s)"
+                )
+            groups: list[dict[str, Any]] = []
+            for group_index, raw_group in enumerate(raw_groups):
+                if not isinstance(raw_group, dict) or set(raw_group) != {
+                    "target_step",
+                    "group_id",
+                    "prompt",
+                }:
+                    raise ValueError(
+                        f"pending admission {index} group {group_index} must have "
+                        "exactly target_step, group_id, and prompt"
+                    )
+                target_step = raw_group["target_step"]
+                if target_step is not None and (
+                    not isinstance(target_step, int) or isinstance(target_step, bool) or target_step < self._train_steps
+                ):
+                    raise ValueError(
+                        f"pending admission {index} group {group_index} has "
+                        f"invalid target_step={target_step!r} for restored train "
+                        f"step {self._train_steps}"
+                    )
+                if not admitted and target_step is not None:
+                    raise ValueError(
+                        f"unadmitted pending admission {index} group {group_index} " "cannot have a target_step"
+                    )
+                group_id = raw_group["group_id"]
+                if group_id is not None and (
+                    not isinstance(group_id, str) or not group_id or group_id in seen_group_ids
+                ):
+                    raise ValueError(
+                        f"pending admission {index} group {group_index} has "
+                        f"invalid or duplicate group_id={group_id!r}"
+                    )
+                if group_id is not None:
+                    seen_group_ids.add(group_id)
+                if not admitted and group_id is not None:
+                    raise ValueError(
+                        f"unadmitted pending admission {index} group {group_index} " "cannot have a group_id"
+                    )
+                groups.append(
+                    {
+                        "target_step": target_step,
+                        "group_id": group_id,
+                        "prompt": raw_group["prompt"],
+                    }
+                )
+            pending.append(
+                {
+                    "dispatch_index": dispatch_index,
+                    "admitted": admitted,
+                    "source": source,
+                    "groups": groups,
+                }
+            )
+
+        unadmitted_indices = [index for index, entry in enumerate(pending) if not entry["admitted"]]
+        if unadmitted_indices and unadmitted_indices != [len(pending) - 1]:
+            raise ValueError(
+                "rollout admission checkpoint may contain only one unadmitted "
+                "dataloader batch, at the tail of pending_admissions"
+            )
+
+        stamped = [
+            group["target_step"] is not None for entry in pending if entry["admitted"] for group in entry["groups"]
+        ]
+        if stamped and any(stamped) and not all(stamped):
+            raise ValueError("rollout admission checkpoint mixes stamped and unstamped batches")
+
+        self._next_rollout_admission = next_admission
+        self._pending_rollout_admissions = pending
+        self._legacy_untracked_replay_group_ids = set(raw_legacy_group_ids)
+        self._rollout_admission_state_restored = True
+        self._sampler.set_dispatch_index(self._next_rollout_admission)
+        if stamped and stamped[0]:
+            self._sampler_stamps_target_steps = True
+        print(
+            f"📦 Restored {len(pending)} pending rollout admission(s); next "
+            f"admission={self._next_rollout_admission}: {state_path}",
+            flush=True,
+        )
+
+    async def _discard_legacy_unstamped_replay(self) -> None:
+        """Drop restored unstamped rows that cannot resume at the current weight.
+
+        A checkpoint predating ``rollout_admission.pt`` has no prompt identity
+        ledger, so every unstamped row is discarded and the complete remaining
+        admission budget is regenerated. Retaining an incomplete older WeightFifo
+        bucket would make it the oldest selectable weight forever, while every fresh
+        replacement uses the current weight.
+
+        V2 normally reconciles by exact group ID. It still has to discard an older
+        WeightFifo row (or a row the sampler explicitly says is now stale): if its
+        sibling was in flight and omitted from replay, requeueing only that sibling at
+        the current weight splits one prompt cohort across two strict FIFO buckets.
+        Removing the ready row makes the exact ledger requeue the whole affected
+        cohort at one weight. Legacy carry IDs inside a transitional v2 checkpoint
+        are also discarded because they have no prompt record to requeue.
+        """
+        targets = list(getattr(self._buffer, "target_step_list", ()))
+        if not targets or any(target is not None for target in targets):
+            return
+
+        group_ids = list(getattr(self._buffer, "_group_ids", ()))
+        start_weights = list(
+            getattr(
+                self._buffer,
+                "start_weight_list",
+                [self._train_steps] * len(targets),
+            )
+        )
+        if not len(group_ids) == len(start_weights) == len(targets):
+            raise RuntimeError("restored replay metadata is misaligned before admission cleanup")
+        if self._rollout_admission_state_restored:
+            exact_ledger_group_ids = {
+                group["group_id"]
+                for entry in self._pending_rollout_admissions
+                for group in entry["groups"]
+                if group["group_id"] is not None
+            }
+            unexpected_group_ids = set(group_ids) - (exact_ledger_group_ids | self._legacy_untracked_replay_group_ids)
+            if unexpected_group_ids:
+                raise RuntimeError(
+                    "restored replay buffer contains group ID(s) absent from the "
+                    "paired admission ledger or its legacy carry set: "
+                    f"{sorted(unexpected_group_ids)}"
+                )
+
+        drop_indices: list[int] = []
+        dropped_legacy_group_ids: set[str] = set()
+        sampler_name = self._async_cfg.sampler.name
+        for index, (group_id, start_weight) in enumerate(zip(group_ids, start_weights, strict=True)):
+            is_legacy = (
+                not self._rollout_admission_state_restored or group_id in self._legacy_untracked_replay_group_ids
+            )
+            drop_for_weight_fifo = sampler_name == "weight_fifo" and start_weight < self._train_steps
+            drop_as_stale = self._sampler.should_abort_inflight(
+                start_weight_version=start_weight,
+                current_train_weight=self._train_steps,
+            )
+            if is_legacy or drop_for_weight_fifo or drop_as_stale:
+                drop_indices.append(index)
+                if is_legacy:
+                    dropped_legacy_group_ids.add(group_id)
+
+        if not drop_indices:
+            return
+        dropped_group_ids = {group_ids[index] for index in drop_indices}
+        removed = await self._buffer.remove(drop_indices, remove_in_dp=True)
+        if removed != len(drop_indices):
+            raise RuntimeError("unstamped replay cleanup removed " f"{removed}/{len(drop_indices)} group(s)")
+        self._legacy_untracked_replay_group_ids.difference_update(dropped_group_ids)
+        if dropped_legacy_group_ids and self._rollout_admission_state_restored:
+            admitted_dispatch_indices = [
+                entry["dispatch_index"] for entry in self._pending_rollout_admissions if entry["admitted"]
+            ]
+            exact_frontier = max([self._train_steps] + [index + 1 for index in admitted_dispatch_indices])
+            if self._next_rollout_admission > exact_frontier:
+                self._next_rollout_admission = exact_frontier
+                self._sampler.set_dispatch_index(exact_frontier)
+        restored_permits = min(removed, getattr(self, "_restored_replay_group_count", 0))
+        for _ in range(restored_permits):
+            self._buffer_capacity.release()
+        self._restored_replay_group_count = max(
+            0,
+            getattr(self, "_restored_replay_group_count", 0) - removed,
+        )
+        print(
+            f"🧹 Discarded {removed} unstamped replay group(s) that could not "
+            "resume safely at the current trainer weight.",
+            flush=True,
+        )
+
+    def _finalize_rollout_admission_restore(self) -> None:
+        """Seed a legacy checkpoint's cursor from the replay groups it restored."""
+        targets = list(getattr(self._buffer, "target_step_list", ()))
+        has_stamped_targets = any(target is not None for target in targets)
+        stamped_targets = [target for target in targets if target is not None and target >= self._train_steps]
+        if has_stamped_targets:
+            self._sampler_stamps_target_steps = True
+
+        if self._rollout_admission_state_restored:
+            return
+
+        self._legacy_untracked_replay_group_ids = set(getattr(self._buffer, "_group_ids", ()))
+
+        # Checkpoints predating rollout_admission.pt cannot recover unready prompt
+        # payloads, but the ready replay groups still prove how far admission got.
+        # A partial stamped cohort is different: seed at its target so a dataloader or
+        # reserve batch can fill its missing groups without spending another absolute
+        # step. Full cohorts are skipped by advancing beyond their largest target.
+        if has_stamped_targets:
+            groups_per_step = self._master_config.grpo.num_prompts_per_step
+            if stamped_targets:
+                target_counts = {target: stamped_targets.count(target) for target in set(stamped_targets)}
+                # A completely absent cohort can also be an admitted batch whose every
+                # rollout was in flight when the legacy replay snapshot was taken. Start
+                # at the first non-full target in the contiguous lookahead range, then let
+                # the pump advance across later full targets without consuming data.
+                incomplete_targets = [
+                    target
+                    for target in range(self._train_steps, max(stamped_targets) + 1)
+                    if target_counts.get(target, 0) < groups_per_step
+                ]
+                if incomplete_targets:
+                    self._next_rollout_admission = max(self._train_steps, min(incomplete_targets))
+                else:
+                    self._next_rollout_admission = max(self._train_steps, max(stamped_targets) + 1)
+            else:
+                # A stale stamped straggler still proves the sampler policy. It says
+                # nothing about the next untrained cohort, so do not spend that cohort's
+                # absolute admission budget before the stale row is evicted.
+                self._next_rollout_admission = self._train_steps
+        elif targets:
+            # An old unstamped replay snapshot cannot prove how many *selectable*
+            # cohorts it owns. Rows may have become stale immediately after the saved
+            # train-step increment, and custom samplers need not expose their
+            # selectability rule. Counting those rows can therefore spend admission
+            # budget on work the train pump will evict and end the run short. Restart
+            # from the absolute train frontier and tolerate any restored surplus. New
+            # v2 checkpoints use exact group IDs and never take this fallback.
+            self._next_rollout_admission = self._train_steps
+            print(
+                "⚠️ Legacy unstamped replay has no admission identity ledger; "
+                "regenerating the complete remaining admission budget so stale "
+                "restored groups cannot make the run finish short.",
+                flush=True,
+            )
+        self._sampler.set_dispatch_index(self._next_rollout_admission)
+
+    def _rollout_admission_state_dict(self) -> dict[str, Any]:
+        """Return the admission state paired with the dataloader checkpoint."""
+        return {
+            "version": _ROLLOUT_ADMISSION_STATE_VERSION,
+            "sampler_name": self._async_cfg.sampler.name,
+            "next_rollout_admission": self._next_rollout_admission,
+            "legacy_untracked_group_ids": sorted(self._legacy_untracked_replay_group_ids),
+            "pending_admissions": [
+                {
+                    "dispatch_index": entry["dispatch_index"],
+                    "admitted": entry["admitted"],
+                    "source": entry["source"],
+                    "groups": [
+                        {
+                            "target_step": group["target_step"],
+                            "group_id": group["group_id"],
+                            "prompt": group["prompt"],
+                        }
+                        for group in entry["groups"]
+                    ],
+                }
+                for entry in self._pending_rollout_admissions
+            ],
+        }
+
+    def _retire_rollout_group_ids(self, group_ids: set[str]) -> int:
+        """Remove exact committed groups from the durable admission ledger."""
+        if not group_ids:
+            return 0
+        self._legacy_untracked_replay_group_ids.difference_update(group_ids)
+        removed = 0
+        retained: deque[dict[str, Any]] = deque()
+        for entry in self._pending_rollout_admissions:
+            groups = []
+            for group in entry["groups"]:
+                if group["group_id"] in group_ids:
+                    removed += 1
+                else:
+                    groups.append(group)
+            if groups:
+                entry["groups"] = groups
+                retained.append(entry)
+        self._pending_rollout_admissions = retained
+        return removed
+
+    def _drop_pending_group(self, group_record: dict[str, Any]) -> None:
+        """Forget one prompt that definitively produced no replay group."""
+        retained: deque[dict[str, Any]] = deque()
+        found = False
+        for entry in self._pending_rollout_admissions:
+            groups = []
+            for candidate in entry["groups"]:
+                if candidate is group_record:
+                    found = True
+                else:
+                    groups.append(candidate)
+            if groups:
+                entry["groups"] = groups
+                retained.append(entry)
+        self._pending_rollout_admissions = retained
+        if not found:
+            raise RuntimeError("rollout prompt record disappeared before completion")
+
+    def _retarget_pending_group(self, group_id: str, target_step: int) -> None:
+        """Keep the ledger aligned when a ready group is promoted to another step."""
+        for entry in self._pending_rollout_admissions:
+            for group in entry["groups"]:
+                if group["group_id"] == group_id:
+                    group["target_step"] = target_step
+                    return
+
+    def _retire_rollout_admission(
+        self,
+        trained_step: int,
+        *,
+        trained_group_ids: set[str] | None = None,
+    ) -> None:
+        """Forget the exact groups durably consumed by one optimizer step."""
+        if trained_group_ids:
+            self._retire_rollout_group_ids(trained_group_ids)
+        if not self._pending_rollout_admissions:
+            return
+        admitted_groups = [
+            group for entry in self._pending_rollout_admissions if entry["admitted"] for group in entry["groups"]
+        ]
+        if not admitted_groups:
+            return
+        stamped = admitted_groups[0]["target_step"] is not None
+        if any(
+            (group["target_step"] is not None) != stamped
+            for entry in self._pending_rollout_admissions
+            if entry["admitted"]
+            for group in entry["groups"]
+        ):
+            raise RuntimeError("pending rollout admissions mix stamp policies")
+
+        if stamped:
+            retained: deque[dict[str, Any]] = deque()
+            for entry in self._pending_rollout_admissions:
+                if not entry["admitted"]:
+                    retained.append(entry)
+                    continue
+                groups = [group for group in entry["groups"] if group["target_step"] > trained_step]
+                if groups:
+                    entry["groups"] = groups
+                    retained.append(entry)
+            self._pending_rollout_admissions = retained
+            return
+
+        # Real replay groups have exact IDs. This count fallback is only for legacy
+        # checkpoints/test doubles whose restored rows predate the identity ledger.
+        if trained_group_ids:
+            return
+        groups_to_retire = self._master_config.grpo.num_prompts_per_step
+        retained = deque()
+        for entry in self._pending_rollout_admissions:
+            if not entry["admitted"] or not groups_to_retire:
+                retained.append(entry)
+                continue
+            entry_groups = len(entry["groups"])
+            if entry_groups <= groups_to_retire:
+                groups_to_retire -= entry_groups
+                continue
+            entry["groups"] = entry["groups"][groups_to_retire:]
+            groups_to_retire = 0
+            retained.append(entry)
+        self._pending_rollout_admissions = retained
+
     async def _maybe_restore_replay_buffer(self) -> None:
         """Restore replay-buffer groups from the previous run's checkpoint.
 
@@ -538,8 +1117,7 @@ class SingleControllerActor:
         buffer_path = os.path.join(self._last_checkpoint_path, "replay_buffer.pt")
         if not os.path.exists(buffer_path):
             print(
-                f"⚠️ No replay buffer checkpoint found at {buffer_path}. "
-                "Starting with an empty replay buffer.",
+                f"⚠️ No replay buffer checkpoint found at {buffer_path}. " "Starting with an empty replay buffer.",
                 flush=True,
             )
             return
@@ -556,9 +1134,7 @@ class SingleControllerActor:
         print(f"📦 Restoring replay buffer from checkpoint: {buffer_path}")
         # weights_only=False: groups hold pickled KVBatchMeta/TensorDicts,
         # not plain tensors. The checkpoint is a trusted same-job artifact.
-        buffer_state = await asyncio.to_thread(
-            torch.load, buffer_path, weights_only=False
-        )
+        buffer_state = await asyncio.to_thread(torch.load, buffer_path, weights_only=False)
         restored = await self._buffer.load_state_dict(
             buffer_state,
             max_groups=self._async_cfg.max_buffered_rollouts,
@@ -570,6 +1146,7 @@ class SingleControllerActor:
         assert restored <= self._async_cfg.max_buffered_rollouts
         for _ in range(restored):
             await self._buffer_capacity.acquire()
+        self._restored_replay_group_count = restored
 
     async def _maybe_restore_replacement_reserve(self) -> None:
         """Restore spare prompts diverted before the previous run's checkpoint.
@@ -587,9 +1164,7 @@ class SingleControllerActor:
         """
         if self._last_checkpoint_path is None:
             return
-        reserve_path = os.path.join(
-            self._last_checkpoint_path, "replacement_reserve.pt"
-        )
+        reserve_path = os.path.join(self._last_checkpoint_path, "replacement_reserve.pt")
         # Absent for every run that never diverted a batch, which is every run that
         # does not use "replace" -- so silence here rather than the buffer restore's
         # warning, since this is the ordinary case rather than a lost artifact.
@@ -597,13 +1172,10 @@ class SingleControllerActor:
             return
         # weights_only=False: spares are pickled DatumSpecs, and the checkpoint is a
         # trusted same-job artifact (the replay buffer restore loads on the same terms).
-        reserve_state = await asyncio.to_thread(
-            torch.load, reserve_path, weights_only=False
-        )
+        reserve_state = await asyncio.to_thread(torch.load, reserve_path, weights_only=False)
         self._replacement_reserve.extend(reserve_state)
         print(
-            f"📦 Restored {len(reserve_state)} pooled spare prompt(s) from checkpoint: "
-            f"{reserve_path}",
+            f"📦 Restored {len(reserve_state)} pooled spare prompt(s) from checkpoint: " f"{reserve_path}",
             flush=True,
         )
 
@@ -647,19 +1219,21 @@ class SingleControllerActor:
           6. Decrement _inflight_rollouts
 
         Once every epoch is done, whatever is left in the spare pool is dispatched as
-        ordinary steps rather than discarded (see _drain_reserve_into_steps).
+        ordinary steps, up to the remaining ``grpo.max_num_steps`` budget, rather than
+        discarded (see _drain_reserve_into_steps).
         """
         sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
         self._rollout_exhausted.clear()
         print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(
-            prompt: DatumSpec,
-            target_step: Optional[int],
+            group_record: dict[str, Any],
             task_started_event: asyncio.Event,
         ) -> None:
             task_started_event.set()
             self._inflight_rollouts += 1
+            prompt = group_record["prompt"]
+            target_step = group_record["target_step"]
             # This task owns one slot of a step, which can outlive both the prompt it
             # started with and the step it started on: a dropped prompt is substituted in
             # place and the loop runs again, and the slot is re-aimed at whichever step
@@ -673,7 +1247,12 @@ class SingleControllerActor:
                         outcome = await self._rollout_manager.generate_and_push(
                             prompt,
                             target_step=target_step,
-                            inflight_registry=self._inflight_by_group_id,
+                            inflight_registry=_AdmissionInflightRegistry(
+                                self._inflight_by_group_id,
+                                group_record,
+                                self._rollout_permitted,
+                                self._inflight_registry_changed,
+                            ),  # type: ignore[arg-type]
                         )
                     except BaseException:
                         # On success ownership transfers to the train pump, which
@@ -684,16 +1263,26 @@ class SingleControllerActor:
                     if outcome is not RolloutOutcome.SKIPPED:
                         break
 
-                    replacement = self._take_replacement(target_step, replacements)
-                    if replacement is None:
-                        # Nothing was committed, so the train pump will never see this
-                        # group and never release its permit on our behalf.
-                        self._buffer_capacity.release()
-                        self._credit_shortfall(target_step)
-                        return
+                    async with self._rollout_admission_lock:
+                        replacement = self._take_replacement(target_step, replacements)
+                        if replacement is None:
+                            # Nothing was committed, so the train pump will never see
+                            # this group and never release its permit on our behalf.
+                            self._buffer_capacity.release()
+                            self._credit_shortfall(target_step)
+                            self._drop_pending_group(group_record)
+                            return
 
-                    replacements += 1
-                    prompt = replacement
+                        replacements += 1
+                        prompt = replacement
+                        group_record["prompt"] = replacement
+                        group_record["group_id"] = None
+                        # Attempted only now that a spare is in hand, because the
+                        # borrow is a debt and the spare is what repays it.
+                        lender_step = self._promote_into_step(target_step)
+                        if lender_step is not None:
+                            target_step = lender_step
+                            group_record["target_step"] = lender_step
                     print(
                         f"  target_step={target_step}: substituting a spare prompt for "
                         f"the dropped group (replacement {replacements}/"
@@ -701,12 +1290,6 @@ class SingleControllerActor:
                         f"{len(self._replacement_reserve)} spare(s) left)",
                         flush=True,
                     )
-                    # Attempted only now that a spare is in hand, because the borrow is a
-                    # debt and the spare is what repays it. Borrowing without one would
-                    # leave the lender short instead: the same hole, one step later.
-                    lender_step = self._promote_into_step(target_step)
-                    if lender_step is not None:
-                        target_step = lender_step
                     # A substitution is a fresh rollout, not a continuation of the one
                     # that failed, so it observes the same pause a first dispatch does
                     # instead of pushing new generation into a weight-sync window.
@@ -720,9 +1303,7 @@ class SingleControllerActor:
                 # the fact that explains why its batch is full despite a drop. Recorded
                 # against the step the spare actually committed to, which after a borrow
                 # is the lender rather than the step that was dropped from.
-                self._batch_replacements[target_step] = (
-                    self._batch_replacements.get(target_step, 0) + 1
-                )
+                self._batch_replacements[target_step] = self._batch_replacements.get(target_step, 0) + 1
 
             if self._async_cfg.diagnostics:
                 content = ""
@@ -741,7 +1322,7 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 sem.release()
 
-        async def _launch(prompt: DatumSpec, target_step: Optional[int]) -> None:
+        async def _launch(group_record: dict[str, Any]) -> None:
             # check if buffer is full
             await self._buffer_capacity.acquire()
             # check if inflight rollouts is full
@@ -751,9 +1332,7 @@ class SingleControllerActor:
 
             task_started_event = asyncio.Event()
             # dispatch rollout
-            task = rollout_tasks.create_task(
-                _dispatch_one_prompt(prompt, target_step, task_started_event)
-            )
+            task = rollout_tasks.create_task(_dispatch_one_prompt(group_record, task_started_event))
             self._dispatched_rollouts.add(task)
             task.add_done_callback(self._dispatched_rollouts.discard)
             task.add_done_callback(
@@ -763,46 +1342,257 @@ class SingleControllerActor:
                 )
             )
 
-        max_epochs = self._master_config.grpo.max_num_epochs
-        async with asyncio.TaskGroup() as rollout_tasks:
-            while max_epochs is None or self._current_epoch < max_epochs:
-                for prompt_batch in self._dataloader:
-                    if self._divert_batch_to_reserve(prompt_batch):
-                        continue
+        def _materialize_batch(
+            prompt_batch: BatchedDataDict[DatumSpec],
+        ) -> list[DatumSpec]:
+            return [
+                {k: v[prompt_idx] for k, v in prompt_batch.items()}  # type: ignore
+                for prompt_idx in range(prompt_batch.size)
+            ]
 
-                    target_step = await self._sampler.admit(
-                        trainer_version_fn=lambda: self._trainer_version
+        def _record_yielded_batch(prompts: list[DatumSpec], *, source: str = "dataloader") -> dict[str, Any]:
+            if not prompts:
+                raise RuntimeError("rollout admission cannot hold an empty batch")
+            entry = {
+                "dispatch_index": None,
+                "admitted": False,
+                "source": source,
+                "groups": [
+                    {
+                        "target_step": None,
+                        "group_id": None,
+                        "prompt": prompt,
+                    }
+                    for prompt in prompts
+                ],
+            }
+            self._pending_rollout_admissions.append(entry)
+            return entry
+
+        def _mark_batch_admitted(entry: dict[str, Any], target_step: Optional[int]) -> None:
+            if entry["admitted"] or entry["dispatch_index"] is not None:
+                raise RuntimeError("rollout batch was admitted more than once")
+            entry["dispatch_index"] = self._next_rollout_admission
+            entry["admitted"] = True
+            for group_record in entry["groups"]:
+                group_record["target_step"] = target_step
+            self._next_rollout_admission += 1
+
+        def _drop_pending_entry(entry: dict[str, Any]) -> None:
+            self._pending_rollout_admissions = deque(
+                candidate for candidate in self._pending_rollout_admissions if candidate is not entry
+            )
+
+        async def _admit_yielded_batch(entry: dict[str, Any], *, max_num_steps: int) -> bool:
+            """Admit a durably owned dataloader/reserve batch outside the cut lock."""
+            target_step = await self._sampler.admit(trainer_version_fn=lambda: self._trainer_version)
+            if target_step is not None and target_step >= max_num_steps:
+                raise RuntimeError(
+                    "rollout sampler admitted target_step=" f"{target_step} beyond grpo.max_num_steps={max_num_steps}"
+                )
+            async with self._rollout_admission_lock:
+                _mark_batch_admitted(entry, target_step)
+                if target_step is not None:
+                    self._sampler_stamps_target_steps = True
+
+                if entry["source"] == "reserve" and target_step is not None:
+                    buffered = min(
+                        self._buffer.count_for_target_step(target_step),
+                        len(entry["groups"]),
                     )
-                    if target_step is not None:
-                        self._sampler_stamps_target_steps = True
+                    if buffered:
+                        missing = len(entry["groups"]) - buffered
+                        returned_groups = entry["groups"][missing:]
+                        entry["groups"] = entry["groups"][:missing]
+                        self._replacement_reserve.extendleft(reversed([group["prompt"] for group in returned_groups]))
+                        if not entry["groups"]:
+                            _drop_pending_entry(entry)
+                        print(
+                            f"  pooled target_step={target_step}: {buffered} group(s) "
+                            "already buffered; preserved the same number of spares",
+                            flush=True,
+                        )
+            return bool(entry["groups"])
 
-                    num_prompts = prompt_batch.size
-                    if target_step is not None:
-                        buffered = self._buffer.count_for_target_step(target_step)
-                        if buffered:
-                            num_prompts = max(0, prompt_batch.size - buffered)
-                            print(
-                                f"  target_step={target_step}: {buffered} group(s) "
-                                f"already buffered; dispatching {num_prompts} of "
-                                f"{prompt_batch.size} prompt(s), dropping the rest",
-                                flush=True,
-                            )
+        async def _dispatch_admission(entry: dict[str, Any], restored_group_ids: set[str]) -> None:
+            """Dispatch exactly the prompt groups absent from restored replay."""
+            if not entry["admitted"]:
+                raise RuntimeError("cannot dispatch a yielded batch before admission")
+            # Reserve reconciliation can return every prompt to the pool when the
+            # restored target is already full, removing this ledger entry entirely.
+            if not entry["groups"]:
+                return
+            buffered = 0
+            legacy_count_credit = 0
+            target_step = entry["groups"][0]["target_step"]
+            if (
+                not self._rollout_admission_state_restored
+                and entry["source"] == "dataloader"
+                and target_step is not None
+                and all(group["group_id"] is None for group in entry["groups"])
+            ):
+                legacy_count_credit = min(
+                    self._buffer.count_for_target_step(target_step),
+                    len(entry["groups"]),
+                )
+                if legacy_count_credit:
+                    missing = len(entry["groups"]) - legacy_count_credit
+                    returned_groups = entry["groups"][missing:]
+                    entry["groups"] = entry["groups"][:missing]
+                    self._replacement_reserve.extendleft(reversed([group["prompt"] for group in returned_groups]))
+                    if not entry["groups"]:
+                        _drop_pending_entry(entry)
+            for group_record in entry["groups"]:
+                group_id = group_record["group_id"]
+                if group_id is not None and group_id in restored_group_ids:
+                    restored_group_ids.remove(group_id)
+                    buffered += 1
+                    continue
+                await _launch(group_record)
+            buffered += legacy_count_credit
+            if buffered:
+                reconciliation = "legacy target-count credit" if legacy_count_credit else "exact group ID(s)"
+                print(
+                    f"  dispatch_index={entry['dispatch_index']}: {buffered} "
+                    f"{reconciliation} already buffered; requeued only missing "
+                    "prompts",
+                    flush=True,
+                )
 
-                    for prompt_idx in range(num_prompts):
-                        prompt: DatumSpec = {  # type: ignore
-                            k: v[prompt_idx] for k, v in prompt_batch.items()
-                        }
-                        await _launch(prompt, target_step)
+        async def _advance_full_legacy_target(max_num_steps: int) -> bool:
+            """Consume sampler admission, but no prompt, for a full legacy target."""
+            if (
+                not getattr(self, "_sampler_stamps_target_steps", False)
+                or not self._legacy_untracked_replay_group_ids
+                or self._next_rollout_admission >= max_num_steps
+            ):
+                return False
+            target_step = self._next_rollout_admission
+            groups_per_step = self._master_config.grpo.num_prompts_per_step
+            if self._buffer.count_for_target_step(target_step) < groups_per_step:
+                return False
+            if self._rollout_admission_state_restored:
+                target_group_ids = [
+                    group_id
+                    for buffered_target, group_id in zip(
+                        self._buffer.target_step_list,
+                        self._buffer._group_ids,
+                        strict=True,
+                    )
+                    if buffered_target == target_step
+                ]
+                # A v2 checkpoint written while a legacy resume was still in
+                # progress carries the old replay IDs forward. Only those exact IDs
+                # authorize prompt-free admission; a full cohort produced under v2
+                # has its own ledger entries and must reconcile there instead.
+                if not target_group_ids or any(
+                    group_id not in self._legacy_untracked_replay_group_ids for group_id in target_group_ids
+                ):
+                    return False
 
-                self._current_epoch += 1
+            # Do not hold the checkpoint/admission lock across a sampler gate: the
+            # trainer may need the same lock to retire the cohort that opens it.
+            admitted_target = await self._sampler.admit(trainer_version_fn=lambda: self._trainer_version)
+            if admitted_target != target_step:
+                raise RuntimeError(
+                    "legacy replay target reconciliation expected sampler target_step="
+                    f"{target_step}, got {admitted_target}"
+                )
+            async with self._rollout_admission_lock:
+                self._next_rollout_admission += 1
+            print(
+                f"  legacy target_step={target_step} is already complete in the "
+                "restored buffer; advanced admission without consuming prompts",
+                flush=True,
+            )
+            return True
+
+        # A checkpoint can contain ready groups and omit sibling slots whose rollout
+        # was still in flight. Reconcile by exact group ID before touching the restored
+        # dataloader; counts cannot distinguish "A ready, B in flight" from the
+        # opposite completion order and would regenerate the wrong prompt.
+        restored_group_ids = set(getattr(self._buffer, "_group_ids", ()))
+        self._legacy_untracked_replay_group_ids.intersection_update(restored_group_ids)
+        async with asyncio.TaskGroup() as rollout_tasks:
+            # Training may retire the left edge while one of these launches awaits
+            # capacity, so iterate a stable snapshot rather than the live deque.
+            for entry in list(self._pending_rollout_admissions):
+                if not entry["admitted"]:
+                    await _admit_yielded_batch(
+                        entry,
+                        max_num_steps=self._master_config.grpo.max_num_steps,
+                    )
+                await _dispatch_admission(entry, restored_group_ids)
+        unexpected_restored_group_ids = restored_group_ids - self._legacy_untracked_replay_group_ids
+        if unexpected_restored_group_ids and self._rollout_admission_state_restored:
+            raise RuntimeError(
+                "restored replay buffer contains group ID(s) absent from the paired "
+                "admission ledger or its legacy carry set: "
+                f"{sorted(unexpected_restored_group_ids)}"
+            )
+
+        max_epochs = self._master_config.grpo.max_num_epochs
+        max_num_steps = self._master_config.grpo.max_num_steps
+        admission_budget_exhausted = self._next_rollout_admission >= max_num_steps
+        async with asyncio.TaskGroup() as rollout_tasks:
+            while not admission_budget_exhausted and (max_epochs is None or self._current_epoch < max_epochs):
+                dataloader_iter = iter(self._dataloader)
+                while True:
+                    entry: dict[str, Any] | None = None
+                    epoch_exhausted = False
+                    if await _advance_full_legacy_target(max_num_steps):
+                        if self._next_rollout_admission >= max_num_steps:
+                            admission_budget_exhausted = True
+                            break
+                        continue
+                    async with self._rollout_admission_lock:
+                        if (
+                            self._next_rollout_admission >= max_num_steps
+                            and not self._should_divert_next_batch_to_reserve()
+                        ):
+                            admission_budget_exhausted = True
+                        else:
+                            try:
+                                prompt_batch = next(dataloader_iter)
+                            except StopIteration:
+                                epoch_exhausted = True
+
+                        if epoch_exhausted:
+                            self._current_epoch += 1
+                        elif admission_budget_exhausted:
+                            pass
+                        elif self._divert_batch_to_reserve(prompt_batch):
+                            pass
+                        else:
+                            # Own the yielded batch before sampler.admit can block.
+                            # A checkpoint now has its prompts even though neither the
+                            # sampler cursor nor absolute admission cursor advanced.
+                            entry = _record_yielded_batch(_materialize_batch(prompt_batch))
+
+                    if epoch_exhausted or admission_budget_exhausted:
+                        break
+                    if entry is not None:
+                        await _admit_yielded_batch(entry, max_num_steps=max_num_steps)
+                        await _dispatch_admission(entry, restored_group_ids)
 
         # Only now that every dispatched rollout has settled is the pool genuinely
         # spare. Draining it inside the group above would race them for it, and a
         # rollout that was about to be dropped has the better claim: it needs a spare to
         # keep its step whole, whereas an extra step is only worth having if one is
         # left over. A second group because the first is closed to new tasks.
+        while await _advance_full_legacy_target(max_num_steps):
+            pass
         async with asyncio.TaskGroup() as rollout_tasks:
-            await self._drain_reserve_into_steps(_launch)
+            await self._drain_reserve_into_steps(
+                _launch,
+                max_steps=max(0, max_num_steps - self._next_rollout_admission),
+            )
+        # A reserve top-up may have exposed a later full lookahead cohort. Advance it
+        # even when max_epochs already put the dataloader loop at EOF; otherwise a
+        # final checkpoint can persist next_admission < train_steps after training
+        # consumes that cohort and then reject its own state on the next resume.
+        while await _advance_full_legacy_target(max_num_steps):
+            pass
 
         # Drain in-flight so return implies "all rollouts in TQ".
         inflight = list(self._dispatched_rollouts)
@@ -812,9 +1602,16 @@ class SingleControllerActor:
         self._rollout_exhausted.set()
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
-    def _divert_batch_to_reserve(
-        self, prompt_batch: BatchedDataDict[DatumSpec]
-    ) -> bool:
+    def _should_divert_next_batch_to_reserve(self) -> bool:
+        """Whether the next dataloader batch is owed to the replacement pool."""
+        failure_cfg = self._async_cfg.rollout_failure
+        return (
+            failure_cfg.on_dropped_prompt == "replace"
+            and self._sampler_stamps_target_steps
+            and len(self._replacement_reserve) < failure_cfg.replacement_reserve_prompts
+        )
+
+    def _divert_batch_to_reserve(self, prompt_batch: BatchedDataDict[DatumSpec]) -> bool:
         """Consume a whole batch as spare prompts instead of admitting it as a step.
 
         Returns whether the batch was taken, in which case the caller must not admit it.
@@ -833,18 +1630,12 @@ class SingleControllerActor:
         diverted; in practice the pool is filled while that first batch's rollouts are
         still running, so it is available by the time any of them can be given up on.
         """
+        if not self._should_divert_next_batch_to_reserve():
+            return False
         failure_cfg = self._async_cfg.rollout_failure
-        if failure_cfg.on_dropped_prompt != "replace":
-            return False
-        if not self._sampler_stamps_target_steps:
-            return False
-        if len(self._replacement_reserve) >= failure_cfg.replacement_reserve_prompts:
-            return False
 
         for prompt_idx in range(prompt_batch.size):
-            spare: DatumSpec = {  # type: ignore
-                k: v[prompt_idx] for k, v in prompt_batch.items()
-            }
+            spare: DatumSpec = {k: v[prompt_idx] for k, v in prompt_batch.items()}  # type: ignore
             self._replacement_reserve.append(spare)
         print(
             f"  spare pool refilled with {prompt_batch.size} prompt(s) "
@@ -855,8 +1646,11 @@ class SingleControllerActor:
         return True
 
     async def _drain_reserve_into_steps(
-        self, launch: Callable[[DatumSpec, Optional[int]], Awaitable[None]]
-    ) -> None:
+        self,
+        launch: Callable[[dict[str, Any]], Awaitable[None]],
+        *,
+        max_steps: int,
+    ) -> int:
         """Train on the leftover spares once the dataloader has nothing more to give.
 
         Spares were consumed from the dataset like any other prompt, so leaving them in
@@ -873,39 +1667,106 @@ class SingleControllerActor:
         batch (the dataloader uses ``batch_size=num_prompts_per_step``), so the common
         outcome is that the whole thing is recovered.
 
+        ``max_steps`` is the unused global training-step budget. It distinguishes
+        dataloader exhaustion, where a diverted batch should restore a missing step,
+        from an explicit ``grpo.max_num_steps`` stop, where draining the same batch
+        would generate work the trainer can never consume.
+
         Not gated on ``on_dropped_prompt``: an empty pool makes this a no-op anyway, and
         only "replace" ever fills one, so the gate would buy nothing while stranding a
         pool restored from a checkpoint into a run that has since switched to "shrink".
+
+        Returns:
+            The number of additional training steps dispatched from the pool.
         """
+        if max_steps < 0:
+            raise ValueError(f"max_steps must be non-negative, got {max_steps}")
+
         num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
-        while len(self._replacement_reserve) >= num_prompts_per_step:
-            # Take the step's prompts out before the first await. A drop resolving
-            # concurrently draws from this same pool, and could otherwise claim one of
-            # them and leave the step it is filling one group short.
-            step_prompts = [
-                self._replacement_reserve.popleft() for _ in range(num_prompts_per_step)
-            ]
-            target_step = await self._sampler.admit(
-                trainer_version_fn=lambda: self._trainer_version
-            )
+        max_num_steps = self._master_config.grpo.max_num_steps
+        dispatched_steps = 0
+        while dispatched_steps < max_steps:
+            async with self._rollout_admission_lock:
+                if len(self._replacement_reserve) < num_prompts_per_step:
+                    break
+                # Own K prompts before sampler.admit can block. A checkpoint sees
+                # them either in the reserve or in this unadmitted entry.
+                step_prompts = [self._replacement_reserve.popleft() for _ in range(num_prompts_per_step)]
+                entry = {
+                    "dispatch_index": None,
+                    "admitted": False,
+                    "source": "reserve",
+                    "groups": [
+                        {
+                            "target_step": None,
+                            "group_id": None,
+                            "prompt": prompt,
+                        }
+                        for prompt in step_prompts
+                    ],
+                }
+                self._pending_rollout_admissions.append(entry)
+
+            target_step = await self._sampler.admit(trainer_version_fn=lambda: self._trainer_version)
+            if target_step is not None and target_step >= max_num_steps:
+                raise RuntimeError(
+                    "rollout sampler admitted pooled target_step="
+                    f"{target_step} beyond grpo.max_num_steps={max_num_steps}"
+                )
+
+            async with self._rollout_admission_lock:
+                entry["dispatch_index"] = self._next_rollout_admission
+                entry["admitted"] = True
+                for group_record in entry["groups"]:
+                    group_record["target_step"] = target_step
+                self._next_rollout_admission += 1
+                if target_step is not None:
+                    self._sampler_stamps_target_steps = True
+                    buffered = self._buffer.count_for_target_step(target_step)
+                else:
+                    buffered = 0
+                buffered = min(buffered, num_prompts_per_step)
+                missing = num_prompts_per_step - buffered
+                returned_groups = entry["groups"][missing:]
+                entry["groups"] = entry["groups"][:missing]
+                self._replacement_reserve.extendleft(reversed([group["prompt"] for group in returned_groups]))
+                if not entry["groups"]:
+                    self._pending_rollout_admissions = deque(
+                        candidate for candidate in self._pending_rollout_admissions if candidate is not entry
+                    )
+
+            if not missing:
+                dispatched_steps += 1
+                print(
+                    f"  pooled target_step={target_step} is already complete in the "
+                    "restored buffer; preserving the reserve and dispatching 0 "
+                    "duplicate prompts",
+                    flush=True,
+                )
+                continue
             print(
-                f"  dataloader exhausted; training on {len(step_prompts)} pooled "
-                f"spare(s) as target_step={target_step}",
+                f"  dataloader exhausted; training on {missing} pooled "
+                f"spare(s) as target_step={target_step}; {buffered} group(s) "
+                "already buffered",
                 flush=True,
             )
-            for prompt in step_prompts:
-                await launch(prompt, target_step)
+            for group_record in entry["groups"]:
+                await launch(group_record)
+            dispatched_steps += 1
 
         if self._replacement_reserve:
+            if len(self._replacement_reserve) < num_prompts_per_step:
+                detail = f"fewer than the {num_prompts_per_step} a step needs"
+            else:
+                detail = "the training-step budget is exhausted"
             print(
-                f"  {len(self._replacement_reserve)} pooled spare(s) left over, fewer "
-                f"than the {num_prompts_per_step} a step needs; they are not trained on",
+                f"  {len(self._replacement_reserve)} pooled spare(s) left over; "
+                f"{detail}, so they are not trained on",
                 flush=True,
             )
+        return dispatched_steps
 
-    def _take_replacement(
-        self, target_step: Optional[int], replacements_used: int
-    ) -> Optional[DatumSpec]:
+    def _take_replacement(self, target_step: Optional[int], replacements_used: int) -> Optional[DatumSpec]:
         """A spare prompt to stand in for a dropped group, or None to shrink instead.
 
         None covers the four ways a replacement can be unavailable: it was not asked
@@ -952,12 +1813,21 @@ class SingleControllerActor:
             return None
         if target_step < self._trainer_version:
             return None
+        targets_before = list(getattr(self._buffer, "target_step_list", ()))
         lender_step = self._buffer.promote_ready_group(to_target_step=target_step)
         if lender_step is None:
             return None
-        self._batch_promotions[target_step] = (
-            self._batch_promotions.get(target_step, 0) + 1
-        )
+        targets_after = list(getattr(self._buffer, "target_step_list", ()))
+        group_ids = list(getattr(self._buffer, "_group_ids", ()))
+        if len(group_ids) == len(targets_before) == len(targets_after):
+            promoted_indices = [
+                index
+                for index, (before, after) in enumerate(zip(targets_before, targets_after))
+                if before == lender_step and after == target_step
+            ]
+            if len(promoted_indices) == 1:
+                self._retarget_pending_group(group_ids[promoted_indices[0]], target_step)
+        self._batch_promotions[target_step] = self._batch_promotions.get(target_step, 0) + 1
         print(
             f"  target_step={target_step}: filled the dropped group by promoting a "
             f"finished group from target_step={lender_step}; the spare prompt is "
@@ -970,9 +1840,7 @@ class SingleControllerActor:
         """Record that a stamped step will never receive a group it is waiting for."""
         if target_step is None:
             return
-        self._batch_shortfall[target_step] = (
-            self._batch_shortfall.get(target_step, 0) + 1
-        )
+        self._batch_shortfall[target_step] = self._batch_shortfall.get(target_step, 0) + 1
         print(
             f"  target_step={target_step} is one group short "
             f"({self._batch_shortfall[target_step]} total); the train pump "
@@ -1045,22 +1913,25 @@ class SingleControllerActor:
             step_open = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
+            trained_group_ids: set[str] = set()
 
             with self._timer.time("total_step_time"):
                 # Re-read on every iteration rather than once: a prompt stamped for this
                 # step can be dropped while the pump is already waiting for it, which is
                 # precisely the case that would otherwise wait forever.
-                while groups_dispatched < self._target_groups_for_step(
-                    version_during_step
-                ):
+                while groups_dispatched < self._target_groups_for_step(version_during_step):
                     # Wait for a selectable batch
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
 
                         # Evict stale groups
+                        group_ids_before_evict = set(getattr(self._buffer, "_group_ids", ()))
                         evicted = await self._sampler.evict(
                             current_train_weight=self._trainer_version,
                         )
+                        if evicted:
+                            evicted_group_ids = group_ids_before_evict - set(getattr(self._buffer, "_group_ids", ()))
+                            self._retire_rollout_group_ids(evicted_group_ids)
                         evicted_stale_prompt_groups += evicted
                         if evicted:
                             print(
@@ -1077,20 +1948,14 @@ class SingleControllerActor:
                         # can also have fallen to what is already dispatched, which is
                         # not a batch the sampler can be asked for -- select() rejects
                         # a min below 1 -- so close the step instead.
-                        target_groups = self._target_groups_for_step(
-                            version_during_step
-                        )
+                        target_groups = self._target_groups_for_step(version_during_step)
                         max_prompt_groups = target_groups - groups_dispatched
                         if max_prompt_groups <= 0:
                             break
-                        min_prompt_groups, max_prompt_groups = (
-                            _train_selection_group_bounds(
-                                remaining_groups=max_prompt_groups,
-                                configured_min_groups=(
-                                    self._async_cfg.min_groups_for_streaming_train
-                                ),
-                                group_multiple=self._train_dispatch_group_multiple,
-                            )
+                        min_prompt_groups, max_prompt_groups = _train_selection_group_bounds(
+                            remaining_groups=max_prompt_groups,
+                            configured_min_groups=(self._async_cfg.min_groups_for_streaming_train),
+                            group_multiple=self._train_dispatch_group_multiple,
                         )
                         train_meta, num_groups = await self._sampler.select(
                             current_train_weight=self._trainer_version,
@@ -1115,8 +1980,7 @@ class SingleControllerActor:
                                 buffered_groups = len(self._buffer)
                                 if groups_dispatched == 0 and buffered_groups == 0:
                                     print(
-                                        "train_pump: rollout exhausted and "
-                                        "buffer drained",
+                                        "train_pump: rollout exhausted and " "buffer drained",
                                         flush=True,
                                     )
                                     return
@@ -1134,15 +1998,24 @@ class SingleControllerActor:
                             await asyncio.sleep(0.005)
                             continue
 
+                        # Sample IDs are ``{group_id}_g{i}``. Track the exact groups
+                        # selected because ready-first/freshest policies may consume a
+                        # different admission order than FIFO completion.
+                        selected_group_ids = {
+                            head
+                            for sample_id in train_meta.sample_ids
+                            for head, separator, row in [sample_id.rpartition("_g")]
+                            if head and separator and row.isdigit()
+                        }
+                        if len(selected_group_ids) == num_groups:
+                            trained_group_ids.update(selected_group_ids)
+
                         # Release buffer capacity
                         for _ in range(num_groups):
                             self._buffer_capacity.release()
 
                     # Compute prev_logprobs / ref_logprobs
-                    if (
-                        self._policy_logprobs_required
-                        or self._reference_logprobs_required
-                    ):
+                    if self._policy_logprobs_required or self._reference_logprobs_required:
                         with self._timer.time("logprob_inference_prep"):
                             # Once the step is open, gradients are accumulating
                             # in the trainer's grad buffers across chunks. The
@@ -1156,9 +2029,7 @@ class SingleControllerActor:
                             )
                         with self._timer.time("policy_and_reference_logprobs"):
                             if self._policy_logprobs_required:
-                                await asyncio.to_thread(
-                                    self._trainer.get_logprobs_from_meta, train_meta
-                                )
+                                await asyncio.to_thread(self._trainer.get_logprobs_from_meta, train_meta)
                             if self._reference_logprobs_required:
                                 await asyncio.to_thread(
                                     self._trainer.get_reference_policy_logprobs_from_meta,
@@ -1196,15 +2067,11 @@ class SingleControllerActor:
                     # F/B, and _advantage_stage intentionally records no shared-prefix
                     # opportunity for it either.
                     if has_valid_training_tokens and train_meta.sequence_lengths:
-                        self._step_log_dict["sequence_lengths"].extend(
-                            int(s) for s in train_meta.sequence_lengths
-                        )
+                        self._step_log_dict["sequence_lengths"].extend(int(s) for s in train_meta.sequence_lengths)
 
                     if getattr(self._gen, "requires_kv_scale_sync", False):
                         calibration_fields = [
-                            field
-                            for field in (train_meta.fields or [])
-                            if field in DP_CALIB_INPUT_FIELDS
+                            field for field in (train_meta.fields or []) if field in DP_CALIB_INPUT_FIELDS
                         ]
                         calibration_batches.append(
                             await asyncio.to_thread(
@@ -1215,14 +2082,9 @@ class SingleControllerActor:
                         )
 
                     # Refresh min_sample_version
-                    curr_min_sample_version = min(
-                        t["weight_version"]
-                        for t in train_meta.tags  # type: ignore
-                    )
+                    curr_min_sample_version = min(t["weight_version"] for t in train_meta.tags)  # type: ignore
                     if min_sample_version is not None:
-                        min_sample_version = min(
-                            min_sample_version, curr_min_sample_version
-                        )
+                        min_sample_version = min(min_sample_version, curr_min_sample_version)
                     else:
                         min_sample_version = curr_min_sample_version
 
@@ -1272,9 +2134,7 @@ class SingleControllerActor:
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
 
                 step_metrics = aggregate_step_metrics(result)
-                step_metrics.update(
-                    reduce_advantage_pump_metrics(**self._step_log_dict)
-                )
+                step_metrics.update(reduce_advantage_pump_metrics(**self._step_log_dict))
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 if self._step_shared_prefix_opportunities:
                     step_metrics.update(
@@ -1285,44 +2145,43 @@ class SingleControllerActor:
                     )
                     self._step_shared_prefix_opportunities = []
 
+                # The JSONL can be large. Keep the published trainer version at
+                # the generation-visible version while it is written; otherwise
+                # this await lets the rollout pump admit version N+1 work before
+                # _sync_weights has moved generation off version N.
+                await asyncio.to_thread(
+                    self._flush_train_data_records,
+                    step=self._train_steps + 1,
+                )
+                # Retire before publishing the incremented trainer step. Checkpointing
+                # happens later in this same iteration, so its cursor, dataloader, and
+                # pending-admission ledger all describe one coherent boundary.
+                self._retire_rollout_admission(
+                    version_during_step,
+                    trained_group_ids=trained_group_ids,
+                )
                 self._trainer_version += 1
                 self._train_steps += 1
-                dropped_prompt_groups = self._batch_shortfall.get(
-                    version_during_step, 0
-                )
-                replaced_prompt_groups = self._batch_replacements.get(
-                    version_during_step, 0
-                )
-                promoted_prompt_groups = self._batch_promotions.get(
-                    version_during_step, 0
-                )
+                dropped_prompt_groups = self._batch_shortfall.get(version_during_step, 0)
+                replaced_prompt_groups = self._batch_replacements.get(version_during_step, 0)
+                promoted_prompt_groups = self._batch_promotions.get(version_during_step, 0)
                 # Prune every stamp this step or older. Popping only this step's entry
                 # would leak the ones belonging to a step that was already closed when
                 # a straggler stamped for it was finally given up on.
                 self._batch_shortfall = {
-                    step: dropped
-                    for step, dropped in self._batch_shortfall.items()
-                    if step > version_during_step
+                    step: dropped for step, dropped in self._batch_shortfall.items() if step > version_during_step
                 }
                 self._batch_replacements = {
-                    step: replaced
-                    for step, replaced in self._batch_replacements.items()
-                    if step > version_during_step
+                    step: replaced for step, replaced in self._batch_replacements.items() if step > version_during_step
                 }
                 self._batch_promotions = {
-                    step: promoted
-                    for step, promoted in self._batch_promotions.items()
-                    if step > version_during_step
+                    step: promoted for step, promoted in self._batch_promotions.items() if step > version_during_step
                 }
                 with self._timer.time("weight_sync"):
                     calibration_data = (
-                        BatchedDataDict.from_batches(calibration_batches)
-                        if calibration_batches
-                        else None
+                        BatchedDataDict.from_batches(calibration_batches) if calibration_batches else None
                     )
-                    aborted_stale_inflight_groups = await self._sync_weights(
-                        calibration_data=calibration_data
-                    )
+                    aborted_stale_inflight_groups = await self._sync_weights(calibration_data=calibration_data)
                     step_metrics.update(
                         {
                             "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
@@ -1363,56 +2222,41 @@ class SingleControllerActor:
                 # the legacy loop's 1-indexed `step + 1`.
                 should_save_by_step = (
                     is_last_step
-                    or self._train_steps
-                    % self._master_config.checkpointing["save_period"]
-                    == 0
-                    or (
-                        ft_save_period is not None
-                        and self._train_steps % ft_save_period == 0
-                    )
+                    or self._train_steps % self._master_config.checkpointing["save_period"] == 0
+                    or (ft_save_period is not None and self._train_steps % ft_save_period == 0)
                 )
                 should_save_by_timeout = self._timeout.check_save()
 
-                if self._master_config.checkpointing["enabled"] and (
-                    should_save_by_step or should_save_by_timeout
-                ):
+                if self._master_config.checkpointing["enabled"] and (should_save_by_step or should_save_by_timeout):
                     with self._timer.time("checkpointing"):
                         await self._save_checkpoint(step_metrics)
 
-            timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
-                reduction_op="sum"
-            )  # type: ignore
+            timing_metrics: dict[str, float] = self._timer.get_timing_metrics(reduction_op="sum")  # type: ignore
 
             total_time = timing_metrics.get("total_step_time", 0.0)
             total_num_gpus = int(ray.cluster_resources().get("GPU", 0))
-            if (
-                total_time > 0
-                and total_num_gpus > 0
-                and "global_valid_toks" in step_metrics
-            ):
+            if total_time > 0 and total_num_gpus > 0 and "global_valid_toks" in step_metrics:
                 timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                     step_metrics["global_valid_toks"] / total_time / total_num_gpus
                 )
 
             print("\n⏱️  Timing:")
             print(f"  • Total step time: {total_time:.2f}s")
-            for k, v in sorted(
-                timing_metrics.items(), key=lambda item: item[1], reverse=True
-            ):
+            for k, v in sorted(timing_metrics.items(), key=lambda item: item[1], reverse=True):
                 if k == "total_step_time":
                     continue
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            # TODO: per-step train_data jsonl dump, vllm metrics logger,
-            #   histogram log, rollout_metrics, pretty-print "Training Results"
-            #   block, print_performance_metrics.
+            # TODO: vllm metrics logger, histogram log, rollout_metrics,
+            #   pretty-print "Training Results" block, print_performance_metrics.
             print(f"step_metrics={step_metrics}", flush=True)
+            self._logger.log_metrics(step_metrics, step=self._train_steps, prefix="train")
             self._logger.log_metrics(
-                step_metrics, step=self._train_steps, prefix="train"
-            )
-            self._logger.log_metrics(
-                timing_metrics, step=self._train_steps, prefix="timing/train"
+                timing_metrics,
+                step=self._train_steps,
+                prefix="timing/train",
+                step_finished=True,
             )
             self._timer.reset()
 
@@ -1476,13 +2320,10 @@ class SingleControllerActor:
                 # Best-effort like the membership push: a router being recreated must
                 # not cost a metrics tick.
                 try:
-                    metrics.update(
-                        await self._ray_get(self._generation_router.metrics.remote())
-                    )
+                    metrics.update(await self._ray_get(self._generation_router.metrics.remote()))
                 except Exception as error:  # noqa: BLE001 - metrics are advisory
                     print(
-                        f"watchdog: router metrics unavailable this tick: "
-                        f"{type(error).__name__}: {error}",
+                        f"watchdog: router metrics unavailable this tick: " f"{type(error).__name__}: {error}",
                         flush=True,
                     )
             self._logger.log_metrics(metrics, step=self._train_steps)
@@ -1495,9 +2336,7 @@ class SingleControllerActor:
                 if problems:
                     detail = "; ".join(problems)
                     if watchdog_cfg.stall_action == "abort":
-                        raise RuntimeError(
-                            f"environment health check failed -- {detail}"
-                        )
+                        raise RuntimeError(f"environment health check failed -- {detail}")
                     print(f"WARNING: environment health -- {detail}", flush=True)
 
             if self._gen_fleet is not None:
@@ -1551,8 +2390,7 @@ class SingleControllerActor:
                 await self._push_router_membership()
             except Exception as error:  # noqa: BLE001 - best-effort, retried next tick
                 print(
-                    f"fleet probe: router update failed, retrying next tick: "
-                    f"{type(error).__name__}: {error}",
+                    f"fleet probe: router update failed, retrying next tick: " f"{type(error).__name__}: {error}",
                     flush=True,
                 )
 
@@ -1589,9 +2427,7 @@ class SingleControllerActor:
                     timeout=fleet_cfg.probe_timeout_s,
                 )
             except (Exception, asyncio.TimeoutError) as error:
-                self._gen_fleet.record_probe(
-                    shard_idx, ok=False, error=f"{type(error).__name__}: {error}"
-                )
+                self._gen_fleet.record_probe(shard_idx, ok=False, error=f"{type(error).__name__}: {error}")
             else:
                 self._gen_fleet.record_probe(shard_idx, ok=True)
 
@@ -1617,11 +2453,7 @@ class SingleControllerActor:
         """
         if self._generation_router is None or self._gen_fleet is None:
             return
-        await self._ray_get(
-            self._generation_router.set_serving_backends.remote(
-                self._gen_fleet.serving_base_urls()
-            )
-        )
+        await self._ray_get(self._generation_router.set_serving_backends.remote(self._gen_fleet.serving_base_urls()))
 
     async def _drain_router_failures(self) -> None:
         """Fold the router's observed backend failures into the fleet ledger.
@@ -1634,9 +2466,7 @@ class SingleControllerActor:
         """
         if self._generation_router is None or self._gen_fleet is None:
             return
-        counts: dict[str, int] = await self._ray_get(
-            self._generation_router.drain_backend_failures.remote()
-        )
+        counts: dict[str, int] = await self._ray_get(self._generation_router.drain_backend_failures.remote())
         for url, count in counts.items():
             shard_idx = self._gen_fleet.shard_for_base_url(url)
             if shard_idx is None:
@@ -1673,31 +2503,28 @@ class SingleControllerActor:
             if health_check is None:
                 continue
             try:
-                await asyncio.wait_for(
-                    self._ray_get(health_check.remote()), timeout=timeout_s
-                )
+                await asyncio.wait_for(self._ray_get(health_check.remote()), timeout=timeout_s)
             except asyncio.TimeoutError:
-                problems.append(
-                    f"environment {env_name!r} did not answer its health check within "
-                    f"{timeout_s}s"
-                )
+                problems.append(f"environment {env_name!r} did not answer its health check within " f"{timeout_s}s")
             except Exception as error:
                 problems.append(f"environment {env_name!r} reported unhealthy: {error}")
         return problems
 
     async def _abort_stale_inflight(self) -> int:
         """Abort in-flight rollouts that the sampler can no longer select."""
-        stale_tasks = [
-            task
-            for task, start_version in self._inflight_by_group_id.values()
+        stale_groups = [
+            (group_id, task)
+            for group_id, (task, start_version) in self._inflight_by_group_id.items()
             if self._sampler.should_abort_inflight(
                 start_weight_version=start_version,
                 current_train_weight=self._trainer_version,
             )
         ]
-        if not stale_tasks:
+        if not stale_groups:
             return 0
 
+        stale_tasks = [task for _, task in stale_groups]
+        self._retire_rollout_group_ids({group_id for group_id, _ in stale_groups})
         for task in stale_tasks:
             task.cancel()
 
@@ -1705,8 +2532,7 @@ class SingleControllerActor:
         failures = [
             result
             for result in results
-            if isinstance(result, BaseException)
-            and not isinstance(result, asyncio.CancelledError)
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
         ]
         if failures:
             raise BaseExceptionGroup(
@@ -1720,6 +2546,32 @@ class SingleControllerActor:
         )
         return len(stale_tasks)
 
+    async def _drain_gym_inflight_generations(self) -> int:
+        """Wait until every Gym request admitted before the refit gate has left generation.
+
+        Cancelling the local Gym task is insufficient: the HTTP request may keep
+        running in Gym/vLLM after its caller is cancelled. RolloutManager consults
+        the same gate before every attempt, so once the gate is cleared the registry
+        can only shrink. Waiting for the registry to become empty therefore proves
+        that no remote generation can overlap the weight update.
+        """
+        drained_group_ids: set[str] = set()
+        while self._inflight_by_group_id:
+            drained_group_ids.update(self._inflight_by_group_id)
+            self._inflight_registry_changed.clear()
+            # Avoid losing a removal that happened between the loop condition and
+            # clear(); asyncio tasks can only mutate this mapping at await points.
+            if not self._inflight_by_group_id:
+                continue
+            await self._inflight_registry_changed.wait()
+
+        if drained_group_ids:
+            print(
+                f"  drained {len(drained_group_ids)} Gym in-flight generation(s)",
+                flush=True,
+            )
+        return len(drained_group_ids)
+
     async def _save_checkpoint(self, step_metrics: dict[str, Any]) -> None:
         """Write a full checkpoint for the just-finished train step.
 
@@ -1727,26 +2579,22 @@ class SingleControllerActor:
         on disk before begin_finalization; rollouts keep running throughout.
         """
         save_state = self._save_state
-        save_state.current_step = self._train_steps
-        save_state.total_steps = self._train_steps
-        save_state.current_epoch = self._current_epoch
-        save_state.consumed_samples = self._consumed_samples
-        save_state.total_valid_tokens = self._total_valid_tokens
-        # The restore skips the replay buffer when the resuming run uses a
-        # different sampler (its stamps may never be selectable there).
-        save_state.sampler_name = self._async_cfg.sampler.name
-        # Snapshot before any await so it can't interleave with
-        # _rollout_pump iterating this same dataloader.
-        dataloader_state = self._dataloader.state_dict()
-        # The spare pool has to be saved with that snapshot, not left out of the
-        # checkpoint: diverting a batch already advanced the iterator, so the state
-        # above records those prompts as consumed while they are still only in memory.
-        # Without this a resumed replace-mode run comes back with an empty pool and a
-        # dataloader positioned past the diverted batch, silently losing it -- and
-        # losing it for good, since _drain_reserve_into_steps only ever recovers spares
-        # held by the process that diverted them. Snapshotted here, in the same
-        # await-free window, so the pair cannot disagree.
-        reserve_state = list(self._replacement_reserve)
+        # Hold the admission cut until replay_buffer.state_dict has captured its ready
+        # slots. Otherwise a new unstamped batch can enter replay during the trainer
+        # save awaits without appearing in this checkpoint's cursor or ledger.
+        async with self._rollout_admission_lock:
+            save_state.current_step = self._train_steps
+            save_state.total_steps = self._train_steps
+            save_state.current_epoch = self._current_epoch
+            save_state.consumed_samples = self._consumed_samples
+            save_state.total_valid_tokens = self._total_valid_tokens
+            # The restore skips replay when the sampler changes because its stamps
+            # might never be selectable under the new policy.
+            save_state.sampler_name = self._async_cfg.sampler.name
+            dataloader_state = self._dataloader.state_dict()
+            reserve_state = list(self._replacement_reserve)
+            rollout_admission_state = self._rollout_admission_state_dict()
+            buffer_state = await self._buffer.state_dict(saved_capacity=self._async_cfg.max_buffered_rollouts)
         # SC has no validation loop yet; drop the default sentinel instead of
         # persisting a bogus val_reward.
         if hasattr(save_state, "val_reward"):
@@ -1766,20 +2614,22 @@ class SingleControllerActor:
         await asyncio.to_thread(self._checkpointer.finalize_pending)
 
         print(f"Saving checkpoint for step {self._train_steps}...")
-        checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
-            self._checkpointer.init_tmp_checkpoint,
-            self._train_steps,
-            vars(save_state),
-            self._master_config,
+        checkpoint_path: PathLike = (
+            await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+                self._checkpointer.init_tmp_checkpoint,
+                self._train_steps,
+                vars(save_state),
+                self._master_config,
+            )
         )
         # With async_save this returns after D2H staging; disk writes finish
         # in the background.
         await asyncio.to_thread(
             self._trainer.save_checkpoint,
             weights_path=os.path.join(checkpoint_path, "policy", "weights"),
-            optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer")
-            if self._checkpointer.save_optimizer
-            else None,
+            optimizer_path=(
+                os.path.join(checkpoint_path, "policy", "optimizer") if self._checkpointer.save_optimizer else None
+            ),
             tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
             checkpointing_cfg=self._master_config.checkpointing,
         )
@@ -1788,15 +2638,17 @@ class SingleControllerActor:
             dataloader_state,
             os.path.join(checkpoint_path, "train_dataloader.pt"),
         )
+        await asyncio.to_thread(
+            torch.save,
+            rollout_admission_state,
+            os.path.join(checkpoint_path, _ROLLOUT_ADMISSION_STATE_FILE),
+        )
         if reserve_state:
             await asyncio.to_thread(
                 torch.save,
                 reserve_state,
                 os.path.join(checkpoint_path, "replacement_reserve.pt"),
             )
-        buffer_state = await self._buffer.state_dict(
-            saved_capacity=self._async_cfg.max_buffered_rollouts
-        )
         await asyncio.to_thread(
             torch.save,
             buffer_state,
@@ -1819,17 +2671,20 @@ class SingleControllerActor:
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
     ) -> int:
-        """Pause new rollout dispatches, synchronize weights, resume.
+        """Pause rollout generation, synchronize weights, invalidate caches, resume.
 
-        SC owns the pause gate; in-flight generations continue through the
-        refit — vLLM V1 async engine supports weight updates during pending
-        requests.
+        Native rollouts retain the sampler's stale-abort semantics. Gym rollouts
+        are drained because cancelling a local Gym request does not prove the
+        corresponding remote vLLM request stopped.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
-          2. Optionally calibrate FP8 KV-cache scales.
-          3. weight_synchronizer.sync_weights(kv_scales=...)
-          4. _rollout_permitted.set()   — resume
+          2. Abort stale native rollouts or drain all Gym generations.
+          3. Optionally calibrate FP8 KV-cache scales.
+          4. weight_synchronizer.sync_weights(kv_scales=...)
+          5. Invalidate reusable generation caches when configured, and always
+             for Gym where repeated prompts otherwise reuse pre-refit KV state.
+          6. _rollout_permitted.set()   — resume
 
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
@@ -1841,22 +2696,16 @@ class SingleControllerActor:
         """
         self._rollout_permitted.clear()
 
-        # TODO(#2625): Abort unconditionally once Gym-path abort is validated;
-        # for now only the native path aborts stale in-flight requests.
-        aborted_stale_inflight_groups = (
-            0
-            if should_use_nemo_gym(self._master_config)
-            else await self._abort_stale_inflight()
-        )
-
-        # TODO(#2625): Add drain-gate support during refit.
+        use_nemo_gym = should_use_nemo_gym(self._master_config)
+        if use_nemo_gym:
+            await self._drain_gym_inflight_generations()
+            aborted_stale_inflight_groups = 0
+        else:
+            aborted_stale_inflight_groups = await self._abort_stale_inflight()
 
         t0 = time.monotonic()
         kv_scales = None
-        if (
-            getattr(self._gen, "requires_kv_scale_sync", False)
-            and calibration_data is not None
-        ):
+        if getattr(self._gen, "requires_kv_scale_sync", False) and calibration_data is not None:
             print("▶ Computing KV cache scales...", flush=True)
             calibration_result = await asyncio.to_thread(
                 self._trainer.calibrate_qkv_fp8_scales,
@@ -1869,12 +2718,14 @@ class SingleControllerActor:
             self._weight_synchronizer.sync_weights,
             kv_scales=kv_scales,
         )
-        if self._async_cfg.recompute_kv_cache_after_weight_updates:
+        if use_nemo_gym or self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would
             # freeze the event loop itself -- taking the watchdog, which is an asyncio
             # task on that same loop, down with it.
-            await asyncio.to_thread(self._gen.invalidate_kv_cache)
+            invalidated = await asyncio.to_thread(self._gen.invalidate_kv_cache)
+            if not invalidated:
+                raise RuntimeError("Generation prefix/KV cache invalidation failed after weight update")
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
@@ -1907,17 +2758,40 @@ class SingleControllerActor:
         )
 
         prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
-        rewards = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.reward_field)
-        ).float()
-        token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
-        sample_mask = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.sample_mask_field)
-        ).float()
-
-        seq_logprob_error_threshold = (
-            self._master_config.grpo.seq_logprob_error_threshold
+        verifier_rewards = (
+            squeeze_trailing_unit_dim(tensor_field(data, adv_cfg.reward_field))
+            .float()
+            .detach()
+            .clone()
         )
+        rewards = verifier_rewards
+        token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
+        sample_mask = squeeze_trailing_unit_dim(tensor_field(data, adv_cfg.sample_mask_field)).float()
+
+        repeated_batch = BatchedDataDict(
+            {
+                "total_reward": rewards,
+                **{
+                    field_name: squeeze_trailing_unit_dim(tensor_field(data, field_name))
+                    for field_name in adv_cfg.repeated_batch_fields
+                },
+            }
+        )
+        reward_scaling_cfg = getattr(self._master_config.grpo, "reward_scaling", None)
+        reward_shaping_cfg = getattr(self._master_config.grpo, "reward_shaping", None)
+        reward_scaling_enabled = bool(getattr(reward_scaling_cfg, "enabled", False))
+        reward_shaping_enabled = bool(getattr(reward_shaping_cfg, "enabled", False))
+        if reward_scaling_cfg is not None:
+            repeated_batch = scale_rewards(repeated_batch, reward_scaling_cfg)
+        if reward_shaping_enabled:
+            repeated_batch["truncated"] = squeeze_trailing_unit_dim(tensor_field(data, "truncated")).bool()
+            repeated_batch["response_token_lengths"] = squeeze_trailing_unit_dim(
+                tensor_field(data, "response_token_lengths")
+            ).long()
+            repeated_batch = apply_reward_shaping(repeated_batch, reward_shaping_cfg)
+        rewards = repeated_batch["total_reward"]
+
+        seq_logprob_error_threshold = self._master_config.grpo.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
         # report sequence-level generation/training mismatch. A threshold adds
         # masking; leaving it unset keeps this metrics-only.
@@ -1937,9 +2811,7 @@ class SingleControllerActor:
                 }
             )
             num_valid_seqs_before = float(
-                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
-                .sum()
-                .item()
+                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0).sum().item()
             )
             seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
                 train_data=masking_data,
@@ -1947,27 +2819,13 @@ class SingleControllerActor:
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
             )
             sample_mask = masking_data["sample_mask"]
-            num_valid_seqs_after = float(
-                ((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
-                .sum()
-                .item()
-            )
-            seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
-                seq_error_metrics.pop("num_masked_seqs")
-            )
+            num_valid_seqs_after = float(((token_mask[:, 1:] * sample_mask.unsqueeze(-1)).sum(dim=-1) > 0).sum().item())
+            seq_error_metrics["num_masked_seqs_by_logprob_error"] = seq_error_metrics.pop("num_masked_seqs")
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
         mask = token_mask * sample_mask.unsqueeze(-1)
-
-        repeated_batch: dict[str, torch.Tensor] = {
-            "total_reward": rewards,
-        }
-        for field_name in adv_cfg.repeated_batch_fields:
-            repeated_batch[field_name] = squeeze_trailing_unit_dim(
-                tensor_field(data, field_name)
-            )
 
         kwargs: dict[str, torch.Tensor] = {}
         if self._policy_logprobs_required:
@@ -1990,17 +2848,11 @@ class SingleControllerActor:
                     observe_shared_prefix_opportunity(
                         group_ids=_string_object_field(data, SHARED_PREFIX_GROUP_ID),
                         prompt_token_ids=prompt_ids,
-                        prompt_lengths=squeeze_trailing_unit_dim(
-                            tensor_field(data, SHARED_PREFIX_PROMPT_LENGTHS)
-                        ),
-                        input_lengths=squeeze_trailing_unit_dim(
-                            tensor_field(data, "input_lengths")
-                        ),
+                        prompt_lengths=squeeze_trailing_unit_dim(tensor_field(data, SHARED_PREFIX_PROMPT_LENGTHS)),
+                        input_lengths=squeeze_trailing_unit_dim(tensor_field(data, "input_lengths")),
                         token_mask=token_mask,
                         sample_mask=sample_mask,
-                        expected_group_size=(
-                            self._master_config.grpo.num_generations_per_prompt
-                        ),
+                        expected_group_size=(self._master_config.grpo.num_generations_per_prompt),
                     )
                 )
             advantages = self._advantage_estimator.compute_advantage(
@@ -2013,12 +2865,34 @@ class SingleControllerActor:
         else:
             advantages = torch.zeros_like(mask)
         response_advantages = torch.masked_select(advantages, mask.bool())
-        self._step_log_dict["rewards"].append(rewards.detach().cpu())
-        self._step_log_dict["masked_advantages"].append(
-            response_advantages.detach().cpu()
-        )
+        # Keep reward metrics on the same streaming cohort that reaches F/B and
+        # train-data JSONL capture.  A partially masked chunk still reaches the
+        # trainer as one payload (with sample_loss_mask identifying inactive
+        # rows), so retain all of its rows.  A fully filtered chunk is consumed
+        # without F/B and is not captured; including it here would make
+        # train/reward and train/verifier_reward describe a different cohort
+        # from the optimizer step.
+        if has_valid_training_tokens:
+            self._step_log_dict["rewards"].append(rewards.detach().cpu())
+            self._step_log_dict.setdefault("verifier_rewards", []).append(
+                verifier_rewards.detach().cpu()
+            )
+        self._step_log_dict["masked_advantages"].append(response_advantages.detach().cpu())
+
+        if getattr(self, "_log_train_data", False) and has_valid_training_tokens:
+            self._capture_train_data_chunk(
+                meta=meta,
+                data=data,
+                rewards=rewards,
+                verifier_rewards=verifier_rewards,
+                token_mask=token_mask,
+                sample_mask=sample_mask,
+                advantages=advantages,
+            )
 
         fields_to_put = {adv_cfg.output_field: advantages}
+        if reward_scaling_enabled or reward_shaping_enabled:
+            fields_to_put[adv_cfg.reward_field] = rewards
         if seq_logprob_error_threshold is not None:
             fields_to_put[adv_cfg.sample_mask_field] = sample_mask
 
@@ -2029,9 +2903,123 @@ class SingleControllerActor:
             fields=fields_for_put(meta, fields_to_put),
         )
         return (
-            meta.with_fields([adv_cfg.output_field]),
+            meta.with_fields(list(fields_to_put)),
             has_valid_training_tokens,
         )
+
+    def _capture_train_data_chunk(
+        self,
+        *,
+        meta: KVBatchMeta,
+        data: TensorDict,
+        rewards: torch.Tensor,
+        verifier_rewards: torch.Tensor,
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        advantages: torch.Tensor,
+    ) -> None:
+        """Preserve the exact ordered trainer payload before DataPlane clears it."""
+        input_ids = tensor_field(data, "input_ids")
+        input_lengths = squeeze_trailing_unit_dim(tensor_field(data, "input_lengths"))
+        prompt_ids = tensor_field(data, self._advantage_cfg.prompt_ids_field)
+        batch_size = int(input_ids.shape[0])
+        if len(meta.sample_ids) != batch_size:
+            raise RuntimeError(
+                "SingleController train-data logging sample-id mismatch: "
+                f"{len(meta.sample_ids)} ids for batch size {batch_size}"
+            )
+
+        group_ids: list[str] | None = None
+        prompt_lengths: torch.Tensor | None = None
+        if self._shared_prefix_training_config.mode != "disabled":
+            group_ids = _string_object_field(data, SHARED_PREFIX_GROUP_ID)
+            prompt_lengths = squeeze_trailing_unit_dim(tensor_field(data, SHARED_PREFIX_PROMPT_LENGTHS))
+
+        policy_logprobs = (
+            tensor_field(data, self._advantage_cfg.policy_logprobs_field) if self._policy_logprobs_required else None
+        )
+        generation_logprobs = (
+            tensor_field(data, self._advantage_cfg.generation_logprobs_field)
+            if getattr(self, "_log_train_data", False) or self._policy_logprobs_required
+            else None
+        )
+        reference_logprobs = (
+            tensor_field(data, self._advantage_cfg.reference_logprobs_field)
+            if self._reference_logprobs_required
+            else None
+        )
+
+        def row_list(tensor: torch.Tensor, row: int) -> Any:
+            return tensor[row].detach().cpu().tolist()
+
+        for row in range(batch_size):
+            if prompt_lengths is not None:
+                prompt_length = int(prompt_lengths[row].detach().cpu().item())
+            else:
+                active_loss_indices = torch.nonzero(token_mask[row].bool(), as_tuple=False).flatten()
+                if not len(active_loss_indices):
+                    # A valid zero-completion row has no active loss token. In
+                    # that case the complete input is the prompt, so retain the
+                    # diagnostic row instead of allowing default-on logging to
+                    # abort an otherwise valid optimizer step.
+                    prompt_length = int(input_lengths[row].detach().cpu().item())
+                else:
+                    prompt_length = int(active_loss_indices[0].detach().cpu().item())
+            if not 0 < prompt_length <= int(prompt_ids.shape[1]):
+                raise RuntimeError(
+                    "SingleController train-data logging prompt length is invalid "
+                    f"for sample {meta.sample_ids[row]}: {prompt_length}"
+                )
+            record: dict[str, Any] = {
+                "sample_id": str(meta.sample_ids[row]),
+                "rewards": float(rewards[row].detach().cpu().item()),
+                "verifier_rewards": float(
+                    verifier_rewards[row].detach().cpu().item()
+                ),
+                "input_lengths": int(input_lengths[row].detach().cpu().item()),
+                "token_ids": row_list(input_ids, row),
+                "prompt_ids": prompt_ids[row, :prompt_length].detach().cpu().tolist(),
+                "token_loss_mask": row_list(token_mask, row),
+                "sample_loss_mask": float(sample_mask[row].detach().cpu().item()),
+                "advantages": row_list(advantages, row),
+            }
+            if group_ids is not None and prompt_lengths is not None:
+                record[SHARED_PREFIX_GROUP_ID] = group_ids[row]
+                record[SHARED_PREFIX_PROMPT_LENGTHS] = prompt_length
+            if policy_logprobs is not None:
+                record["prev_logprobs"] = row_list(policy_logprobs, row)
+            if generation_logprobs is not None:
+                record["generation_logprobs"] = row_list(generation_logprobs, row)
+            if reference_logprobs is not None:
+                record["reference_policy_logprobs"] = row_list(reference_logprobs, row)
+            self._step_train_data_records.append(record)
+
+    def _flush_train_data_records(self, *, step: int) -> None:
+        """Write one complete optimizer-step JSONL using the legacy filename."""
+        if not getattr(self, "_log_train_data", False):
+            return
+        if not self._step_train_data_records:
+            raise RuntimeError(
+                "SingleController train-data logging produced no rows for a " f"successful optimizer step {step}"
+            )
+
+        keys = tuple(self._step_train_data_records[0])
+        expected_keys = set(keys)
+        for index, record in enumerate(self._step_train_data_records[1:], start=1):
+            if set(record) != expected_keys:
+                raise RuntimeError(
+                    "SingleController train-data logging field mismatch at row "
+                    f"{index}: expected {sorted(expected_keys)}, got "
+                    f"{sorted(record)}"
+                )
+        sample_ids = [record.get("sample_id") for record in self._step_train_data_records]
+        if any(not isinstance(sample_id, str) or not sample_id for sample_id in sample_ids) or len(
+            set(sample_ids)
+        ) != len(sample_ids):
+            raise RuntimeError("SingleController train-data logging contains missing or duplicate " "sample IDs")
+        columns = {key: [record[key] for record in self._step_train_data_records] for key in keys}
+        self._logger.log_batched_dict_as_jsonl(columns, f"train_data_step{step}.jsonl")
+        self._step_train_data_records.clear()
 
     # ── utility helpers ────────────────────────────────────────────────────
 
@@ -2044,6 +3032,9 @@ class SingleControllerActor:
             adv_cfg.sample_mask_field,
             *adv_cfg.repeated_batch_fields,
         ]
+        reward_shaping_cfg = getattr(self._master_config.grpo, "reward_shaping", None)
+        if bool(getattr(reward_shaping_cfg, "enabled", False)):
+            fields.extend(["truncated", "response_token_lengths"])
         if self._shared_prefix_training_config.mode != "disabled":
             fields.extend(
                 [
@@ -2052,9 +3043,11 @@ class SingleControllerActor:
                     SHARED_PREFIX_PROMPT_LENGTHS,
                 ]
             )
+        if getattr(self, "_log_train_data", False):
+            fields.extend(["input_ids", "input_lengths"])
         if self._policy_logprobs_required:
             fields.append(adv_cfg.policy_logprobs_field)
-        if self._policy_logprobs_required:
+        if getattr(self, "_log_train_data", False) or self._policy_logprobs_required:
             fields.append(adv_cfg.generation_logprobs_field)
         if self._reference_logprobs_required:
             fields.append(adv_cfg.reference_logprobs_field)

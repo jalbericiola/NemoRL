@@ -17,7 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Literal, Optional
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -44,6 +44,21 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
 pytestmark = pytest.mark.mcore
+
+
+def _isolated_worker_test_module():
+    """Return the source-bound worker used by CPU-only worker tests.
+
+    The helper restores all canonical NeMo/Bridge imports before returning, so
+    these focused tests cannot leave accelerator-import doubles in the process.
+    """
+    from tests.unit.models.policy._isolated_megatron_policy_worker import (
+        WORKER_MODULE,
+        assert_import_isolation,
+    )
+
+    assert_import_isolation()
+    return WORKER_MODULE
 
 
 def test_shared_prefix_logprobs_restore_original_row_order():
@@ -155,6 +170,98 @@ def test_model_owned_mtp_loss_mask_packing_capability_is_detected():
 
     assert _model_self_packs_mtp_loss_mask(ModelOwnedPackingModel())
     assert not _model_self_packs_mtp_loss_mask(object())
+
+
+def _shared_prefix_mtp_worker():
+    MegatronPolicyWorkerImpl = _isolated_worker_test_module().MegatronPolicyWorkerImpl
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._shared_prefix_training_enabled = True
+    worker._router_replay_enabled = False
+    worker.delegate_pack_to_model = False
+    worker.model_slices_context_parallel_inputs = False
+    worker.media_placeholder_token_id = None
+    worker.cfg = {
+        "is_vlm": False,
+        "dynamic_batching": {"enabled": False},
+        "megatron_cfg": {
+            "use_fused_linear_logprobs": False,
+            "fp8_cfg": {"enabled": False},
+        },
+    }
+    worker._get_model_config = lambda: SimpleNamespace(
+        mtp_num_layers=5,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+    )
+    return worker
+
+
+def test_shared_prefix_worker_rejects_mtp_without_mcore_capability(monkeypatch):
+    worker_module = _isolated_worker_test_module()
+
+    worker = _shared_prefix_mtp_worker()
+    monkeypatch.setattr(
+        worker_module,
+        "_get_mcore_shared_prefix_training_capability",
+        lambda: frozenset(),
+    )
+
+    with pytest.raises(NotImplementedError, match="MTP without MCore capability"):
+        worker._validate_shared_prefix_worker_features()
+
+
+def test_shared_prefix_worker_accepts_mtp_with_mcore_capability(monkeypatch):
+    from tests.unit.models.policy._isolated_megatron_policy_worker import (
+        SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+    )
+
+    worker_module = _isolated_worker_test_module()
+
+    worker = _shared_prefix_mtp_worker()
+    monkeypatch.setattr(
+        worker_module,
+        "_get_mcore_shared_prefix_training_capability",
+        lambda: frozenset((SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,)),
+    )
+
+    worker._validate_shared_prefix_worker_features()
+
+
+def test_shared_prefix_worker_rejects_megatron_peft_in_train_mode() -> None:
+    worker = _shared_prefix_mtp_worker()
+    worker.cfg["shared_prefix_training"] = {"mode": "train"}
+    worker.cfg["megatron_cfg"]["peft"] = {"enabled": True}
+    worker._get_model_config = lambda: SimpleNamespace(
+        mtp_num_layers=0,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"PEFT/LoRA adapters .*peft\.enabled=false.*gradient semantics",
+    ):
+        worker._validate_shared_prefix_worker_features()
+
+
+@pytest.mark.parametrize("mode", ["disabled", "observe"])
+def test_shared_prefix_worker_ignores_megatron_peft_outside_train_mode(
+    mode: Literal["disabled", "observe"],
+) -> None:
+    from nemo_rl.models.policy import get_shared_prefix_training_config
+
+    MegatronPolicyWorkerImpl = _isolated_worker_test_module().MegatronPolicyWorkerImpl
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {
+        "shared_prefix_training": {"mode": mode},
+        "megatron_cfg": {"peft": {"enabled": True}},
+    }
+    worker._shared_prefix_training_enabled = (
+        get_shared_prefix_training_config(worker.cfg).mode == "train"
+    )
+
+    worker._validate_shared_prefix_worker_features()
 
 
 def _conversion_task(megatron_param: str, hf_param) -> SimpleNamespace:
@@ -603,9 +710,7 @@ def test_megatron_prepare_for_training_leaves_native_cpu_optimizer_placement():
 
 def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():
     """_set_moe_grad_scale_func should set/clear moe_grad_scale_func on the config."""
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
+    MegatronPolicyWorkerImpl = _isolated_worker_test_module().MegatronPolicyWorkerImpl
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     model_config = SimpleNamespace()
@@ -624,9 +729,7 @@ def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():
 
 def test_set_moe_grad_scale_func_handles_float16module_wrapper():
     """_get_model_config should unwrap a Float16Module-style .module.config."""
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
+    MegatronPolicyWorkerImpl = _isolated_worker_test_module().MegatronPolicyWorkerImpl
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     inner_config = SimpleNamespace()
@@ -641,9 +744,7 @@ def test_set_moe_grad_scale_func_handles_float16module_wrapper():
 
 def test_set_moe_grad_scale_func_noop_when_no_config():
     """A model without a resolvable config should be a no-op, not an error."""
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
+    MegatronPolicyWorkerImpl = _isolated_worker_test_module().MegatronPolicyWorkerImpl
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.model = SimpleNamespace()  # no .config and no .module
@@ -654,9 +755,7 @@ def test_set_moe_grad_scale_func_noop_when_no_config():
 
 def test_compute_moe_grad_scale_normalizes_by_valid_tokens():
     """_compute_moe_grad_scale should yield loss_scale = 1/global_valid_toks."""
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
+    MegatronPolicyWorkerImpl = _isolated_worker_test_module().MegatronPolicyWorkerImpl
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
 
@@ -668,9 +767,7 @@ def test_compute_moe_grad_scale_normalizes_by_valid_tokens():
 
 def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
     """clamp(min=1) must guard against division by zero when no valid tokens."""
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
+    MegatronPolicyWorkerImpl = _isolated_worker_test_module().MegatronPolicyWorkerImpl
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
 

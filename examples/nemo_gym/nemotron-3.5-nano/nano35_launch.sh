@@ -61,6 +61,8 @@ set -euo pipefail
 #   NRL_MAX_STEPS=                         Override grpo.max_num_steps
 #   EXTRA_MOUNTS=                          Comma-separated host:container pairs
 #   USE_SNAPSHOT=1                         Snapshot source tree at submission
+#   IMPLICIT_CODE_OVERLAYS_ENABLED=1       Automatic RW code overlays; set 0
+#                                          with an authenticated full-root mount
 #   USE_CUSTOM_VLLM=0                      1 to source a custom vLLM checkout
 #   DRY_RUN=0                              1 to print TRAIN_CMD and exit
 #   INTERACTIVE=0                          1 to bring up Ray and idle for attach
@@ -474,6 +476,27 @@ NRL_VLLM_CACHE_SEED_DIR="/tmp/nemo_rl_vllm_cache_warm"
 INDUCTOR_CACHE_DIR="/tmp/nemo_rl_inductor_cache"
 TRITON_CACHE_DIR="/tmp/nemo_rl_triton_cache"
 CACHE_SYNC_FREQUENCY="${CACHE_SYNC_FREQUENCY:-0}"
+CACHE_SEED_ENABLED="${CACHE_SEED_ENABLED:-1}"
+case "${CACHE_SEED_ENABLED}" in
+  0|1) ;;
+  *)
+    echo "ERROR: CACHE_SEED_ENABLED must be 0 or 1, got: ${CACHE_SEED_ENABLED}" >&2
+    exit 1
+    ;;
+esac
+
+# The validated cold-cache mode also removes Python/Hugging Face executable
+# caches from the shared filesystem boundary.  Fix the locations instead of
+# accepting caller-controlled paths that could redirect the recursive cleanup.
+if [[ "${CACHE_SEED_ENABLED}" == "0" ]]; then
+  HOME="/tmp/nemo_rl_home"
+  HF_HOME="/tmp/nemo_rl_hf_home"
+  HF_MODULES_CACHE="/tmp/nemo_rl_hf_modules_cache"
+  HF_HUB_CACHE="${HF_HOME}/hub"
+  HF_DATASETS_CACHE="${HF_HOME}/datasets"
+  HF_HUB_OFFLINE=1
+  TRANSFORMERS_OFFLINE=1
+fi
 
 export LUSTRE_VLLM_CACHE
 export LUSTRE_INDUCTOR_CACHE
@@ -484,6 +507,14 @@ export NRL_VLLM_LOCAL_CACHE_DIR
 export INDUCTOR_CACHE_DIR
 export TRITON_CACHE_DIR
 export CACHE_SYNC_FREQUENCY
+export CACHE_SEED_ENABLED
+export HOME
+export HF_HOME
+export HF_MODULES_CACHE
+export HF_HUB_CACHE
+export HF_DATASETS_CACHE
+export HF_HUB_OFFLINE
+export TRANSFORMERS_OFFLINE
 
 mkdir -p "${LUSTRE_FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
   "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}" \
@@ -604,6 +635,19 @@ fi
 #   /opt/nemo-rl/3rdparty/Gym-workspace/Gym                           — NeMo-Gym
 #   /opt/nemo-rl/3rdparty/vllm                                        — vLLM
 # =============================================================================
+# A validated launcher can mount the complete authenticated NeMo tree read-only
+# and disable the convenience overlays below. Default 1 preserves existing use.
+IMPLICIT_CODE_OVERLAYS_ENABLED="${IMPLICIT_CODE_OVERLAYS_ENABLED:-1}"
+case "${IMPLICIT_CODE_OVERLAYS_ENABLED}" in
+  0|1) ;;
+  *)
+    echo "ERROR: IMPLICIT_CODE_OVERLAYS_ENABLED must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+export IMPLICIT_CODE_OVERLAYS_ENABLED
+
+# BEGIN NANO35_MOUNT_BUILDER
 _append_mount() {
   if [[ -z "${MOUNTS}" ]]; then
     MOUNTS="$1"
@@ -612,21 +656,25 @@ _append_mount() {
   fi
 }
 
-if [[ -d "${OVERLAY_SOURCE}/nemo_rl" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/nemo_rl:/opt/nemo-rl/nemo_rl"
-  echo "  Mount: nemo_rl → /opt/nemo-rl/nemo_rl"
-fi
-if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
-  echo "  Mount: configs → /opt/nemo-rl/examples/configs"
-fi
-if [[ -d "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano:/opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
-  echo "  Mount: Nano 3.5 recipes → /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
-fi
-if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-  echo "  Mount: Gym → /opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+if [[ "${IMPLICIT_CODE_OVERLAYS_ENABLED}" == "1" ]]; then
+  if [[ -d "${OVERLAY_SOURCE}/nemo_rl" ]]; then
+    _append_mount "${OVERLAY_SOURCE}/nemo_rl:/opt/nemo-rl/nemo_rl"
+    echo "  Mount: nemo_rl → /opt/nemo-rl/nemo_rl"
+  fi
+  if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
+    _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
+    echo "  Mount: configs → /opt/nemo-rl/examples/configs"
+  fi
+  if [[ -d "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano" ]]; then
+    _append_mount "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano:/opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
+    echo "  Mount: Nano 3.5 recipes → /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
+  fi
+  if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
+    _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+    echo "  Mount: Gym → /opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+  fi
+else
+  echo "  Automatic code overlays: disabled (authenticated full-root mode)"
 fi
 
 if [[ "${USE_SNAPSHOT}" == "1" ]]; then
@@ -639,6 +687,7 @@ if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
 fi
 
 export MOUNTS
+# END NANO35_MOUNT_BUILDER
 
 # =============================================================================
 # Resolve ray.sub
@@ -664,22 +713,29 @@ export RAY_SUB
 # cache before Ray starts.
 #
 # IMPORTANT: Stale /tmp caches from previous jobs can cause hangs (e.g. the
-# Triton bundler skipping non-empty temp dirs). We rm -rf /tmp caches first,
-# then seed fresh from Lustre.
+# Triton bundler skipping non-empty temp dirs). We always clear them first.
+# CACHE_SEED_ENABLED=0 builds a cold SETUP_COMMAND containing no tar extraction
+# commands; validated gates use it to exclude mutable executable cache inputs.
 # =============================================================================
+# BEGIN NANO35_CACHE_SETUP_BUILDER
 read -r -d '' SETUP_COMMAND <<SETUPEOF || true
-command -v zstd >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq zstd; } 2>/dev/null || true
-echo "[CACHE SEED] Clearing stale /tmp caches and seeding from Lustre..."
-WARM_SEED="${NRL_VLLM_CACHE_SEED_DIR}"
+echo "[CACHE SEED] Clearing stale /tmp caches..."
 LOCAL_IND="${INDUCTOR_CACHE_DIR}"
 LOCAL_TRI="${TRITON_CACHE_DIR}"
-CACHE_READ="${CACHE_READ_DIR}"
 
 # vLLM caches are per-instance (VLLM_CACHE_ROOT_{seed}). Clear ALL from prior jobs.
 rm -rf /tmp/nemo_rl_vllm_cache /tmp/nemo_rl_vllm_cache_*
+rm -rf "${NRL_VLLM_CACHE_SEED_DIR}"
 rm -rf "\$LOCAL_IND" "\$LOCAL_TRI"
 mkdir -p "\$LOCAL_IND" "\$LOCAL_TRI"
+SETUPEOF
 
+if [[ "${CACHE_SEED_ENABLED}" == "1" ]]; then
+  read -r -d '' CACHE_SEED_COMMAND <<SETUPEOF || true
+command -v zstd >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq zstd; } 2>/dev/null || true
+echo "[CACHE SEED] Seeding authenticated node-local caches from Lustre..."
+WARM_SEED="${NRL_VLLM_CACHE_SEED_DIR}"
+CACHE_READ="${CACHE_READ_DIR}"
 _seed_cache() {
   local tarball="\$1" local_dir="\$2" name="\$3"
   if [ -f "\$tarball" ]; then
@@ -708,7 +764,20 @@ _seed_cache "\$CACHE_READ/triton_cache.tar.zst" "\$LOCAL_TRI" "Triton"
 
 echo "[CACHE SEED] Done."
 SETUPEOF
+  SETUP_COMMAND+=$'\n'
+  SETUP_COMMAND+="${CACHE_SEED_COMMAND}"
+else
+  read -r -d '' COLD_CACHE_COMMAND <<SETUPEOF || true
+echo "[CACHE SEED] Cold mode enabled; warm executable-cache inputs are disabled."
+rm -rf "${HOME}" "${HF_HOME}" "${HF_MODULES_CACHE}"
+rm -rf "/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default}"
+mkdir -p "${HOME}" "${HF_HOME}" "${HF_MODULES_CACHE}"
+SETUPEOF
+  SETUP_COMMAND+=$'\n'
+  SETUP_COMMAND+="${COLD_CACHE_COMMAND}"
+fi
 export SETUP_COMMAND
+# END NANO35_CACHE_SETUP_BUILDER
 
 # =============================================================================
 # Build the training command
@@ -717,6 +786,23 @@ export SETUP_COMMAND
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
+# BEGIN NANO35_OPTIONAL_HF_CACHE_ENV_BUILDER
+# An empty cache environment variable is not equivalent to an absent one:
+# huggingface_hub/transformers use getenv(), so an empty HF_MODULES_CACHE would
+# mask the normal HF_HOME-derived location.  Emit only nonempty cache paths and
+# quote their values for the later bash -c parse of TRAIN_CMD.  Cold-cache mode
+# assigns all four fixed /tmp paths above, so it continues to emit all of them.
+HF_CACHE_ENV_SOURCE=""
+for _hf_cache_name in HF_HOME HF_MODULES_CACHE HF_HUB_CACHE HF_DATASETS_CACHE; do
+  _hf_cache_value="${!_hf_cache_name:-}"
+  if [[ -n "${_hf_cache_value}" ]]; then
+    printf -v _hf_cache_quoted '%q' "${_hf_cache_value}"
+    HF_CACHE_ENV_SOURCE+="${_hf_cache_name}=${_hf_cache_quoted} "
+  fi
+done
+unset _hf_cache_name _hf_cache_value _hf_cache_quoted
+# END NANO35_OPTIONAL_HF_CACHE_ENV_BUILDER
+
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${VLLM_ENV_SOURCE}\
 OMP_NUM_THREADS=16 \
@@ -735,10 +821,13 @@ VLLM_USE_FLASHINFER_MOE_FP8=1 \
 VLLM_FLASHINFER_MOE_BACKEND=latency \
 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \
 NRL_WG_USE_RAY_REF=1 \
-HF_HOME=${HF_HOME:-} \
+${HF_CACHE_ENV_SOURCE}\
+HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0} \
+TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0} \
 HF_TOKEN=\${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ${TRAIN_ENTRYPOINT} \
+UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv \
+/root/.local/bin/uv run --no-sync ${TRAIN_ENTRYPOINT} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
@@ -819,6 +908,14 @@ echo ""
   echo "commit: $(git -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "dirty: $(git -C "${PROJECT_ROOT}" status --porcelain 2>/dev/null | head -20)"
   echo "snapshot: ${USE_SNAPSHOT}"
+  echo "cache_seed_enabled: ${CACHE_SEED_ENABLED}"
+  echo "implicit_code_overlays_enabled: ${IMPLICIT_CODE_OVERLAYS_ENABLED}"
+  echo "container_instance_policy: ${CONTAINER_INSTANCE_POLICY:-job_scoped_named_interactive}"
+  echo "home: ${HOME}"
+  echo "hf_home: ${HF_HOME:-}"
+  echo "hf_modules_cache: ${HF_MODULES_CACHE:-}"
+  echo "hf_hub_offline: ${HF_HUB_OFFLINE:-0}"
+  echo "transformers_offline: ${TRANSFORMERS_OFFLINE:-0}"
   if [[ "${USE_SNAPSHOT}" == "1" ]]; then
     echo "snapshot_dir: ${SNAPSHOT_DIR}"
   fi

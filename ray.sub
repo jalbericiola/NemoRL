@@ -24,6 +24,23 @@
 
 set -eoux pipefail
 
+# Slurm injects the allocation identity into every job step, but the Ray head
+# intentionally removes all SLURM_* variables before starting Ray so MPI clients
+# do not inherit a stale launcher context. Preserve only the two immutable job
+# identity fields under a neutral namespace before that purge. These values then
+# remain available to the direct driver command for fail-closed provenance.
+if [[ ! "${SLURM_JOB_ID:-}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[FATAL] SLURM_JOB_ID is missing or malformed" >&2
+  exit 1
+fi
+if [[ -z "${SLURM_JOB_NAME:-}" ]]; then
+  echo "[FATAL] SLURM_JOB_NAME is missing" >&2
+  exit 1
+fi
+readonly NRL_SLURM_JOB_ID="$SLURM_JOB_ID"
+readonly NRL_SLURM_JOB_NAME="$SLURM_JOB_NAME"
+export NRL_SLURM_JOB_ID NRL_SLURM_JOB_NAME
+
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
 
@@ -33,9 +50,62 @@ log_phase() {
 }
 log_phase "ray.sub started (job=${SLURM_JOB_ID:-?} nodes=${SLURM_JOB_NUM_NODES:-?} partition=${SLURM_JOB_PARTITION:-?} node=$(hostname))"
 
-# Log a final marker on exit; trap TERM/HUP/INT too so a scancel/time-limit kill is still stamped.
-_nrl_log_exit() { local rc=$?; trap - EXIT; log_phase "ray.sub exiting (exit_code=$rc)"; exit $rc; }
-trap _nrl_log_exit EXIT TERM HUP INT
+# Preserve the real shell status on EXIT and map asynchronous signals to their
+# conventional non-zero statuses. A shared handler that reads `$?` for TERM/HUP/INT
+# can report zero when the interrupted command was successful, which would turn a
+# cancelled allocation into false completion evidence.
+_nrl_finish_exit() {
+  local rc="$1"
+  local reason="$2"
+  local job_id="${SLURM_JOB_ID:-unavailable}"
+  local restart_count="${JOB_RESTART_COUNT:-${SLURM_RESTART_COUNT:-0}}"
+  local session_name="unavailable"
+  local expected_workers="unavailable"
+  local completion_status="failed"
+  trap - EXIT
+  trap '' TERM HUP INT
+  set +e
+  # Disable xtrace before rendering the control-plane receipt. Otherwise both the
+  # function invocation and its echo/printf command can duplicate a success marker
+  # across Slurm stdout/stderr, making exact completion ambiguous.
+  set +x
+  if [[ -n "${LOG_DIR:-}" ]]; then
+    touch "$LOG_DIR/ENDED" 2>/dev/null || true
+    if [[ -f "$LOG_DIR/RAY_SESSION_NAME" && ! -L "$LOG_DIR/RAY_SESSION_NAME" ]]; then
+      IFS= read -r session_name < "$LOG_DIR/RAY_SESSION_NAME" || session_name="unavailable"
+      [[ "$session_name" =~ ^session_[A-Za-z0-9._-]+$ ]] || session_name="unavailable"
+    fi
+  fi
+  [[ "$job_id" =~ ^[0-9]+$ ]] || job_id="unavailable"
+  [[ "$restart_count" =~ ^[0-9]+$ ]] || restart_count="unavailable"
+  if [[ "${SLURM_JOB_NUM_NODES:-}" =~ ^[1-9][0-9]*$ ]]; then
+    expected_workers=$((SLURM_JOB_NUM_NODES - 1))
+  fi
+  # Publish success evidence only from the zero-status EXIT path, after all
+  # head/worker finalizers and the job receipt have completed. Signals are ignored
+  # above, so no later asynchronous trap can turn a published success into failure.
+  if [[ "$rc" -eq 0 ]]; then
+    if [[ "$session_name" == "unavailable" ]] || \
+       [[ "$expected_workers" == "unavailable" ]] || \
+       ! publish-runtime-artifact-manifest "$session_name" "$expected_workers"; then
+      echo "[ERROR] Failed to publish sealed Ray runtime artifact manifest" >&2
+      rc=1
+    fi
+  fi
+  [[ "$rc" -eq 0 ]] && completion_status="complete"
+  log_phase "ray.sub termination reason=$reason"
+  printf '[NRL_JOB_COMPLETION] schema=ray-session-completion-v1 role=job job_id=%s restart_count=%s session=%s status=%s exit_code=%s\n' \
+    "$job_id" "$restart_count" "$session_name" "$completion_status" "$rc"
+  exit "$rc"
+}
+_nrl_on_exit() { local rc=$?; _nrl_finish_exit "$rc" EXIT; }
+_nrl_on_term() { _nrl_finish_exit 143 TERM; }
+_nrl_on_hup() { _nrl_finish_exit 129 HUP; }
+_nrl_on_int() { _nrl_finish_exit 130 INT; }
+trap _nrl_on_exit EXIT
+trap _nrl_on_term TERM
+trap _nrl_on_hup HUP
+trap _nrl_on_int INT
 
 ########################################################
 # Function to detect if SLURM cluster uses GRES
@@ -100,6 +170,48 @@ CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
+# BEGIN RAY_CONTAINER_WORKDIR_POLICY
+container-workdir-text-is-safe() {
+  local path="$1"
+  (( ${#path} <= 4096 )) || return 1
+  # Keep this deliberately narrower than arbitrary filesystem path text: every
+  # accepted value is later embedded in a whitespace-separated srun argument
+  # string.  These four punctuation characters are
+  # shell-word safe and restore support for common sweep/version directories
+  # (for example, lr=1e-6+mtp@owner:run) without admitting expansion or command
+  # separators.
+  [[ "$path" =~ ^/[A-Za-z0-9._/@+=:-]+$ ]] || return 1
+  [[ "$path" != *//* && "$path" != */ ]] || return 1
+  case "/${path#/}/" in
+    */./*|*/../*) return 1 ;;
+  esac
+}
+
+# The Slurm submit directory remains the backwards-compatible default. Callers
+# whose host checkout is mounted at a different in-container path must set the
+# container namespace path explicitly; it cannot be canonicalized on the host.
+CONTAINER_CWD="${CONTAINER_CWD-${SLURM_SUBMIT_DIR-}}"
+if ! container-workdir-text-is-safe "$CONTAINER_CWD"; then
+  printf "Error: CONTAINER_CWD must be a normalized absolute container path using only letters, digits, '.', '_', '/', '-', '+', '=', '@', and ':'; got %q.\n" "$CONTAINER_CWD" >&2
+  exit 1
+fi
+export CONTAINER_CWD
+readonly CONTAINER_CWD
+# END RAY_CONTAINER_WORKDIR_POLICY
+CONTAINER_INSTANCE_POLICY=${CONTAINER_INSTANCE_POLICY:-job_scoped_named_interactive}
+case "$CONTAINER_INSTANCE_POLICY" in
+  anonymous_fresh_noninteractive|job_scoped_named_interactive) ;;
+  *)
+    echo "Error: CONTAINER_INSTANCE_POLICY must be anonymous_fresh_noninteractive or job_scoped_named_interactive, got '$CONTAINER_INSTANCE_POLICY'." >&2
+    exit 1
+    ;;
+esac
+if [[ "$CONTAINER_INSTANCE_POLICY" == "anonymous_fresh_noninteractive" ]] && \
+   [[ -z "$COMMAND" ]]; then
+  echo "Error: anonymous fresh containers do not support idle/attach mode; COMMAND is required." >&2
+  exit 1
+fi
+export CONTAINER_INSTANCE_POLICY
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-1301}
@@ -173,8 +285,64 @@ fi
 MIN_WORKER_PORT=${MIN_WORKER_PORT:-2000}
 MAX_WORKER_PORT=${MAX_WORKER_PORT:-2999}
 ########################################################
-# Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
+# Number seconds to sync logs from the head-authenticated Ray session to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
+# Maximum seconds a worker may wait for its local Ray session to resolve to the
+# session name authenticated by the head. This is intentionally independent of
+# log-sync frequency: provenance is mandatory even when periodic log sync is off.
+RAY_SESSION_ATTEST_TIMEOUT=${RAY_SESSION_ATTEST_TIMEOUT:-300}
+if ! [[ "$RAY_SESSION_ATTEST_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Error: RAY_SESSION_ATTEST_TIMEOUT must be a positive integer, got '$RAY_SESSION_ATTEST_TIMEOUT'." >&2
+  exit 1
+fi
+
+# BEGIN RAY_FINAL_SYNC_WATCHDOG_POLICY
+ray-final-sync-watchdog-seconds() {
+  local node_count="$1"
+  local base_seconds="$2"
+  local per_node_seconds="$3"
+  local maximum_seconds="$4"
+  local additional_nodes additional_seconds
+
+  [[ "$node_count" =~ ^[1-9][0-9]*$ && ${#node_count} -le 6 ]] || return 1
+  [[ "$base_seconds" =~ ^[1-9][0-9]*$ && ${#base_seconds} -le 5 ]] || return 1
+  [[ "$per_node_seconds" =~ ^(0|[1-9][0-9]*)$ && ${#per_node_seconds} -le 5 ]] || return 1
+  [[ "$maximum_seconds" =~ ^[1-9][0-9]*$ && ${#maximum_seconds} -le 5 ]] || return 1
+  (( base_seconds <= 86400 )) || return 1
+  (( per_node_seconds <= 86400 )) || return 1
+  (( maximum_seconds <= 86400 && maximum_seconds >= base_seconds )) || return 1
+
+  additional_nodes=$((node_count - 1))
+  if (( per_node_seconds == 0 )); then
+    printf '%s\n' "$base_seconds"
+  elif (( additional_nodes > (maximum_seconds - base_seconds) / per_node_seconds )); then
+    printf '%s\n' "$maximum_seconds"
+  else
+    additional_seconds=$((additional_nodes * per_node_seconds))
+    printf '%s\n' "$((base_seconds + additional_seconds))"
+  fi
+}
+# END RAY_FINAL_SYNC_WATCHDOG_POLICY
+
+# Final log copies run concurrently to distinct node-specific trees, but their
+# aggregate shared-filesystem bandwidth can still fall as allocation size grows.
+# Preserve the historical five-minute floor for small jobs, budget another 15
+# seconds per additional node, and use a one-hour fail-closed ceiling by default.
+RAY_FINAL_SYNC_BASE_TIMEOUT_SECONDS=${RAY_FINAL_SYNC_BASE_TIMEOUT_SECONDS:-300}
+RAY_FINAL_SYNC_PER_NODE_TIMEOUT_SECONDS=${RAY_FINAL_SYNC_PER_NODE_TIMEOUT_SECONDS:-15}
+RAY_FINAL_SYNC_MAX_TIMEOUT_SECONDS=${RAY_FINAL_SYNC_MAX_TIMEOUT_SECONDS:-3600}
+readonly RAY_FINAL_SYNC_BASE_TIMEOUT_SECONDS
+readonly RAY_FINAL_SYNC_PER_NODE_TIMEOUT_SECONDS
+readonly RAY_FINAL_SYNC_MAX_TIMEOUT_SECONDS
+if ! RAY_FINAL_SYNC_WATCHDOG_SECONDS=$(ray-final-sync-watchdog-seconds \
+  "$SLURM_JOB_NUM_NODES" \
+  "$RAY_FINAL_SYNC_BASE_TIMEOUT_SECONDS" \
+  "$RAY_FINAL_SYNC_PER_NODE_TIMEOUT_SECONDS" \
+  "$RAY_FINAL_SYNC_MAX_TIMEOUT_SECONDS"); then
+  echo "Error: invalid Ray final-sync timeout policy: nodes='$SLURM_JOB_NUM_NODES', base='$RAY_FINAL_SYNC_BASE_TIMEOUT_SECONDS', per_node='$RAY_FINAL_SYNC_PER_NODE_TIMEOUT_SECONDS', maximum='$RAY_FINAL_SYNC_MAX_TIMEOUT_SECONDS'." >&2
+  exit 1
+fi
+readonly RAY_FINAL_SYNC_WATCHDOG_SECONDS
 ########################################################
 
 # Unset UV_CACHE_DIR to avoid local cache directory interferring with the container cache
@@ -202,6 +370,35 @@ else
   LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 fi
 mkdir -p $LOG_DIR
+JOB_RESTART_COUNT="${SLURM_RESTART_COUNT:-0}"
+RAY_SESSION_COMPLETION_DIR="$LOG_DIR/RAY_SESSION_COMPLETIONS"
+RAY_JOB_COMPLETION_RECEIPT="$LOG_DIR/RAY_JOB_COMPLETION"
+RAY_RUNTIME_ARTIFACT_MANIFEST="$LOG_DIR/RAY_RUNTIME_ARTIFACTS.json"
+RUNTIME_ARTIFACT_MANIFEST_HELPER="$LOG_DIR/runtime_artifact_manifest.py"
+WORKER_FINALIZE_REQUEST="$LOG_DIR/WORKER_FINALIZE_REQUEST"
+
+# BEGIN RAY_CONTAINER_INSTANCE_ARG_HELPER
+ray-container-instance-arg() {
+  local role="$1"
+  case "$CONTAINER_INSTANCE_POLICY" in
+    anonymous_fresh_noninteractive)
+      # Omitting --container-name forces Pyxis/Enroot to instantiate the image
+      # for this srun instead of reopening a named, mutable rootfs.
+      return 0
+      ;;
+    job_scoped_named_interactive)
+      [[ "$role" == head || "$role" == worker ]] || return 1
+      printf '%s' "--container-name=ray-${role}-${SLURM_JOB_ID}-${JOB_RESTART_COUNT}"
+      ;;
+    *) return 1 ;;
+  esac
+}
+# END RAY_CONTAINER_INSTANCE_ARG_HELPER
+
+HEAD_CONTAINER_INSTANCE_ARG="$(ray-container-instance-arg head)"
+WORKER_CONTAINER_INSTANCE_ARG="$(ray-container-instance-arg worker)"
+readonly HEAD_CONTAINER_INSTANCE_ARG WORKER_CONTAINER_INSTANCE_ARG
+echo "[INFO] Container instance policy: $CONTAINER_INSTANCE_POLICY"
 
 # LOG_DIR must be shared across all nodes. Write a canary the head and worker
 # containers check at startup: a node that can't see it isn't on the shared FS, so
@@ -252,7 +449,7 @@ COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
-COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+COMMON_SRUN_ARGS+=" --container-workdir=$CONTAINER_CWD"
 # Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
@@ -584,6 +781,708 @@ RAY_RESOURCES+='}'
 export RAY_RESOURCES
 TOPO_PROBE_EOF
 
+# Shared final-sync helpers. Periodic diagnostic copies use a separate untrusted
+# tree; only this helper may create the evaluator-visible `ray/.../logs` tree.
+# Each final target has its own mkdir lock, so duplicate publication fails closed
+# while distinct head/worker targets copy concurrently. The final directory
+# appears with one same-filesystem rename only after a complete copy.
+FINAL_SYNC_HELPER_SCRIPT="$LOG_DIR/final_sync_helpers.sh"
+cat > "$FINAL_SYNC_HELPER_SCRIPT" <<'FINAL_SYNC_HELPER_EOF'
+sync-live-ray-logs() {
+  local source_logs="$1"
+  local live_logs="$2"
+  [[ -d "$source_logs" ]] || return 1
+  mkdir -p "$live_logs" || return 1
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a -- "$source_logs/" "$live_logs/" >/dev/null 2>&1
+  else
+    cp -a -- "$source_logs/." "$live_logs/"
+  fi
+}
+
+atomic-final-ray-logs() {
+  local source_logs="$1"
+  local final_logs="$2"
+  local role="$3"
+  local log_root="${NRL_PROVENANCE_LOG_DIR:?missing NRL_PROVENANCE_LOG_DIR}"
+  local final_parent lock_dir tmp
+
+  [[ "$role" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [[ -d "$source_logs" && ! -L "$source_logs" ]] || return 1
+  case "$final_logs" in
+    "$log_root"/ray/*/logs) ;;
+    *) return 1 ;;
+  esac
+
+  final_parent="${final_logs%/logs}"
+  mkdir -p "$final_parent" || return 1
+  lock_dir="$final_parent/.logs.final-publish-lock"
+  # Exactly one process owns a target. A second publisher is a provenance
+  # violation, not routine contention, so fail immediately instead of waiting.
+  mkdir "$lock_dir" 2>/dev/null || return 1
+  tmp="$final_parent/.logs.final-${role}-$$"
+  if [[ -e "$final_logs" || -L "$final_logs" || -e "$tmp" || -L "$tmp" ]]; then
+    rmdir "$lock_dir" 2>/dev/null || true
+    return 1
+  fi
+  if ! mkdir "$tmp"; then
+    rmdir "$lock_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  if command -v rsync >/dev/null 2>&1; then
+    if ! rsync -a -- "$source_logs/" "$tmp/"; then
+      rm -rf -- "$tmp"
+      rmdir "$lock_dir" 2>/dev/null || true
+      return 1
+    fi
+  elif ! cp -a -- "$source_logs/." "$tmp/"; then
+    rm -rf -- "$tmp"
+    rmdir "$lock_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  if ! mv -- "$tmp" "$final_logs"; then
+    rm -rf -- "$tmp"
+    rmdir "$lock_dir" 2>/dev/null || true
+    return 1
+  fi
+  rmdir "$lock_dir" || return 1
+}
+
+atomic-write-provenance-file() {
+  local final_path="$1"
+  local log_root="${NRL_PROVENANCE_LOG_DIR:?missing NRL_PROVENANCE_LOG_DIR}"
+  local tmp_path
+  case "$final_path" in
+    "$log_root"/RAY_SESSION_COMPLETIONS/*|\
+    "$log_root"/RAY_JOB_COMPLETION|\
+    "$log_root"/WORKER_FINALIZE_REQUEST) ;;
+    *) return 1 ;;
+  esac
+  [[ ! -e "$final_path" && ! -L "$final_path" ]] || return 1
+  mkdir -p "${final_path%/*}" || return 1
+  tmp_path="${final_path%/*}/.${final_path##*/}.$$"
+  [[ ! -e "$tmp_path" && ! -L "$tmp_path" ]] || return 1
+  umask 077
+  cat > "$tmp_path" || return 1
+  mv -- "$tmp_path" "$final_path"
+}
+
+provenance-file-matches() {
+  local path="$1"
+  local expected="$2"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  [[ "$(cat -- "$path")" == "$expected" ]]
+}
+FINAL_SYNC_HELPER_EOF
+chmod 500 "$FINAL_SYNC_HELPER_SCRIPT"
+NRL_PROVENANCE_LOG_DIR="$LOG_DIR"
+source "$FINAL_SYNC_HELPER_SCRIPT"
+
+# The submit-side EXIT handler runs this helper only after the driver, head, and
+# all expected workers have completed successfully. Keep the implementation in a
+# standalone file so the JSON encoding and fd-relative integrity checks do not
+# depend on shell escaping or locale-specific coreutils output.
+cat > "$RUNTIME_ARTIFACT_MANIFEST_HELPER" <<'RUNTIME_ARTIFACT_MANIFEST_HELPER_EOF'
+# BEGIN RAY_RUNTIME_ARTIFACT_MANIFEST_HELPER
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+SCHEMA = "ray-runtime-artifacts-v1"
+ARTIFACT_MODE = 0o444
+DIRECTORY_MODE = 0o555
+SESSION_PATTERN = re.compile(r"^session_[A-Za-z0-9._-]+$")
+
+
+def _mode_string(mode: int) -> str:
+    return f"{stat.S_IMODE(mode):04o}"
+
+
+def _open_directory(path: str) -> int:
+    path_stat = os.lstat(path)
+    if not stat.S_ISDIR(path_stat.st_mode) or stat.S_ISLNK(path_stat.st_mode):
+        raise ValueError(f"evidence directory is not a concrete directory: {path}")
+    directory_fd = os.open(
+        path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    fd_stat = os.fstat(directory_fd)
+    if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+        os.close(directory_fd)
+        raise RuntimeError(f"evidence directory changed while opening: {path}")
+    return directory_fd
+
+
+def _directory_identity(path: str, directory_fd: int) -> dict[str, object]:
+    directory_stat = os.fstat(directory_fd)
+    return {
+        "path": path,
+        "mode": _mode_string(directory_stat.st_mode),
+        "device": directory_stat.st_dev,
+        "inode": directory_stat.st_ino,
+    }
+
+
+def _verify_directory_path(
+    *,
+    identity: dict[str, object],
+    directory_fd: int,
+    parent_fd: int | None = None,
+    filename: str | None = None,
+) -> None:
+    if parent_fd is None:
+        path_stat = os.lstat(identity["path"])
+    else:
+        if filename is None:
+            raise ValueError("directory filename is required with a parent fd")
+        path_stat = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+    fd_stat = os.fstat(directory_fd)
+    expected = (identity["device"], identity["inode"], identity["mode"])
+    actual = (
+        path_stat.st_dev,
+        path_stat.st_ino,
+        _mode_string(path_stat.st_mode),
+    )
+    fd_actual = (
+        fd_stat.st_dev,
+        fd_stat.st_ino,
+        _mode_string(fd_stat.st_mode),
+    )
+    if (
+        not stat.S_ISDIR(path_stat.st_mode)
+        or stat.S_ISLNK(path_stat.st_mode)
+        or actual != expected
+        or fd_actual != expected
+    ):
+        raise RuntimeError(f"sealed evidence directory identity changed: {identity['path']}")
+
+
+def _require_exact_entries(
+    directory_fd: int,
+    *,
+    path: str,
+    expected_entries: list[str],
+) -> None:
+    actual_entries = sorted(os.listdir(directory_fd))
+    if actual_entries != sorted(expected_entries):
+        raise ValueError(
+            f"unexpected evidence directory contents for {path}: "
+            f"expected={sorted(expected_entries)!r}, actual={actual_entries!r}"
+        )
+
+
+def _entry_exists(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _sha256_fd(file_fd: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(file_fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(file_fd, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _seal_artifact(
+    *,
+    artifact_name: str,
+    filename: str,
+    parent_path: str,
+    parent_fd: int,
+) -> tuple[int, dict[str, object]]:
+    path_stat = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISREG(path_stat.st_mode) or stat.S_ISLNK(path_stat.st_mode):
+        raise ValueError(f"runtime artifact is not a concrete regular file: {parent_path}/{filename}")
+    file_fd = os.open(
+        filename,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    fd_stat = os.fstat(file_fd)
+    if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+        os.close(file_fd)
+        raise RuntimeError(f"runtime artifact changed while opening: {parent_path}/{filename}")
+
+    os.fchmod(file_fd, ARTIFACT_MODE)
+    os.fsync(file_fd)
+    sha256 = _sha256_fd(file_fd)
+    sealed_stat = os.fstat(file_fd)
+    if _mode_string(sealed_stat.st_mode) != "0444":
+        os.close(file_fd)
+        raise RuntimeError(f"runtime artifact did not seal read-only: {parent_path}/{filename}")
+    return file_fd, {
+        "name": artifact_name,
+        "path": os.path.join(parent_path, filename),
+        "sha256": sha256,
+        "size": sealed_stat.st_size,
+        "mode": _mode_string(sealed_stat.st_mode),
+        "device": sealed_stat.st_dev,
+        "inode": sealed_stat.st_ino,
+        "mtime_ns": sealed_stat.st_mtime_ns,
+    }
+
+
+def _verify_artifact_path(
+    *,
+    artifact: dict[str, object],
+    filename: str,
+    parent_fd: int,
+    file_fd: int,
+) -> None:
+    sha256 = _sha256_fd(file_fd)
+    path_stat = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+    fd_stat = os.fstat(file_fd)
+    expected = (
+        artifact["device"],
+        artifact["inode"],
+        artifact["size"],
+        artifact["mtime_ns"],
+        artifact["mode"],
+    )
+    actual = (
+        path_stat.st_dev,
+        path_stat.st_ino,
+        path_stat.st_size,
+        path_stat.st_mtime_ns,
+        _mode_string(path_stat.st_mode),
+    )
+    fd_actual = (
+        fd_stat.st_dev,
+        fd_stat.st_ino,
+        fd_stat.st_size,
+        fd_stat.st_mtime_ns,
+        _mode_string(fd_stat.st_mode),
+    )
+    if actual != expected or fd_actual != expected or sha256 != artifact["sha256"]:
+        raise RuntimeError(f"sealed runtime artifact identity changed: {artifact['path']}")
+
+
+def _write_all(file_fd: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(file_fd, payload[offset:])
+        if written <= 0:
+            raise OSError("short write while publishing runtime artifact manifest")
+        offset += written
+
+
+def _read_receipt(file_fd: int, *, path: object) -> str:
+    receipt_stat = os.fstat(file_fd)
+    if receipt_stat.st_size > 1024 * 1024:
+        raise ValueError(f"runtime provenance receipt is unexpectedly large: {path}")
+    os.lseek(file_fd, 0, os.SEEK_SET)
+    payload = os.read(file_fd, receipt_stat.st_size + 1)
+    if len(payload) != receipt_stat.st_size:
+        raise RuntimeError(f"runtime provenance receipt changed while reading: {path}")
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"runtime provenance receipt is not UTF-8: {path}") from error
+
+
+def _validate_receipt_contents(
+    *,
+    artifact_handles: list[dict[str, object]],
+    job_id: str,
+    restart_count: int,
+    session: str,
+    expected_workers: int,
+) -> None:
+    handles_by_name = {handle["artifact"]["name"]: handle for handle in artifact_handles}
+
+    def receipt(name: str) -> str:
+        handle = handles_by_name[name]
+        return _read_receipt(
+            handle["file_fd"],
+            path=handle["artifact"]["path"],
+        )
+
+    if receipt("session_name") != f"{session}\n":
+        raise ValueError("RAY_SESSION_NAME does not match the manifest session")
+
+    head_attestation = receipt("attestation/head")
+    head_match = re.fullmatch(
+        rf"role=head\nnode=([A-Za-z0-9][A-Za-z0-9._-]*)\nsession={re.escape(session)}\n",
+        head_attestation,
+    )
+    if head_match is None:
+        raise ValueError("head session attestation is malformed")
+    head_node = head_match.group(1)
+    expected_head_completion = (
+        "schema=ray-session-completion-v1\n"
+        "role=head\n"
+        f"job_id={job_id}\n"
+        f"restart_count={restart_count}\n"
+        f"node={head_node}\n"
+        f"session={session}\n"
+        "exit_code=0\n"
+        "sync=complete\n"
+    )
+    if receipt("completion/head") != expected_head_completion:
+        raise ValueError("head completion receipt is malformed")
+
+    for worker_index in range(expected_workers):
+        worker_attestation = receipt(f"attestation/worker-{worker_index}")
+        worker_match = re.fullmatch(
+            rf"role=worker\nworker_index={worker_index}\n"
+            rf"node=([A-Za-z0-9][A-Za-z0-9._-]*)\n"
+            rf"session={re.escape(session)}\n",
+            worker_attestation,
+        )
+        if worker_match is None:
+            raise ValueError(f"worker {worker_index} session attestation is malformed")
+        worker_node = worker_match.group(1)
+        expected_worker_completion = (
+            "schema=ray-session-completion-v1\n"
+            "role=worker\n"
+            f"worker_index={worker_index}\n"
+            f"job_id={job_id}\n"
+            f"restart_count={restart_count}\n"
+            f"node={worker_node}\n"
+            f"session={session}\n"
+            "exit_code=0\n"
+            "sync=complete\n"
+        )
+        if receipt(f"completion/worker-{worker_index}") != expected_worker_completion:
+            raise ValueError(f"worker {worker_index} completion receipt is malformed")
+
+    expected_job_completion = (
+        "schema=ray-session-completion-v1\n"
+        "role=job\n"
+        f"job_id={job_id}\n"
+        f"restart_count={restart_count}\n"
+        f"session={session}\n"
+        f"expected_workers={expected_workers}\n"
+        "status=complete\n"
+        "exit_code=0\n"
+    )
+    if receipt("job_completion") != expected_job_completion:
+        raise ValueError("job completion receipt is malformed")
+
+
+def publish_manifest(argv: list[str]) -> None:
+    if len(argv) != 7:
+        raise ValueError(
+            "usage: runtime_artifact_manifest.py " "LOG_DIR MANIFEST JOB_ID RESTART_COUNT SESSION EXPECTED_WORKERS"
+        )
+
+    log_dir = os.path.abspath(argv[1])
+    manifest_path = os.path.abspath(argv[2])
+    job_id = argv[3]
+    restart_count = int(argv[4])
+    session = argv[5]
+    expected_workers = int(argv[6])
+    if manifest_path != os.path.join(log_dir, "RAY_RUNTIME_ARTIFACTS.json"):
+        raise ValueError(f"manifest path is outside the exact log directory: {manifest_path}")
+    if not re.fullmatch(r"[0-9]+", job_id):
+        raise ValueError(f"invalid Slurm job ID: {job_id!r}")
+    if restart_count < 0:
+        raise ValueError(f"invalid restart count: {restart_count}")
+    if not SESSION_PATTERN.fullmatch(session):
+        raise ValueError(f"invalid Ray session name: {session!r}")
+    if expected_workers < 0:
+        raise ValueError(f"invalid expected worker count: {expected_workers}")
+
+    attestation_dir = os.path.join(log_dir, "RAY_SESSION_ATTESTATIONS")
+    completion_dir = os.path.join(log_dir, "RAY_SESSION_COMPLETIONS")
+    directory_fds: dict[str, int] = {}
+    artifact_handles: list[dict[str, object]] = []
+    manifest_fd = -1
+    manifest_published = False
+    temp_name = f".RAY_RUNTIME_ARTIFACTS.json.{os.getpid()}.tmp"
+    final_name = "RAY_RUNTIME_ARTIFACTS.json"
+    original_log_mode = 0
+
+    try:
+        directory_fds["log_dir"] = _open_directory(log_dir)
+        log_fd = directory_fds["log_dir"]
+        original_log_mode = stat.S_IMODE(os.fstat(log_fd).st_mode)
+        directory_fds["session_attestations"] = _open_directory(attestation_dir)
+        directory_fds["session_completions"] = _open_directory(completion_dir)
+
+        if _entry_exists(log_fd, final_name) or _entry_exists(log_fd, temp_name):
+            raise FileExistsError(f"runtime artifact manifest already exists: {manifest_path}")
+
+        worker_receipts = [f"worker-{worker_index}" for worker_index in range(expected_workers)]
+        _require_exact_entries(
+            directory_fds["session_attestations"],
+            path=attestation_dir,
+            expected_entries=["head", *worker_receipts],
+        )
+        _require_exact_entries(
+            directory_fds["session_completions"],
+            path=completion_dir,
+            expected_entries=["head", *worker_receipts],
+        )
+
+        worker_log_width = len(str(expected_workers))
+        worker_logs = [
+            f"ray-worker-{worker_index:0{worker_log_width}d}.log" for worker_index in range(expected_workers)
+        ]
+        actual_worker_logs = sorted(
+            entry for entry in os.listdir(log_fd) if re.fullmatch(r"ray-worker-.*[.]log", entry)
+        )
+        if actual_worker_logs != sorted(worker_logs):
+            raise ValueError(
+                "unexpected Ray worker log set: " f"expected={sorted(worker_logs)!r}, actual={actual_worker_logs!r}"
+            )
+
+        artifact_specs: list[tuple[str, str, str]] = [
+            ("session_name", "log_dir", "RAY_SESSION_NAME"),
+            ("attestation/head", "session_attestations", "head"),
+        ]
+        artifact_specs.extend(
+            (
+                f"attestation/worker-{worker_index}",
+                "session_attestations",
+                f"worker-{worker_index}",
+            )
+            for worker_index in range(expected_workers)
+        )
+        artifact_specs.append(("completion/head", "session_completions", "head"))
+        artifact_specs.extend(
+            (
+                f"completion/worker-{worker_index}",
+                "session_completions",
+                f"worker-{worker_index}",
+            )
+            for worker_index in range(expected_workers)
+        )
+        artifact_specs.extend(
+            [
+                ("job_completion", "log_dir", "RAY_JOB_COMPLETION"),
+                ("log/head", "log_dir", "ray-head.log"),
+                ("log/driver", "log_dir", "ray-driver.log"),
+            ]
+        )
+        artifact_specs.extend(
+            (f"log/worker-{worker_index}", "log_dir", worker_log) for worker_index, worker_log in enumerate(worker_logs)
+        )
+
+        parent_paths = {
+            "log_dir": log_dir,
+            "session_attestations": attestation_dir,
+            "session_completions": completion_dir,
+        }
+        artifacts: list[dict[str, object]] = []
+        for artifact_name, directory_name, filename in artifact_specs:
+            file_fd, artifact = _seal_artifact(
+                artifact_name=artifact_name,
+                filename=filename,
+                parent_path=parent_paths[directory_name],
+                parent_fd=directory_fds[directory_name],
+            )
+            artifacts.append(artifact)
+            artifact_handles.append(
+                {
+                    "artifact": artifact,
+                    "filename": filename,
+                    "directory_name": directory_name,
+                    "file_fd": file_fd,
+                }
+            )
+
+        _validate_receipt_contents(
+            artifact_handles=artifact_handles,
+            job_id=job_id,
+            restart_count=restart_count,
+            session=session,
+            expected_workers=expected_workers,
+        )
+
+        for directory_name in ("session_attestations", "session_completions"):
+            os.fchmod(directory_fds[directory_name], DIRECTORY_MODE)
+            os.fsync(directory_fds[directory_name])
+
+        directories = {
+            "log_dir": {
+                "path": log_dir,
+                "mode": "0555",
+                "device": os.fstat(log_fd).st_dev,
+                "inode": os.fstat(log_fd).st_ino,
+            },
+            "session_attestations": _directory_identity(
+                attestation_dir,
+                directory_fds["session_attestations"],
+            ),
+            "session_completions": _directory_identity(
+                completion_dir,
+                directory_fds["session_completions"],
+            ),
+        }
+        manifest = {
+            "schema": SCHEMA,
+            "manifest_path": manifest_path,
+            "job_id": job_id,
+            "restart_count": restart_count,
+            "session": session,
+            "expected_workers": expected_workers,
+            "artifact_count": len(artifacts),
+            "artifacts": artifacts,
+            "directories": directories,
+            "integrity": {
+                "artifact_mode": "0444",
+                "artifacts_sealed": True,
+                "artifacts_fsynced": True,
+                "directory_mode": "0555",
+                "directories_sealed": True,
+                "directories_fsynced": True,
+                "manifest_mode": "0444",
+                "manifest_sealed": True,
+                "manifest_fsynced": True,
+                "atomic_publish": True,
+            },
+        }
+        payload = (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+        manifest_fd = os.open(
+            temp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=log_fd,
+        )
+        _write_all(manifest_fd, payload)
+        os.fsync(manifest_fd)
+        os.fchmod(manifest_fd, ARTIFACT_MODE)
+        os.fsync(manifest_fd)
+        os.rename(temp_name, final_name, src_dir_fd=log_fd, dst_dir_fd=log_fd)
+        manifest_published = True
+
+        os.fchmod(log_fd, DIRECTORY_MODE)
+        os.fsync(log_fd)
+        _verify_directory_path(
+            identity=directories["log_dir"],
+            directory_fd=log_fd,
+        )
+        _verify_directory_path(
+            identity=directories["session_attestations"],
+            directory_fd=directory_fds["session_attestations"],
+            parent_fd=log_fd,
+            filename="RAY_SESSION_ATTESTATIONS",
+        )
+        _verify_directory_path(
+            identity=directories["session_completions"],
+            directory_fd=directory_fds["session_completions"],
+            parent_fd=log_fd,
+            filename="RAY_SESSION_COMPLETIONS",
+        )
+
+        for handle in artifact_handles:
+            _verify_artifact_path(
+                artifact=handle["artifact"],
+                filename=handle["filename"],
+                parent_fd=directory_fds[handle["directory_name"]],
+                file_fd=handle["file_fd"],
+            )
+        manifest_stat = os.fstat(manifest_fd)
+        if (
+            not stat.S_ISREG(manifest_stat.st_mode)
+            or _mode_string(manifest_stat.st_mode) != "0444"
+            or manifest_stat.st_size != len(payload)
+        ):
+            raise RuntimeError("published runtime artifact manifest did not seal exactly")
+    except (OSError, RuntimeError, TypeError, ValueError):
+        log_fd = directory_fds.get("log_dir", -1)
+        if log_fd >= 0:
+            try:
+                os.fchmod(log_fd, original_log_mode or 0o755)
+                if manifest_published and _entry_exists(log_fd, final_name):
+                    os.unlink(final_name, dir_fd=log_fd)
+                elif _entry_exists(log_fd, temp_name):
+                    os.unlink(temp_name, dir_fd=log_fd)
+                os.fsync(log_fd)
+            except OSError as cleanup_error:
+                print(
+                    f"failed to remove incomplete runtime artifact manifest: {cleanup_error}",
+                    file=sys.stderr,
+                )
+        raise
+    finally:
+        if manifest_fd >= 0:
+            try:
+                os.close(manifest_fd)
+            except OSError:
+                pass
+        for handle in artifact_handles:
+            try:
+                os.close(handle["file_fd"])
+            except OSError:
+                pass
+        for directory_fd in directory_fds.values():
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    try:
+        publish_manifest(sys.argv)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        print(f"runtime artifact manifest publication failed: {error}", file=sys.stderr)
+        raise SystemExit(1)
+# END RAY_RUNTIME_ARTIFACT_MANIFEST_HELPER
+RUNTIME_ARTIFACT_MANIFEST_HELPER_EOF
+chmod 500 "$RUNTIME_ARTIFACT_MANIFEST_HELPER"
+
+publish-runtime-artifact-manifest() {
+  local session_name="$1"
+  local expected_workers="$2"
+  python3 "$RUNTIME_ARTIFACT_MANIFEST_HELPER" \
+    "$LOG_DIR" \
+    "$RAY_RUNTIME_ARTIFACT_MANIFEST" \
+    "$SLURM_JOB_ID" \
+    "$JOB_RESTART_COUNT" \
+    "$session_name" \
+    "$expected_workers"
+}
+
+# BEGIN RAY_WORKER_SESSION_LATEST_RESOLVER
+# GNU readlink -f prints a normalized path and exits zero when only the final
+# component is absent.  Workers intentionally remove session_latest before
+# starting Ray, so -f turns that normal window into a false session mismatch.
+# GNU readlink -e requires every component to exist.  Recheck the reserved leaf
+# after resolution so concurrent creation/removal either waits or fails closed;
+# a stable regular file/directory is never accepted as Ray's symlink.
+resolve_ray_session_latest() {
+  local latest_path="${1:?missing Ray session_latest path}"
+  local resolved_path=""
+  resolved_path=$(readlink -e -- "$latest_path" 2>/dev/null || true)
+  if [[ -n "$resolved_path" ]]; then
+    if [[ -L "$latest_path" ]]; then
+      printf '%s\n' "$resolved_path"
+      return 0
+    fi
+    # The symlink may have disappeared after readlink completed.  Treat a now
+    # absent leaf as another wait iteration, not as a mismatched session.
+    if [[ ! -e "$latest_path" && ! -L "$latest_path" ]]; then
+      printf '\n'
+      return 0
+    fi
+    return 2
+  fi
+  if [[ -e "$latest_path" && ! -L "$latest_path" ]]; then
+    return 2
+  fi
+  printf '\n'
+}
+# END RAY_WORKER_SESSION_LATEST_RESOLVER
+readonly RAY_WORKER_SESSION_LATEST_RESOLVER="$(declare -f resolve_ray_session_latest)"
+
 # Set up the sandbox ports/signal directory on the shared FS before building the
 # head script, so the head can gate the driver on sandbox readiness. Arbitrary
 # extra mounts are supported via SANDBOX_EXTRA_MOUNTS (e.g. a shared temp dir).
@@ -620,6 +1519,8 @@ fi
 # elapsed counter shares the submit-side timeline.
 log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
 log_phase "head container started on \$(hostname)"
+NRL_PROVENANCE_LOG_DIR="$LOG_DIR"
+source "$FINAL_SYNC_HELPER_SCRIPT"
 
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
@@ -628,13 +1529,19 @@ exit-dramatically() {
     # As a last resort, exit with a non-zero code
     exit 1
 }
-export -f exit-dramatically
+
+# These functions run as background children of this shell.  Keep their PIDs so
+# the finalizer can reap them before Pyxis tears down the container namespace;
+# exported shell functions are neither needed nor safe to leak into Ray actors.
+monitor_sidecar_pid=""
+log_sync_sidecar_pid=""
+ray_status_sidecar_pid=""
 
 # Background process to check for ENDED file
 monitor-sidecar() {
   set +x
   while true; do
-    sleep 60
+    sleep 1
     if [[ -f "$LOG_DIR/ENDED" ]]; then
       echo "Detected ENDED file, terminating..."
       exit-dramatically
@@ -642,30 +1549,54 @@ monitor-sidecar() {
   done
 }
 monitor-sidecar &
+monitor_sidecar_pid=\$!
 
-# Background process to sync ray logs every $RAY_LOG_SYNC_FREQUENCY seconds
+# Periodic copies are diagnostics only and never overlap the evaluator-visible
+# final tree. The finalizer below atomically publishes ray/<session>/logs.
+sync-live-session-logs() {
+  if [[ ! -s "$LOG_DIR/RAY_SESSION_NAME" ]]; then
+    return 1
+  fi
+  local session_name source_logs live_logs
+  session_name=\$(<"$LOG_DIR/RAY_SESSION_NAME")
+  source_logs="/tmp/ray/\$session_name/logs"
+  live_logs="$LOG_DIR/ray_live/head/\$session_name/logs"
+  sync-live-ray-logs "\$source_logs" "\$live_logs"
+}
+
+atomic-final-head-logs() {
+  local session_name source_logs final_logs
+  session_name=\$(<"$LOG_DIR/RAY_SESSION_NAME")
+  source_logs="/tmp/ray/\$session_name/logs"
+  final_logs="$LOG_DIR/ray/\$session_name/logs"
+  atomic-final-ray-logs "\$source_logs" "\$final_logs" head
+}
+
+write-head-completion-receipt() {
+  local rc="\$1"
+  local session_name="\$2"
+  atomic-write-provenance-file "$RAY_SESSION_COMPLETION_DIR/head" <<HEAD_COMPLETION_EOF
+schema=ray-session-completion-v1
+role=head
+job_id=$SLURM_JOB_ID
+restart_count=$JOB_RESTART_COUNT
+node=\$head_node_name
+session=\$session_name
+exit_code=\$rc
+sync=complete
+HEAD_COMPLETION_EOF
+}
+
+# Background process to sync ray logs every $RAY_LOG_SYNC_FREQUENCY seconds.
 log-sync-sidecar() {
   set +x
   if [[ -z "$RAY_LOG_SYNC_FREQUENCY" ]]; then
-    echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
+    echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping periodic log sync"
     return
   fi
-  mkdir -p $LOG_DIR/ray
   while true; do
     sleep $RAY_LOG_SYNC_FREQUENCY
-    if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
-      for session_dir in /tmp/ray/session_[0-9]*/; do
-        if [[ -d "\$session_dir/logs" ]]; then
-          session_name=\$(basename "\$session_dir")
-          mkdir -p "$LOG_DIR/ray/\$session_name"
-          if command -v rsync > /dev/null 2>&1; then
-            rsync -ahP "\$session_dir/logs/" "$LOG_DIR/ray/\$session_name/logs/" 2>/dev/null || true
-          else
-            cp -r "\$session_dir/logs" "$LOG_DIR/ray/\$session_name/"
-          fi
-        fi
-      done
-    fi
+    sync-live-session-logs || true
     if [[ -f "$LOG_DIR/ENDED" ]]; then
       echo "Log sync sidecar terminating..."
       break
@@ -673,6 +1604,57 @@ log-sync-sidecar() {
   done
 }
 log-sync-sidecar &
+log_sync_sidecar_pid=\$!
+
+stop-head-sidecars() {
+  local pid
+  local sidecar_pids=(
+    "\${monitor_sidecar_pid:-}"
+    "\${log_sync_sidecar_pid:-}"
+    "\${ray_status_sidecar_pid:-}"
+  )
+  for pid in "\${sidecar_pids[@]}"; do
+    [[ "\$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    kill -TERM "\$pid" 2>/dev/null || true
+  done
+  for pid in "\${sidecar_pids[@]}"; do
+    [[ "\$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    wait "\$pid" 2>/dev/null || true
+  done
+}
+
+# The driver can exit between periodic syncs. Always copy the authenticated
+# session once more before the head shell leaves the allocation.
+finalize-head-log-sync() {
+  local rc="\$1"
+  local final_rc="\$rc"
+  local session_name expected_attestation
+  trap - EXIT
+  trap '' TERM HUP INT
+  stop-head-sidecars
+  if [[ -s "$LOG_DIR/RAY_SESSION_NAME" ]] && [[ -n "\${head_node_name:-}" ]]; then
+    session_name=\$(<"$LOG_DIR/RAY_SESSION_NAME")
+    expected_attestation=\$(printf 'role=head\nnode=%s\nsession=%s' \
+      "\$head_node_name" "\$session_name")
+    if provenance-file-matches \
+         "$LOG_DIR/RAY_SESSION_ATTESTATIONS/head" "\$expected_attestation" && \
+       atomic-final-head-logs && \
+       write-head-completion-receipt "\$rc" "\$session_name"; then
+      :
+    else
+      echo "[ERROR] Head failed to publish atomic final logs/completion receipt" >&2
+      [[ "\$final_rc" -ne 0 ]] || final_rc=1
+    fi
+  else
+    echo "[ERROR] Head exited before session provenance was established" >&2
+    [[ "\$final_rc" -ne 0 ]] || final_rc=1
+  fi
+  exit "\$final_rc"
+}
+trap 'finalize-head-log-sync \$?' EXIT
+trap 'finalize-head-log-sync 143' TERM
+trap 'finalize-head-log-sync 129' HUP
+trap 'finalize-head-log-sync 130' INT
 
 # Background process that publishes the live worker_units count to a file on the
 # shared FS, which the submit host reads to track how many workers have joined.
@@ -691,6 +1673,7 @@ ray-status-sidecar() {
   done
 }
 ray-status-sidecar &
+ray_status_sidecar_pid=\$!
 
 # Patch nsight.py before starting Ray head
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
@@ -766,7 +1749,40 @@ if [[ \$count -ge $num_retries ]]; then
   exit 1
 fi
 
-# Signal workers and the submit host that the Ray head GCS is now listening.
+# Publish the one Ray session this job owns before any worker is allowed to
+# connect. Log sidecars read only this atomic manifest, so stale /tmp/ray
+# sessions from an earlier allocation can never enter this job's evidence tree.
+ray_session_path=\$(readlink -f /tmp/ray/session_latest)
+ray_session_name=\$(basename "\$ray_session_path")
+if [[ ! "\$ray_session_name" =~ ^session_[A-Za-z0-9._-]+$ ]] || \
+   [[ "\$ray_session_path" != "/tmp/ray/\$ray_session_name" ]] || \
+   [[ ! -d "\$ray_session_path/logs" ]]; then
+  echo "[ERROR] Ray head did not publish a valid session directory: \$ray_session_path" >&2
+  touch "$LOG_DIR/ENDED"
+  exit 1
+fi
+printf '%s\n' "\$ray_session_name" > "$LOG_DIR/.RAY_SESSION_NAME.tmp"
+mv "$LOG_DIR/.RAY_SESSION_NAME.tmp" "$LOG_DIR/RAY_SESSION_NAME"
+
+# Attest the head node only after its canonical local session agrees with the
+# published manifest. The role-specific filename and atomic rename let the
+# strict evaluator distinguish this copy from worker mirrors of the same session.
+ray_attestation_dir="$LOG_DIR/RAY_SESSION_ATTESTATIONS"
+mkdir -p "\$ray_attestation_dir"
+head_node_name=\$(hostname)
+{
+  printf 'role=head\n'
+  printf 'node=%s\n' "\$head_node_name"
+  printf 'session=%s\n' "\$ray_session_name"
+} > "\$ray_attestation_dir/.head.\$\$.tmp"
+mv "\$ray_attestation_dir/.head.\$\$.tmp" "\$ray_attestation_dir/head"
+
+# Preserve an early diagnostic copy for jobs shorter than one periodic interval.
+# It remains outside the strict evaluator's authenticated final tree.
+sync-live-session-logs || true
+
+# Signal workers and the submit host that the Ray head GCS and its authenticated
+# session manifest/attestation are now available.
 touch $LOG_DIR/STARTED_RAY_HEAD
 log_phase "head: Ray GCS listening (STARTED_RAY_HEAD written)"
 
@@ -840,7 +1856,15 @@ worker_cmd=$(cat <<EOF
 if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
   env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
 fi
+$RAY_WORKER_SESSION_LATEST_RESOLVER
 echo "[INFO] Worker \$SLURM_PROCID on node \$SLURMD_NODENAME"
+
+# Preserve worker identity before the MPI/SLURM environment cleanup below. The
+# worker srun has one task per node, so SLURM_PROCID is the stable worker index.
+WORKER_PROCID="\${SLURM_PROCID:?missing SLURM_PROCID}"
+WORKER_NODE="\${SLURMD_NODENAME:?missing SLURMD_NODENAME}"
+WORKER_SESSION_PROBE_READY="/tmp/nrl_ray_session_probe_\${SLURM_JOB_ID:?missing SLURM_JOB_ID}_\${WORKER_PROCID}"
+rm -f "\$WORKER_SESSION_PROBE_READY"
 
 # Fail fast if LOG_DIR is not actually shared with the submit host -- the worker
 # gates on STARTED_RAY_HEAD and other signal files that would otherwise never appear.
@@ -852,6 +1876,8 @@ fi
 # Phase markers inside the container (see head container).
 log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
 log_phase "worker \$SLURM_PROCID container started on \$(hostname)"
+NRL_PROVENANCE_LOG_DIR="$LOG_DIR"
+source "$FINAL_SYNC_HELPER_SCRIPT"
 
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
@@ -861,42 +1887,136 @@ exit-dramatically() {
     exit 1
 }
 
+worker_monitor_sidecar_pid=""
+worker_log_sync_sidecar_pid=""
+
 # Background process to check for ENDED file
 monitor-sidecar() {
   set +x
   while true; do
-    sleep 60
     if [[ -f "$LOG_DIR/ENDED" ]]; then
-      echo "Detected ENDED file, terminating..."
-      exit-dramatically
+      echo "Detected ENDED file, stopping local Ray cleanly..."
+      ray stop || true
+      return
     fi
+    sleep 1
   done
 }
 monitor-sidecar &
+worker_monitor_sidecar_pid=\$!
 
-# Background process to sync ray logs every $RAY_LOG_SYNC_FREQUENCY seconds
+# Periodic diagnostic copies live outside the authenticated final tree.
+sync-live-session-logs() {
+  if [[ ! -s "$LOG_DIR/RAY_SESSION_NAME" ]]; then
+    return 1
+  fi
+  local session_name source_logs live_logs
+  session_name=\$(<"$LOG_DIR/RAY_SESSION_NAME")
+  source_logs="/tmp/ray/\$session_name/logs"
+  live_logs="$LOG_DIR/ray_live/worker-\$WORKER_PROCID/\$session_name/logs"
+  sync-live-ray-logs "\$source_logs" "\$live_logs"
+}
+
+atomic-final-worker-logs() {
+  local session_name source_logs final_logs
+  session_name=\$(<"$LOG_DIR/RAY_SESSION_NAME")
+  source_logs="/tmp/ray/\$session_name/logs"
+  final_logs="$LOG_DIR/ray/\$WORKER_NODE/\$session_name/logs"
+  atomic-final-ray-logs \
+    "\$source_logs" "\$final_logs" "worker-\$WORKER_PROCID"
+}
+
+write-worker-completion-receipt() {
+  local rc="\$1"
+  local session_name="\$2"
+  atomic-write-provenance-file \
+    "$RAY_SESSION_COMPLETION_DIR/worker-\$WORKER_PROCID" <<WORKER_COMPLETION_EOF
+schema=ray-session-completion-v1
+role=worker
+worker_index=\$WORKER_PROCID
+job_id=$SLURM_JOB_ID
+restart_count=$JOB_RESTART_COUNT
+node=\$WORKER_NODE
+session=\$session_name
+exit_code=\$rc
+sync=complete
+WORKER_COMPLETION_EOF
+}
+
+controlled-worker-finalize-request-valid() {
+  local session_name expected
+  [[ -s "$LOG_DIR/RAY_SESSION_NAME" ]] || return 1
+  session_name=\$(<"$LOG_DIR/RAY_SESSION_NAME")
+  expected=\$(printf \
+    'schema=ray-session-completion-v1\njob_id=%s\nrestart_count=%s\nsession=%s\naction=finalize-workers' \
+    '$SLURM_JOB_ID' '$JOB_RESTART_COUNT' "\$session_name")
+  provenance-file-matches "$WORKER_FINALIZE_REQUEST" "\$expected"
+}
+
+# Fail closed unless this node creates the exact cluster session named by the
+# head. The ready file prevents a stale pre-cleanup session_latest symlink from
+# being inspected before the worker retry loop removes /tmp/ray/session_*.
 log-sync-sidecar() {
   set +x
+  local deadline expected_session local_session_path local_session_name
+  local attestation_dir attestation_file attestation_tmp
+  while [[ ! -f "\$WORKER_SESSION_PROBE_READY" ]]; do
+    if [[ -f "$LOG_DIR/ENDED" ]]; then
+      return
+    fi
+    sleep 1
+  done
+
+  deadline=\$((SECONDS + $RAY_SESSION_ATTEST_TIMEOUT))
+  expected_session=\$(<"$LOG_DIR/RAY_SESSION_NAME")
+  while true; do
+    if ! local_session_path=\$(resolve_ray_session_latest /tmp/ray/session_latest); then
+      echo "[ERROR] Worker \$WORKER_PROCID found a non-symlink at reserved path /tmp/ray/session_latest" >&2
+      touch "$LOG_DIR/ENDED"
+      exit-dramatically
+    fi
+    if [[ -n "\$local_session_path" ]]; then
+      local_session_name=\$(basename "\$local_session_path")
+      if [[ "\$local_session_name" != "\$expected_session" ]] || \
+         [[ "\$local_session_path" != "/tmp/ray/\$expected_session" ]]; then
+        echo "[ERROR] Worker \$WORKER_PROCID Ray session mismatch: expected /tmp/ray/\$expected_session, got \$local_session_path" >&2
+        touch "$LOG_DIR/ENDED"
+        exit-dramatically
+      fi
+      if [[ -d "\$local_session_path/logs" ]]; then
+        break
+      fi
+    fi
+    if (( SECONDS > deadline )); then
+      echo "[ERROR] Worker \$WORKER_PROCID timed out waiting for Ray session \$expected_session" >&2
+      touch "$LOG_DIR/ENDED"
+      exit-dramatically
+    fi
+    sleep 1
+  done
+
+  attestation_dir="$LOG_DIR/RAY_SESSION_ATTESTATIONS"
+  attestation_file="\$attestation_dir/worker-\$WORKER_PROCID"
+  attestation_tmp="\$attestation_dir/.worker-\$WORKER_PROCID.\$\$.tmp"
+  mkdir -p "\$attestation_dir"
+  {
+    printf 'role=worker\n'
+    printf 'worker_index=%s\n' "\$WORKER_PROCID"
+    printf 'node=%s\n' "\$WORKER_NODE"
+    printf 'session=%s\n' "\$expected_session"
+  } > "\$attestation_tmp"
+  mv "\$attestation_tmp" "\$attestation_file"
+
+  # The first copy proves this attested node produced the expected directory;
+  # the main-shell exit trap performs one last copy after training.
+  sync-live-session-logs || true
   if [[ -z "$RAY_LOG_SYNC_FREQUENCY" ]]; then
-    echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
+    echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping periodic log sync"
     return
   fi
-  mkdir -p "$LOG_DIR/ray/\$SLURMD_NODENAME"
   while true; do
     sleep $RAY_LOG_SYNC_FREQUENCY
-    if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
-      for session_dir in /tmp/ray/session_[0-9]*/; do
-        if [[ -d "\$session_dir/logs" ]]; then
-          session_name=\$(basename "\$session_dir")
-          mkdir -p "$LOG_DIR/ray/\$SLURMD_NODENAME/\$session_name"
-          if command -v rsync > /dev/null 2>&1; then
-            rsync -ahP "\$session_dir/logs/" "$LOG_DIR/ray/\$SLURMD_NODENAME/\$session_name/logs/" 2>/dev/null || true
-          else
-            cp -r "\$session_dir/logs" "$LOG_DIR/ray/\$SLURMD_NODENAME/\$session_name/"
-          fi
-        fi
-      done
-    fi
+    sync-live-session-logs || true
     if [[ -f "$LOG_DIR/ENDED" ]]; then
       echo "Log sync sidecar terminating..."
       break
@@ -904,6 +2024,60 @@ log-sync-sidecar() {
   done
 }
 log-sync-sidecar &
+worker_log_sync_sidecar_pid=\$!
+
+stop-worker-sidecars() {
+  local pid
+  local sidecar_pids=(
+    "\${worker_monitor_sidecar_pid:-}"
+    "\${worker_log_sync_sidecar_pid:-}"
+  )
+  for pid in "\${sidecar_pids[@]}"; do
+    [[ "\$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    kill -TERM "\$pid" 2>/dev/null || true
+  done
+  for pid in "\${sidecar_pids[@]}"; do
+    [[ "\$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    wait "\$pid" 2>/dev/null || true
+  done
+}
+
+finalize-worker-log-sync() {
+  local rc="\$1"
+  local final_rc="\$rc"
+  local session_name expected_attestation local_session_path
+  trap - EXIT
+  trap '' TERM HUP INT
+  stop-worker-sidecars
+  if [[ -s "$LOG_DIR/RAY_SESSION_NAME" ]]; then
+    session_name=\$(<"$LOG_DIR/RAY_SESSION_NAME")
+    local_session_path=\$(resolve_ray_session_latest /tmp/ray/session_latest || true)
+    expected_attestation=\$(printf \
+      'role=worker\nworker_index=%s\nnode=%s\nsession=%s' \
+      "\$WORKER_PROCID" "\$WORKER_NODE" "\$session_name")
+    if [[ "\$local_session_path" == "/tmp/ray/\$session_name" ]] && \
+       [[ -d "\$local_session_path/logs" ]] && \
+       provenance-file-matches \
+         "$LOG_DIR/RAY_SESSION_ATTESTATIONS/worker-\$WORKER_PROCID" \
+         "\$expected_attestation" && \
+       atomic-final-worker-logs && \
+       write-worker-completion-receipt "\$rc" "\$session_name"; then
+      :
+    else
+      echo "[ERROR] Worker \$WORKER_PROCID failed to publish atomic final logs/completion receipt" >&2
+      [[ "\$final_rc" -ne 0 ]] || final_rc=1
+    fi
+  else
+    echo "[ERROR] Worker \$WORKER_PROCID exited before session provenance was established" >&2
+    [[ "\$final_rc" -ne 0 ]] || final_rc=1
+  fi
+  rm -f "\$WORKER_SESSION_PROBE_READY"
+  exit "\$final_rc"
+}
+trap 'finalize-worker-log-sync \$?' EXIT
+trap 'finalize-worker-log-sync 143' TERM
+trap 'finalize-worker-log-sync 129' HUP
+trap 'finalize-worker-log-sync 130' INT
 
 # Patch nsight.py before starting Ray worker
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
@@ -946,6 +2120,9 @@ while [[ \$count -lt $WORKER_NUM_RETRIES ]]; do
     echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
     bash "$SETUP_COMMAND_FILE"
   fi
+  # The provenance sidecar may inspect session_latest only after this attempt's
+  # stale-state cleanup and setup have completed.
+  touch "\$WORKER_SESSION_PROBE_READY"
   echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Worker \$SLURM_PROCID: starting Ray worker (attempt \$((count+1))/$WORKER_NUM_RETRIES)..."
   cat <<EOFINNER | bash
 ray start --address "$ip_head" \
@@ -964,6 +2141,14 @@ ray start --address "$ip_head" \
           \
           --block
 EOFINNER
+  if [[ -f "$LOG_DIR/ENDED" ]]; then
+    if controlled-worker-finalize-request-valid; then
+      echo "[INFO] Worker \$WORKER_PROCID received authenticated final-sync request"
+      exit 0
+    fi
+    echo "[ERROR] Worker \$WORKER_PROCID stopped without authenticated final-sync request" >&2
+    exit 1
+  fi
   count=\$((count+1))
   echo "[WARN] Worker \$SLURM_PROCID failed \$count/$WORKER_NUM_RETRIES times, restarting in 10 seconds..."
   sleep 10
@@ -1040,7 +2225,7 @@ fi
 
 # Start the Ray head.
 log_phase "launching Ray head + worker sruns"
-srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+srun $COMMON_SRUN_ARGS $HEAD_CONTAINER_INSTANCE_ARG --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
 SRUN_PIDS["ray-head"]=$!
 
 # Start the Ray workers (all nodes except the head) with a single batched srun, so
@@ -1052,7 +2237,7 @@ if [[ $_num_workers -gt 0 ]]; then
   # srun -o with %t produces per-task log files; zero-pad to the worker-count
   # width so ray-worker-*.log filenames sort naturally (e.g. ray-worker-007.log).
   _task_digits=${#_num_workers}
-  srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
+  srun $COMMON_SRUN_ARGS $WORKER_CONTAINER_INSTANCE_ARG --exact \
     --nodes=$_num_workers \
     --ntasks=$_num_workers \
     --ntasks-per-node=1 \
@@ -1073,6 +2258,67 @@ while check_srun_processes && ! test -f "$LOG_DIR/STARTED_RAY_HEAD"; do
   sleep 2
 done
 log_phase "Ray head GCS up (STARTED_RAY_HEAD observed)"
+
+write-worker-finalize-request() {
+  local session_name="$1"
+  atomic-write-provenance-file "$WORKER_FINALIZE_REQUEST" <<WORKER_FINALIZE_EOF
+schema=ray-session-completion-v1
+job_id=$SLURM_JOB_ID
+restart_count=$JOB_RESTART_COUNT
+session=$session_name
+action=finalize-workers
+WORKER_FINALIZE_EOF
+}
+
+validate-head-final-receipt() {
+  local session_name="$1"
+  local attestation="$LOG_DIR/RAY_SESSION_ATTESTATIONS/head"
+  local receipt="$RAY_SESSION_COMPLETION_DIR/head"
+  local node expected_attestation expected_receipt
+  [[ -f "$attestation" && ! -L "$attestation" ]] || return 1
+  node=$(sed -n '2s/^node=//p' "$attestation")
+  [[ "$node" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+  expected_attestation=$(printf 'role=head\nnode=%s\nsession=%s' "$node" "$session_name")
+  provenance-file-matches "$attestation" "$expected_attestation" || return 1
+  expected_receipt=$(printf \
+    'schema=ray-session-completion-v1\nrole=head\njob_id=%s\nrestart_count=%s\nnode=%s\nsession=%s\nexit_code=0\nsync=complete' \
+    "$SLURM_JOB_ID" "$JOB_RESTART_COUNT" "$node" "$session_name")
+  provenance-file-matches "$receipt" "$expected_receipt"
+}
+
+validate-worker-final-receipt() {
+  local worker_index="$1"
+  local session_name="$2"
+  local attestation="$LOG_DIR/RAY_SESSION_ATTESTATIONS/worker-$worker_index"
+  local receipt="$RAY_SESSION_COMPLETION_DIR/worker-$worker_index"
+  local node expected_attestation expected_receipt
+  [[ -f "$attestation" && ! -L "$attestation" ]] || return 1
+  node=$(sed -n '3s/^node=//p' "$attestation")
+  [[ "$node" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+  expected_attestation=$(printf \
+    'role=worker\nworker_index=%s\nnode=%s\nsession=%s' \
+    "$worker_index" "$node" "$session_name")
+  provenance-file-matches "$attestation" "$expected_attestation" || return 1
+  expected_receipt=$(printf \
+    'schema=ray-session-completion-v1\nrole=worker\nworker_index=%s\njob_id=%s\nrestart_count=%s\nnode=%s\nsession=%s\nexit_code=0\nsync=complete' \
+    "$worker_index" "$SLURM_JOB_ID" "$JOB_RESTART_COUNT" "$node" "$session_name")
+  provenance-file-matches "$receipt" "$expected_receipt"
+}
+
+write-job-completion-receipt() {
+  local session_name="$1"
+  local expected_workers="$2"
+  atomic-write-provenance-file "$RAY_JOB_COMPLETION_RECEIPT" <<JOB_COMPLETION_EOF
+schema=ray-session-completion-v1
+role=job
+job_id=$SLURM_JOB_ID
+restart_count=$JOB_RESTART_COUNT
+session=$session_name
+expected_workers=$expected_workers
+status=complete
+exit_code=0
+JOB_COMPLETION_EOF
+}
 
 if [[ -n "$COMMAND" ]]; then
   # Non-interactive: the head container polls for workers, gates on sandbox
@@ -1096,9 +2342,78 @@ if [[ -n "$COMMAND" ]]; then
     sleep 2
   done
   wait "${SRUN_PIDS["ray-head"]}"
-  exit_code=$?
+  head_exit_code=$?
+  final_exit_code=$head_exit_code
+  session_name=""
+
+  # A zero head exit is not job completion. First authenticate the head's final
+  # atomic copy/receipt, then ask workers to stop and publish their own receipts.
+  if [[ "$head_exit_code" -eq 0 ]] && \
+     [[ -f "$LOG_DIR/RAY_SESSION_NAME" ]] && \
+     [[ ! -L "$LOG_DIR/RAY_SESSION_NAME" ]]; then
+    session_name=$(<"$LOG_DIR/RAY_SESSION_NAME")
+    if [[ "$session_name" =~ ^session_[A-Za-z0-9._-]+$ ]] && \
+       validate-head-final-receipt "$session_name" && \
+       write-worker-finalize-request "$session_name"; then
+      :
+    else
+      echo "[ERROR] Head completion provenance is missing or malformed" >&2
+      final_exit_code=1
+    fi
+  else
+    final_exit_code=${head_exit_code:-1}
+    [[ "$final_exit_code" -ne 0 ]] || final_exit_code=1
+  fi
+
+  # ENDED without the authenticated request is an error shutdown. Workers accept
+  # exit zero only when both files were published in the success order above.
+  touch "$LOG_DIR/ENDED"
+
+  worker_exit_code=0
+  if [[ -n "${SRUN_PIDS["ray-workers"]:-}" ]]; then
+    worker_pid="${SRUN_PIDS["ray-workers"]}"
+    (
+      sleep "$RAY_FINAL_SYNC_WATCHDOG_SECONDS"
+      if kill -0 "$worker_pid" 2>/dev/null; then
+        echo "[ERROR] Timed out after ${RAY_FINAL_SYNC_WATCHDOG_SECONDS}s waiting for worker final-sync receipts" >&2
+        kill -TERM "$worker_pid" 2>/dev/null || true
+      fi
+    ) &
+    worker_watchdog_pid=$!
+    wait "$worker_pid"
+    worker_exit_code=$?
+    kill "$worker_watchdog_pid" 2>/dev/null || true
+    wait "$worker_watchdog_pid" 2>/dev/null || true
+    if [[ "$worker_exit_code" -ne 0 ]]; then
+      echo "[ERROR] Ray worker srun exited non-zero during finalization: $worker_exit_code" >&2
+      final_exit_code=1
+    fi
+  fi
+
+  if [[ "$final_exit_code" -eq 0 ]]; then
+    for (( worker_index=0; worker_index<_num_workers; worker_index++ )); do
+      if ! validate-worker-final-receipt "$worker_index" "$session_name"; then
+        echo "[ERROR] Missing/malformed completion receipt for worker $worker_index" >&2
+        final_exit_code=1
+      fi
+    done
+  fi
+
+  # Sandbox sidecars are not provenance-bearing. Stop their srun only after all
+  # Ray worker receipts have either been validated or failed closed.
+  if [[ -n "${SRUN_PIDS["sandbox"]:-}" ]]; then
+    kill "${SRUN_PIDS["sandbox"]}" 2>/dev/null || true
+    wait "${SRUN_PIDS["sandbox"]}" 2>/dev/null || true
+  fi
+
+  if [[ "$final_exit_code" -eq 0 ]]; then
+    if ! write-job-completion-receipt "$session_name" "$_num_workers"; then
+      echo "[ERROR] Failed to publish job completion receipt" >&2
+      final_exit_code=1
+    fi
+  fi
   set -e
-  exit $exit_code
+  exit "$final_exit_code"
 else
   # Interactive: poll for workers from the submit host by reading the file the
   # head's ray-status-sidecar publishes, then write the attach helper and idle.
@@ -1120,8 +2435,7 @@ else
 
   echo "[INFO][$(date '+%Y-%m-%dT%H:%M:%S%z')] All workers connected!"
 
-  log_phase "generating attach helper (scontrol show job)"
-  CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
+  log_phase "generating attach helper"
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
 # No args launches on the head node (node 0)
@@ -1130,15 +2444,15 @@ else
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap $HEAD_CONTAINER_INSTANCE_ARG --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
   else
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap $HEAD_CONTAINER_INSTANCE_ARG --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
   fi
 elif [[ $SLURM_JOB_NUM_NODES -eq 1 ]]; then
   echo "Error: Single-node mode — only the head node is available. Run without arguments."
   exit 1
 else
-  # All workers share the container name 'ray-worker'; target a specific one by node.
+  # Workers use one job/restart-scoped name per node; target a specific node.
   # Log files are 0-indexed: worker K maps to ray-worker-(K-1).log
   if [[ \$WORKER_NUM -lt 1 || \$WORKER_NUM -ge $SLURM_JOB_NUM_NODES ]]; then
     echo "Error: WORKER_NUM must be between 1 and $((SLURM_JOB_NUM_NODES-1))"
@@ -1147,9 +2461,9 @@ else
   nodes_array=($nodes)
   node="\${nodes_array[\$WORKER_NUM]}"
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap $WORKER_CONTAINER_INSTANCE_ARG --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
   else
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID --pty bash
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap $WORKER_CONTAINER_INSTANCE_ARG --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID --pty bash
   fi
 fi
 EOF

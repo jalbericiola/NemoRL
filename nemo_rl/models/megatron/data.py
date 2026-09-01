@@ -35,6 +35,7 @@ from nemo_rl.data.packing import (
     SharedPrefixRow,
     SharedPrefixTensorBin,
     materialize_shared_prefix_layout,
+    materialize_shared_prefix_token_aligned_tensor,
     plan_shared_prefix_bins,
     resolve_shared_prefix_parallel_topology,
     resolve_shared_prefix_physical_padding_multiple,
@@ -703,9 +704,7 @@ def process_shared_prefix_microbatch(
         raise NotImplementedError(
             "shared-prefix train mode does not support multimodal/VLM batches"
         )
-    unsupported_fields = [
-        field for field in ("mtp_loss_mask", "routed_experts") if field in data_dict
-    ]
+    unsupported_fields = [field for field in ("routed_experts",) if field in data_dict]
     if unsupported_fields:
         raise NotImplementedError(
             "shared-prefix train mode does not support batch fields "
@@ -772,6 +771,29 @@ def process_shared_prefix_microbatch(
                 padded_total_length=cp_shard.padded_total_length,
                 padding_multiple=resolved_padding_multiple,
             )
+            mtp_loss_mask = None
+            if "mtp_loss_mask" in data_dict:
+                global_mtp_loss_mask = materialize_shared_prefix_token_aligned_tensor(
+                    data_dict["mtp_loss_mask"],
+                    tensor_bin=tensor_bin,
+                    padding_value=0,
+                )
+                topology_pad = (
+                    cp_shard.padded_total_length - global_mtp_loss_mask.shape[0]
+                )
+                if topology_pad < 0:
+                    raise RuntimeError(
+                        "shared-prefix MTP mask is longer than the padded model input"
+                    )
+                if topology_pad:
+                    global_mtp_loss_mask = torch.nn.functional.pad(
+                        global_mtp_loss_mask,
+                        (0, topology_pad),
+                        value=0,
+                    )
+                mtp_loss_mask = global_mtp_loss_mask.index_select(
+                    0, cp_shard.global_token_indices
+                ).unsqueeze(0)
             yield ProcessedMicrobatch(
                 data_dict=unit_data,
                 input_ids=unit_data["input_ids"],
@@ -780,6 +802,7 @@ def process_shared_prefix_microbatch(
                 position_ids=cp_shard.position_ids.unsqueeze(0),
                 packed_seq_params=None,
                 cu_seqlens_padded=None,
+                mtp_loss_mask=mtp_loss_mask,
                 shared_prefix=shared_prefix,
                 shared_prefix_train_mode=True,
             )

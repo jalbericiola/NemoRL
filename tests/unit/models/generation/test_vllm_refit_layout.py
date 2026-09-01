@@ -17,6 +17,7 @@ import torch
 
 from nemo_rl.models.generation.vllm.refit_layout import (
     parse_hf_expert_weight,
+    resolve_vllm_expert_parameter_name,
     select_hf_weight_for_vllm_target,
 )
 
@@ -55,6 +56,79 @@ def test_parse_hf_expert_weight_maps_vllm_fused_parameters():
         "model.layers.0.mlp.experts.routed_experts.w2_weight",
         "w2",
         1,
+    )
+
+
+def test_bridge_nemotron_h_mixer_expert_resolves_to_vllm_model_prefix():
+    source_name = "backbone.layers.0.mixer.experts.7.up_proj.weight"
+    parsed = parse_hf_expert_weight(source_name)
+    assert parsed is not None
+    assert parsed.parameter_name == ("backbone.layers.0.mixer.experts.routed_experts.w13_weight")
+
+    layout = {
+        "expert_params": {
+            "model.layers.0.mixer.experts.routed_experts.w13_weight": {
+                "tp_rank": 0,
+                "tp_size": 1,
+                "local_expert_ids": [7],
+            }
+        },
+        "missing_weight_prefixes": [],
+    }
+    weight = torch.ones(4, 4)
+
+    assert select_hf_weight_for_vllm_target(source_name, weight, target_layout=layout) is weight
+
+
+def test_native_mtp_expert_cannot_alias_main_model_expert() -> None:
+    candidate = "mtp.layers.2.mixer.experts.routed_experts.w13_weight"
+    main_parameter = "model.layers.2.mixer.experts.routed_experts.w13_weight"
+
+    assert resolve_vllm_expert_parameter_name(candidate, [main_parameter]) is None
+
+
+def test_native_mtp_expert_passes_through_main_model_shard_layout() -> None:
+    source_name = "mtp.layers.2.mixer.experts.1.up_proj.weight"
+    main_parameter = "model.layers.2.mixer.experts.routed_experts.w13_weight"
+    layout = {
+        "expert_params": {
+            main_parameter: {
+                "tp_rank": 1,
+                "tp_size": 2,
+                "local_expert_ids": [1],
+            }
+        },
+        "missing_weight_prefixes": [],
+    }
+    weight = torch.arange(32).reshape(8, 4)
+
+    selected = select_hf_weight_for_vllm_target(
+        source_name,
+        weight,
+        target_layout=layout,
+    )
+
+    assert selected is weight
+
+
+def test_native_mtp_expert_aliases_only_within_mtp_namespace() -> None:
+    candidate = "mtp.layers.2.mixer.experts.routed_experts.w13_weight"
+    drafter_parameter = "language_model.mtp.layers.2.mixer.experts.routed_experts.w13_weight"
+
+    assert resolve_vllm_expert_parameter_name(candidate, [drafter_parameter]) == drafter_parameter
+
+
+def test_mtp_drafter_can_explicitly_alias_native_source_to_model_layers() -> None:
+    candidate = "mtp.layers.2.mixer.experts.routed_experts.w13_weight"
+    drafter_parameter = "model.layers.2.mixer.experts.routed_experts.w13_weight"
+
+    assert (
+        resolve_vllm_expert_parameter_name(
+            candidate,
+            [drafter_parameter],
+            target_is_mtp_drafter=True,
+        )
+        == drafter_parameter
     )
 
 

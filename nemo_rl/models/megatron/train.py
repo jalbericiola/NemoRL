@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from functools import partial
@@ -181,10 +182,6 @@ def model_forward(
             raise ValueError(
                 "shared-prefix Hybrid forward cannot also use packed_seq_params"
             )
-        if mtp_loss_mask is not None:
-            raise NotImplementedError(
-                "shared-prefix Hybrid forward does not support MTP"
-            )
         if multimodal_data or media_token_validity_mask is not None:
             raise NotImplementedError(
                 "shared-prefix Hybrid forward does not support multimodal inputs"
@@ -242,6 +239,22 @@ def model_forward(
             attention_mask=attention_mask,
             **additional_kwargs,
             **multimodal_data,
+        )
+
+    if (
+        shared_prefix is not None
+        and os.environ.get("NEMORL_SHARED_PREFIX_RUNTIME_TRACE") == "1"
+    ):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        layout = shared_prefix.tensor_bin.layout
+        print(
+            "NEMORL_SHARED_PREFIX_FORWARD_COMPLETED "
+            f"rank={rank} training={int(model.training)} "
+            f"prompt_tokens={layout.prompt_length} "
+            f"completions={len(layout.completion_lengths)} "
+            f"logical_tokens={layout.total_length} "
+            f"physical_tokens={shared_prefix.padded_total_length}",
+            flush=True,
         )
 
     # A model that slices context parallelism itself returns (output,

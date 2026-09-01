@@ -103,6 +103,12 @@ def test_shared_prefix_microbatch_materializes_one_star_without_dense_mask():
                 ]
             ),
             "input_lengths": torch.tensor([5, 6]),
+            "mtp_loss_mask": torch.tensor(
+                [
+                    [0, 0, 0, 1, 1, 0],
+                    [0, 0, 0, 1, 1, 1],
+                ]
+            ),
             SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([3, 3]),
             SHARED_PREFIX_GROUP_ID: ["g", "g"],
             SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0]),
@@ -137,6 +143,10 @@ def test_shared_prefix_microbatch_materializes_one_star_without_dense_mask():
         microbatch.data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX],
         torch.tensor([1, 0]),
     )
+    torch.testing.assert_close(
+        microbatch.mtp_loss_mask,
+        torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1]]),
+    )
     assert microbatch.shared_prefix is not None
     assert microbatch.shared_prefix_train_mode is True
     assert microbatch.shared_prefix.tensor_bin.attention_allow_mask is None
@@ -163,6 +173,12 @@ def test_shared_prefix_microbatch_uses_context_parallel_zigzag_shard():
                 ]
             ),
             "input_lengths": torch.tensor([5, 6]),
+            "mtp_loss_mask": torch.tensor(
+                [
+                    [0, 0, 0, 1, 1, 0],
+                    [0, 0, 0, 1, 1, 1],
+                ]
+            ),
             SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([3, 3]),
             SHARED_PREFIX_GROUP_ID: ["g", "g"],
             SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0]),
@@ -205,6 +221,10 @@ def test_shared_prefix_microbatch_uses_context_parallel_zigzag_shard():
     torch.testing.assert_close(
         microbatch.position_ids,
         torch.tensor([[4, 5, 6, 7, 3, 4, 5, 6]]),
+    )
+    torch.testing.assert_close(
+        microbatch.mtp_loss_mask,
+        torch.tensor([[1, 1, 0, 0, 1, 1, 0, 0]]),
     )
     assert microbatch.shared_prefix is not None
     assert microbatch.shared_prefix.cp_rank == 1

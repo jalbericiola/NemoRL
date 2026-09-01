@@ -79,7 +79,7 @@ def _failure_cfg(
     )
 
 
-def _init_pump_ledgers(ctrl: Any) -> None:
+def _init_pump_ledgers(ctrl: Any, *, current_step: int = 0) -> None:
     """Set the per-step bookkeeping the pump reads unconditionally.
 
     Empty is the neutral state, so tests that do not care about these can call this
@@ -91,6 +91,14 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
     ctrl._replacement_reserve = deque()
+    ctrl._train_steps = current_step
+    ctrl._next_rollout_admission = current_step
+    ctrl._pending_rollout_admissions = deque()
+    ctrl._rollout_admission_state_restored = False
+    ctrl._legacy_untracked_replay_group_ids = set()
+    ctrl._rollout_admission_lock = asyncio.Lock()
+    if not hasattr(ctrl, "_buffer"):
+        ctrl._buffer = _RecordingBuffer()
 
 
 class _RecordingBuffer:
@@ -104,6 +112,8 @@ class _RecordingBuffer:
         self,
         target_step_list: list[int | None] | None = None,
         ready_list: list[bool] | None = None,
+        group_ids: list[str] | None = None,
+        start_weight_list: list[int] | None = None,
     ) -> None:
         self.target_step_list: list[int | None] = list(target_step_list or [])
         self.ready_list: list[bool] = (
@@ -111,10 +121,33 @@ class _RecordingBuffer:
             if ready_list is not None
             else [True] * len(self.target_step_list)
         )
+        self._group_ids = (
+            list(group_ids)
+            if group_ids is not None
+            else [f"restored-{index}" for index in range(len(self.target_step_list))]
+        )
+        self.start_weight_list = (
+            list(start_weight_list)
+            if start_weight_list is not None
+            else [0] * len(self.target_step_list)
+        )
 
-    def reserve(self, *, target_step: int | None) -> None:
+    def reserve(
+        self, *, target_step: int | None, start_weight: int = 0
+    ) -> None:
         self.target_step_list.append(target_step)
         self.ready_list.append(False)
+        self._group_ids.append(f"new-{len(self._group_ids)}")
+        self.start_weight_list.append(start_weight)
+
+    async def remove(self, idxs, *, remove_in_dp: bool) -> int:
+        del remove_in_dp
+        for index in sorted(idxs, reverse=True):
+            del self.target_step_list[index]
+            del self.ready_list[index]
+            del self._group_ids[index]
+            del self.start_weight_list[index]
+        return len(idxs)
 
     def count_for_target_step(self, target_step: int) -> int:
         return sum(1 for target in self.target_step_list if target == target_step)
@@ -125,8 +158,12 @@ class _RecordingBuffer:
 
 
 class _RecordingRolloutManager:
-    def __init__(self, buffer: _RecordingBuffer) -> None:
+    def __init__(
+        self, buffer: _RecordingBuffer, *, start_weight: int = 0
+    ) -> None:
         self._buffer = buffer
+        self._start_weight = start_weight
+        self.prompts_seen: list[str] = []
 
     async def generate_and_push(
         self,
@@ -135,8 +172,11 @@ class _RecordingRolloutManager:
         target_step: int | None = None,
         inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
     ) -> None:
-        del prompt, inflight_registry
-        self._buffer.reserve(target_step=target_step)
+        del inflight_registry
+        self.prompts_seen.append(prompt["message_log"][0]["content"])
+        self._buffer.reserve(
+            target_step=target_step, start_weight=self._start_weight
+        )
 
 
 @pytest.mark.parametrize(
@@ -162,7 +202,7 @@ def test_rollout_pump_stamps_target_steps(
         rollout_failure=_failure_cfg(),
     )
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+        grpo=GRPOConfig.model_construct(max_num_epochs=1, max_num_steps=2)
     )
     ctrl._rollout_manager = _RecordingRolloutManager(buffer)
     # The sampler owns admission + target_step stamping (the dispatch counter
@@ -384,6 +424,7 @@ class _ScriptedRolloutManager:
     def __init__(self, outcomes: list[RolloutOutcome]) -> None:
         self._outcomes = list(outcomes)
         self.prompts_seen: list[str] = []
+        self.target_steps_seen: list[int | None] = []
 
     async def generate_and_push(
         self,
@@ -392,8 +433,9 @@ class _ScriptedRolloutManager:
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
     ) -> RolloutOutcome:
-        del target_step, inflight_registry
+        del inflight_registry
         self.prompts_seen.append(prompt["message_log"][0]["content"])
+        self.target_steps_seen.append(target_step)
         if self._outcomes:
             return self._outcomes.pop(0)
         return RolloutOutcome.COMMITTED
@@ -406,6 +448,55 @@ def _batch(*contents: str) -> BatchedDataDict:
     )
 
 
+class _CursorDataloader:
+    """Minimal stateful cursor matching the restart behavior under test."""
+
+    def __init__(self, batches: list[BatchedDataDict], *, cursor: int = 0) -> None:
+        self._batches = batches
+        self.cursor = cursor
+
+    def __iter__(self):
+        while self.cursor < len(self._batches):
+            batch = self._batches[self.cursor]
+            self.cursor += 1
+            yield batch
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+    def state_dict(self) -> dict[str, int]:
+        return {"cursor": self.cursor}
+
+
+def _pending_admission(
+    dispatch_index: int,
+    target_step: int | None,
+    *contents: str,
+    group_ids: list[str | None] | None = None,
+) -> dict[str, Any]:
+    if group_ids is None:
+        group_ids = [None] * len(contents)
+    return {
+        "dispatch_index": dispatch_index,
+        "admitted": True,
+        "source": "dataloader",
+        "groups": [
+            {
+                "target_step": target_step,
+                "group_id": group_id,
+                "prompt": {
+                    "message_log": [{"role": "user", "content": content}]
+                },
+            }
+            for content, group_id in zip(contents, group_ids, strict=True)
+        ],
+    }
+
+
+def _pending_prompts(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    return [group["prompt"] for group in entry["groups"]]
+
+
 def _pump_controller(
     manager: Any,
     dataloader: list[BatchedDataDict],
@@ -415,14 +506,19 @@ def _pump_controller(
     num_prompts_per_step: int = 1,
     buffer: _RecordingBuffer | None = None,
     trainer_version: int = 0,
+    current_step: int = 0,
+    max_num_steps: int | None = None,
 ):
     buffer = _RecordingBuffer() if buffer is None else buffer
+    if max_num_steps is None:
+        max_num_steps = len(dataloader)
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._buffer = buffer
     ctrl._async_cfg = SimpleNamespace(
         max_inflight_prompts=2,
         diagnostics=False,
+        sampler=SimpleNamespace(name="in_order"),
         rollout_failure=_failure_cfg(
             on_dropped_prompt=on_dropped_prompt,
             max_replacement_attempts=max_replacement_attempts,
@@ -430,11 +526,14 @@ def _pump_controller(
     )
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(
-            max_num_epochs=1, num_prompts_per_step=num_prompts_per_step
+            max_num_epochs=1,
+            max_num_steps=max_num_steps,
+            num_prompts_per_step=num_prompts_per_step,
         )
     )
     ctrl._rollout_manager = manager
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=1)
+    ctrl._sampler.set_dispatch_index(current_step)
     ctrl._dataloader = dataloader
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -445,9 +544,862 @@ def _pump_controller(
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = trainer_version
     ctrl._current_epoch = 0
-    _init_pump_ledgers(ctrl)
+    _init_pump_ledgers(ctrl, current_step=current_step)
     ctrl._sampler_stamps_target_steps = False
     return ctrl
+
+
+class TestRolloutAdmissionBudget:
+    """Rollout lookahead must stop where the optimizer-step budget stops."""
+
+    def test_one_step_run_keeps_spare_but_never_admits_lookahead_row(self):
+        """Regression for job 6695984's surplus target_step=1 K=4 cohort."""
+        manager = _ScriptedRolloutManager([])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("target0"), _batch("would-be-spare"), _batch("target1")],
+            max_num_steps=1,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["target0"]
+        assert manager.target_steps_seen == [0]
+        assert len(ctrl._replacement_reserve) == 1
+        assert ctrl._replacement_reserve[0]["message_log"][0]["content"] == (
+            "would-be-spare"
+        )
+
+    def test_two_step_cap_keeps_unused_reserve_but_does_not_drain_it(self):
+        manager = _ScriptedRolloutManager([])
+        ctrl = _pump_controller(
+            manager,
+            [
+                _batch("target0"),
+                _batch("spare"),
+                _batch("target1"),
+                _batch("forbidden-target2"),
+            ],
+            max_num_steps=2,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["target0", "target1"]
+        assert manager.target_steps_seen == [0, 1]
+        assert len(ctrl._replacement_reserve) == 1
+
+    def test_unstamped_sampler_obeys_the_same_admission_cap(self):
+        buffer = _RecordingBuffer()
+        manager = _ScriptedRolloutManager([])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("target0"), _batch("forbidden-target1")],
+            buffer=buffer,
+            max_num_steps=1,
+        )
+        ctrl._sampler = WeightFifoSampler(buffer, max_staleness_versions=1)
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["target0"]
+        assert manager.target_steps_seen == [None]
+        assert len(ctrl._replacement_reserve) == 0
+
+    def test_resume_uses_the_absolute_remaining_step_budget(self):
+        manager = _ScriptedRolloutManager([])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("target5"), _batch("forbidden-target6")],
+            trainer_version=5,
+            current_step=5,
+            max_num_steps=6,
+        )
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["target5"]
+        assert manager.target_steps_seen == [5]
+        assert len(ctrl._replacement_reserve) == 1
+
+    def test_final_epoch_resume_requeues_only_the_missing_stamped_groups(self):
+        """A final-epoch checkpoint omits unready slots but loses no prompts.
+
+        This is the restart shape the old ``current_epoch`` counter could not
+        represent: the dataloader cursor is already at EOF, epoch equals its finite
+        maximum, target 5 is fully durable, and only one of target 6's two admitted
+        prompts reached replay before the checkpoint.
+        """
+        buffer = _RecordingBuffer(
+            [5, 5, 6], group_ids=["p5a-id", "p5b-id", "p6a-id"]
+        )
+        dataloader = _CursorDataloader(
+            [_batch("p5a", "p5b"), _batch("p6a", "p6b")], cursor=2
+        )
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            dataloader,  # type: ignore[arg-type]
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=5,
+            current_step=5,
+            max_num_steps=7,
+        )
+        ctrl._current_epoch = 1
+        ctrl._next_rollout_admission = 7
+        ctrl._pending_rollout_admissions = deque(
+            [
+                _pending_admission(
+                    5,
+                    5,
+                    "p5a",
+                    "p5b",
+                    group_ids=["p5a-id", "p5b-id"],
+                ),
+                _pending_admission(
+                    6,
+                    6,
+                    "p6a",
+                    "p6b",
+                    group_ids=["p6a-id", None],
+                ),
+            ]
+        )
+        ctrl._rollout_admission_state_restored = True
+        ctrl._sampler.set_dispatch_index(7)
+        ctrl._sampler_stamps_target_steps = True
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert buffer.target_step_list == [5, 5, 6, 6]
+        assert manager.prompts_seen == ["p6b"]
+        assert ctrl._next_rollout_admission == 7
+        assert ctrl._current_epoch == 1
+        assert dataloader.state_dict() == {"cursor": 2}
+
+    def test_full_restored_next_step_never_duplicates_from_the_reserve(self):
+        buffer = _RecordingBuffer([5, 5], group_ids=["p5a-id", "p5b-id"])
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            [],
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=5,
+            current_step=5,
+            max_num_steps=6,
+        )
+        ctrl._current_epoch = 1
+        ctrl._next_rollout_admission = 6
+        ctrl._pending_rollout_admissions = deque(
+            [
+                _pending_admission(
+                    5,
+                    5,
+                    "p5a",
+                    "p5b",
+                    group_ids=["p5a-id", "p5b-id"],
+                )
+            ]
+        )
+        ctrl._replacement_reserve.extend(
+            _pending_prompts(_pending_admission(6, None, "spare-a", "spare-b"))
+        )
+        ctrl._sampler.set_dispatch_index(6)
+        ctrl._sampler_stamps_target_steps = True
+        ctrl._rollout_admission_state_restored = True
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert buffer.target_step_list == [5, 5]
+        assert len(ctrl._replacement_reserve) == 2
+
+    def test_legacy_reserve_drain_skips_a_full_restored_cohort(self):
+        """Defense in depth when an old checkpoint has no admission ledger."""
+        buffer = _RecordingBuffer([0, 0])
+        ctrl = _pump_controller(
+            _RecordingRolloutManager(buffer),
+            [],
+            num_prompts_per_step=2,
+            buffer=buffer,
+            max_num_steps=1,
+        )
+        ctrl._current_epoch = 1
+        ctrl._replacement_reserve.extend(
+            _pending_prompts(_pending_admission(0, None, "spare-a", "spare-b"))
+        )
+        ctrl._sampler_stamps_target_steps = True
+        ctrl._finalize_rollout_admission_restore()
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert buffer.target_step_list == [0, 0]
+        assert len(ctrl._replacement_reserve) == 2
+        assert ctrl._next_rollout_admission == 1
+
+    def test_legacy_reserve_drain_tops_up_partial_cohort_without_losing_spare(self):
+        """Exercise the real legacy finalizer before filling the final target."""
+        buffer = _RecordingBuffer([0])
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            [],
+            num_prompts_per_step=2,
+            buffer=buffer,
+            max_num_steps=1,
+        )
+        ctrl._current_epoch = 1
+        ctrl._replacement_reserve.extend(
+            _pending_prompts(_pending_admission(0, None, "spare-a", "spare-b"))
+        )
+        ctrl._sampler_stamps_target_steps = True
+        ctrl._finalize_rollout_admission_restore()
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["spare-a"]
+        assert buffer.target_step_list == [0, 0]
+        assert [
+            prompt["message_log"][0]["content"]
+            for prompt in ctrl._replacement_reserve
+        ] == ["spare-b"]
+
+    def test_legacy_partial_then_full_lookahead_does_not_consume_fresh_batch(self):
+        """A full later cohort advances admission without eating dataset prompts."""
+        buffer = _RecordingBuffer([5, 6, 6])
+        dataloader = _CursorDataloader(
+            [_batch("fresh7a", "fresh7b"), _batch("fresh8a", "fresh8b")]
+        )
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            dataloader,  # type: ignore[arg-type]
+            on_dropped_prompt="shrink",
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=5,
+            current_step=5,
+            max_num_steps=7,
+        )
+        ctrl._finalize_rollout_admission_restore()
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["fresh7a"]
+        assert buffer.count_for_target_step(5) == 2
+        assert buffer.count_for_target_step(6) == 2
+        assert dataloader.state_dict() == {"cursor": 1}
+        assert ctrl._next_rollout_admission == 7
+        assert [
+            prompt["message_log"][0]["content"]
+            for prompt in ctrl._replacement_reserve
+        ] == ["fresh7b"]
+
+    def test_final_epoch_legacy_reserve_topup_advances_later_full_cohort(self):
+        """The final saved cursor covers a full lookahead exposed by a pool top-up."""
+        buffer = _RecordingBuffer([5, 6, 6])
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            [],
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=5,
+            current_step=5,
+            max_num_steps=7,
+        )
+        ctrl._current_epoch = 1
+        ctrl._replacement_reserve.extend(
+            _pending_prompts(_pending_admission(5, None, "spare-a", "spare-b"))
+        )
+        ctrl._finalize_rollout_admission_restore()
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["spare-a"]
+        assert buffer.count_for_target_step(5) == 2
+        assert buffer.count_for_target_step(6) == 2
+        assert ctrl._next_rollout_admission == 7
+        assert [
+            prompt["message_log"][0]["content"]
+            for prompt in ctrl._replacement_reserve
+        ] == ["spare-b"]
+
+    def test_unstamped_resume_credits_restored_groups_before_requeue(self):
+        """Unstamped replay gets one global credit instead of K duplicates/batch."""
+        buffer = _RecordingBuffer(
+            [None, None, None], group_ids=["u5a-id", "u5b-id", "u6b-id"]
+        )
+        dataloader = _CursorDataloader(
+            [_batch("u5a", "u5b"), _batch("u6a", "u6b")], cursor=2
+        )
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            dataloader,  # type: ignore[arg-type]
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=5,
+            current_step=5,
+            max_num_steps=7,
+        )
+        ctrl._sampler = WeightFifoSampler(buffer, max_staleness_versions=1)
+        ctrl._sampler.set_dispatch_index(7)
+        ctrl._current_epoch = 1
+        ctrl._next_rollout_admission = 7
+        ctrl._pending_rollout_admissions = deque(
+            [
+                _pending_admission(
+                    5,
+                    None,
+                    "u5a",
+                    "u5b",
+                    group_ids=["u5a-id", "u5b-id"],
+                ),
+                _pending_admission(
+                    6,
+                    None,
+                    "u6a",
+                    "u6b",
+                    group_ids=[None, "u6b-id"],
+                ),
+            ]
+        )
+        ctrl._rollout_admission_state_restored = True
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert buffer.target_step_list == [None, None, None, None]
+        assert manager.prompts_seen == ["u6a"]
+        assert ctrl._next_rollout_admission == 7
+        assert ctrl._current_epoch == 1
+        assert dataloader.state_dict() == {"cursor": 2}
+
+    def test_true_legacy_unstamped_partial_cohort_regenerates_full_frontier(self):
+        """Unknown legacy selectability cannot spend an absolute admission."""
+        buffer = _RecordingBuffer([None], group_ids=["legacy-ready"])
+        dataloader = _CursorDataloader(
+            [
+                _batch("already-consumed-a", "already-consumed-b"),
+                _batch("fresh-a", "fresh-b"),
+            ],
+            cursor=1,
+        )
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            dataloader,  # type: ignore[arg-type]
+            on_dropped_prompt="shrink",
+            num_prompts_per_step=2,
+            buffer=buffer,
+            max_num_steps=1,
+        )
+        ctrl._sampler = WeightFifoSampler(buffer, max_staleness_versions=1)
+        ctrl._finalize_rollout_admission_restore()
+
+        assert ctrl._next_rollout_admission == 0
+
+        async def resume():
+            await ctrl._discard_legacy_unstamped_replay()
+            await ctrl._rollout_pump()
+
+        asyncio.run(resume())
+
+        assert manager.prompts_seen == ["fresh-a", "fresh-b"]
+        assert buffer.target_step_list == [None, None]
+        assert ctrl._next_rollout_admission == 1
+        assert dataloader.state_dict() == {"cursor": 2}
+        assert not ctrl._replacement_reserve
+
+    def test_second_resume_discards_unstamped_legacy_carry_owned_before_admit(self):
+        """A v2 checkpoint at the gate rewinds carry but retains owned prompts."""
+        buffer = _RecordingBuffer([None], group_ids=["legacy-ready"])
+        dataloader = _CursorDataloader(
+            [
+                _batch("already-consumed-a", "already-consumed-b"),
+                _batch("fresh-a", "fresh-b"),
+            ],
+            cursor=2,
+        )
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            dataloader,  # type: ignore[arg-type]
+            on_dropped_prompt="shrink",
+            num_prompts_per_step=2,
+            buffer=buffer,
+            max_num_steps=1,
+        )
+        ctrl._sampler = WeightFifoSampler(buffer, max_staleness_versions=1)
+        ctrl._sampler.set_dispatch_index(0)
+        ctrl._current_epoch = 1
+        ctrl._rollout_admission_state_restored = True
+        ctrl._legacy_untracked_replay_group_ids = {"legacy-ready"}
+        unadmitted = _pending_admission(0, None, "fresh-a", "fresh-b")
+        unadmitted["dispatch_index"] = None
+        unadmitted["admitted"] = False
+        ctrl._pending_rollout_admissions.append(unadmitted)
+
+        async def resume():
+            await ctrl._discard_legacy_unstamped_replay()
+            await ctrl._rollout_pump()
+
+        asyncio.run(resume())
+
+        assert manager.prompts_seen == ["fresh-a", "fresh-b"]
+        assert buffer.target_step_list == [None, None]
+        assert ctrl._next_rollout_admission == 1
+        assert dataloader.state_dict() == {"cursor": 2}
+        assert not ctrl._replacement_reserve
+
+    def test_v2_weight_fifo_requeues_ready_older_sibling_at_current_weight(self):
+        """Exact identity cannot leave one cohort split across strict FIFO buckets."""
+        buffer = _RecordingBuffer(
+            [None],
+            group_ids=["ready-old"],
+            start_weight_list=[0],
+        )
+        manager = _RecordingRolloutManager(buffer, start_weight=1)
+        ctrl = _pump_controller(
+            manager,
+            [],
+            on_dropped_prompt="shrink",
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=1,
+            current_step=1,
+            max_num_steps=2,
+        )
+        ctrl._async_cfg.sampler = SimpleNamespace(name="weight_fifo")
+        ctrl._sampler = WeightFifoSampler(buffer, max_staleness_versions=1)
+        ctrl._sampler.set_dispatch_index(2)
+        ctrl._current_epoch = 1
+        ctrl._next_rollout_admission = 2
+        ctrl._pending_rollout_admissions.append(
+            _pending_admission(
+                1,
+                None,
+                "ready-prompt",
+                "missing-sibling",
+                group_ids=["ready-old", None],
+            )
+        )
+        ctrl._rollout_admission_state_restored = True
+        ctrl._restored_replay_group_count = 1
+        # One restored row already owns one of the four capacity permits.
+        ctrl._buffer_capacity = asyncio.Semaphore(3)
+
+        async def resume():
+            await ctrl._discard_legacy_unstamped_replay()
+            assert buffer._group_ids == []
+            assert ctrl._buffer_capacity._value == 4
+            await ctrl._rollout_pump()
+
+        asyncio.run(resume())
+
+        assert manager.prompts_seen == ["ready-prompt", "missing-sibling"]
+        assert buffer.start_weight_list == [1, 1]
+        assert buffer.target_step_list == [None, None]
+        assert ctrl._next_rollout_admission == 2
+
+    def test_v2_sanitizer_rejects_old_group_absent_from_paired_ledger(self):
+        """Cleanup must not hide a corrupt replay/admission snapshot pair."""
+        buffer = _RecordingBuffer(
+            [None],
+            group_ids=["orphan-old"],
+            start_weight_list=[0],
+        )
+        ctrl = _pump_controller(
+            _RecordingRolloutManager(buffer, start_weight=1),
+            [],
+            on_dropped_prompt="shrink",
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=1,
+            current_step=1,
+            max_num_steps=2,
+        )
+        ctrl._async_cfg.sampler = SimpleNamespace(name="weight_fifo")
+        ctrl._sampler = WeightFifoSampler(buffer, max_staleness_versions=1)
+        ctrl._rollout_admission_state_restored = True
+        ctrl._pending_rollout_admissions.append(
+            _pending_admission(
+                1,
+                None,
+                "different-prompt",
+                "missing-sibling",
+                group_ids=["different-id", None],
+            )
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="absent from the paired admission ledger",
+        ):
+            asyncio.run(ctrl._discard_legacy_unstamped_replay())
+
+        assert buffer._group_ids == ["orphan-old"]
+
+    def test_true_legacy_unstamped_reserve_regenerates_full_frontier(self):
+        """EOF reserve drain also refuses unsafe pre-ledger count credit."""
+        buffer = _RecordingBuffer([None], group_ids=["legacy-ready"])
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            [],
+            on_dropped_prompt="shrink",
+            num_prompts_per_step=2,
+            buffer=buffer,
+            max_num_steps=1,
+        )
+        ctrl._sampler = WeightFifoSampler(buffer, max_staleness_versions=1)
+        ctrl._current_epoch = 1
+        ctrl._replacement_reserve.extend(
+            _pending_prompts(_pending_admission(0, None, "spare-a", "spare-b"))
+        )
+        ctrl._finalize_rollout_admission_restore()
+
+        async def resume():
+            await ctrl._discard_legacy_unstamped_replay()
+            await ctrl._rollout_pump()
+
+        asyncio.run(resume())
+
+        assert manager.prompts_seen == ["spare-a", "spare-b"]
+        assert buffer.target_step_list == [None, None]
+        assert ctrl._next_rollout_admission == 1
+        assert not ctrl._replacement_reserve
+
+    def test_true_legacy_stale_unstamped_full_cohort_spends_no_budget(self):
+        """A full but stale Windowed cohort cannot make two future steps short."""
+        buffer = _RecordingBuffer(
+            [None, None], group_ids=["stale-a", "stale-b"]
+        )
+        dataloader = _CursorDataloader(
+            [
+                _batch("already-consumed-a", "already-consumed-b"),
+                _batch("step-1-a", "step-1-b"),
+                _batch("step-2-a", "step-2-b"),
+            ],
+            cursor=1,
+        )
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            dataloader,  # type: ignore[arg-type]
+            on_dropped_prompt="shrink",
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=1,
+            current_step=1,
+            max_num_steps=3,
+        )
+        ctrl._sampler = WindowedSampler(
+            buffer, max_staleness_versions=0
+        )
+        ctrl._finalize_rollout_admission_restore()
+
+        assert ctrl._next_rollout_admission == 1
+
+        async def resume():
+            await ctrl._discard_legacy_unstamped_replay()
+            await ctrl._rollout_pump()
+
+        asyncio.run(resume())
+
+        assert manager.prompts_seen == [
+            "step-1-a",
+            "step-1-b",
+            "step-2-a",
+            "step-2-b",
+        ]
+        assert ctrl._next_rollout_admission == 3
+        assert dataloader.state_dict() == {"cursor": 3}
+
+    def test_true_legacy_stale_stamped_row_does_not_spend_next_step_budget(self):
+        """A stale target still identifies InOrder policy, but not an admission."""
+        buffer = _RecordingBuffer([0], group_ids=["late-step-0"])
+        dataloader = _CursorDataloader(
+            [
+                _batch("already-consumed-a", "already-consumed-b"),
+                _batch("step-1-a", "step-1-b"),
+            ],
+            cursor=1,
+        )
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            dataloader,  # type: ignore[arg-type]
+            on_dropped_prompt="shrink",
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=1,
+            current_step=1,
+            max_num_steps=2,
+        )
+        ctrl._finalize_rollout_admission_restore()
+
+        assert ctrl._sampler_stamps_target_steps is True
+        assert ctrl._next_rollout_admission == 1
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["step-1-a", "step-1-b"]
+        assert buffer.target_step_list == [0, 1, 1]
+        assert ctrl._next_rollout_admission == 2
+        assert dataloader.state_dict() == {"cursor": 2}
+
+    def test_second_resume_accepts_legacy_groups_carried_through_v2_checkpoint(self):
+        """Untrained lookahead from a legacy checkpoint survives a roll-forward."""
+        legacy_ids = ["legacy-6a", "legacy-6b"]
+        buffer = _RecordingBuffer([6, 6], group_ids=legacy_ids)
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            [],
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=6,
+            current_step=6,
+            max_num_steps=7,
+        )
+        ctrl._current_epoch = 1
+        ctrl._next_rollout_admission = 7
+        ctrl._sampler.set_dispatch_index(7)
+        ctrl._sampler_stamps_target_steps = True
+        ctrl._rollout_admission_state_restored = True
+        ctrl._legacy_untracked_replay_group_ids = set(legacy_ids)
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == []
+        assert buffer.target_step_list == [6, 6]
+        assert sorted(ctrl._legacy_untracked_replay_group_ids) == legacy_ids
+
+    def test_second_resume_advances_full_legacy_carry_after_exact_partial(self):
+        """A v2 checkpoint mid-legacy-resume still finishes the old lookahead."""
+        legacy_ids = ["legacy-7a", "legacy-7b"]
+        buffer = _RecordingBuffer(
+            [6, 7, 7],
+            group_ids=["exact-6a", *legacy_ids],
+        )
+        manager = _RecordingRolloutManager(buffer)
+        ctrl = _pump_controller(
+            manager,
+            [],
+            num_prompts_per_step=2,
+            buffer=buffer,
+            trainer_version=6,
+            current_step=6,
+            max_num_steps=8,
+        )
+        ctrl._current_epoch = 1
+        ctrl._next_rollout_admission = 7
+        ctrl._pending_rollout_admissions = deque(
+            [
+                _pending_admission(
+                    6,
+                    6,
+                    "exact-6a",
+                    "missing-6b",
+                    group_ids=["exact-6a", None],
+                )
+            ]
+        )
+        ctrl._sampler.set_dispatch_index(7)
+        ctrl._sampler_stamps_target_steps = True
+        ctrl._rollout_admission_state_restored = True
+        ctrl._legacy_untracked_replay_group_ids = set(legacy_ids)
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["missing-6b"]
+        assert buffer.count_for_target_step(6) == 2
+        assert buffer.count_for_target_step(7) == 2
+        assert ctrl._next_rollout_admission == 8
+        assert sorted(ctrl._legacy_untracked_replay_group_ids) == legacy_ids
+
+    def test_checkpoint_cut_persists_batch_blocked_in_sampler_admit(self):
+        """A cursor cannot checkpoint past an unowned batch at a full gate."""
+
+        class _BlockingSampler(InOrderSampler):
+            def __init__(self, buffer):
+                super().__init__(buffer, max_lookahead_versions=1)
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def admit(self, *, trainer_version_fn):
+                self.entered.set()
+                await self.release.wait()
+                return await super().admit(trainer_version_fn=trainer_version_fn)
+
+        async def exercise():
+            buffer = _RecordingBuffer()
+            dataloader = _CursorDataloader([_batch("blocked")])
+            ctrl = _pump_controller(
+                _RecordingRolloutManager(buffer),
+                dataloader,  # type: ignore[arg-type]
+                buffer=buffer,
+                max_num_steps=1,
+            )
+            sampler = _BlockingSampler(buffer)
+            sampler.set_dispatch_index(0)
+            ctrl._sampler = sampler
+
+            pump_task = asyncio.create_task(ctrl._rollout_pump())
+            await sampler.entered.wait()
+
+            async def checkpoint_cut():
+                async with ctrl._rollout_admission_lock:
+                    return (
+                        dataloader.state_dict(),
+                        ctrl._rollout_admission_state_dict(),
+                    )
+
+            checkpoint_task = asyncio.create_task(checkpoint_cut())
+            dataloader_state, admission_state = await asyncio.wait_for(
+                checkpoint_task, timeout=1.0
+            )
+            sampler.release.set()
+            await pump_task
+            return dataloader_state, admission_state
+
+        dataloader_state, admission_state = asyncio.run(exercise())
+
+        assert dataloader_state == {"cursor": 1}
+        assert admission_state["next_rollout_admission"] == 0
+        assert admission_state["pending_admissions"][0]["admitted"] is False
+        assert admission_state["pending_admissions"][0]["groups"][0]["prompt"] == {
+            "message_log": [{"role": "user", "content": "blocked"}]
+        }
+
+    def test_blocked_gate_does_not_deadlock_skipped_prompt_bookkeeping(self):
+        """A full lookahead gate must not own the admission checkpoint lock."""
+
+        class _GateObservingSampler(InOrderSampler):
+            def __init__(self, buffer):
+                super().__init__(buffer, max_lookahead_versions=0)
+                self.calls = 0
+                self.second_entered = asyncio.Event()
+
+            async def admit(self, *, trainer_version_fn):
+                self.calls += 1
+                if self.calls == 2:
+                    self.second_entered.set()
+                return await super().admit(trainer_version_fn=trainer_version_fn)
+
+        class _DelayedSkipManager:
+            def __init__(self):
+                self.calls = 0
+                self.allow_skip = asyncio.Event()
+
+            async def generate_and_push(self, prompt, **kwargs):
+                del prompt, kwargs
+                self.calls += 1
+                if self.calls == 1:
+                    await self.allow_skip.wait()
+                    return RolloutOutcome.SKIPPED
+                return RolloutOutcome.COMMITTED
+
+        async def exercise():
+            buffer = _RecordingBuffer()
+            manager = _DelayedSkipManager()
+            ctrl = _pump_controller(
+                manager,
+                [_batch("step0"), _batch("step1")],
+                on_dropped_prompt="shrink",
+                buffer=buffer,
+                max_num_steps=2,
+            )
+            sampler = _GateObservingSampler(buffer)
+            sampler.set_dispatch_index(0)
+            ctrl._sampler = sampler
+
+            pump_task = asyncio.create_task(ctrl._rollout_pump())
+            await sampler.second_entered.wait()
+            manager.allow_skip.set()
+
+            async def wait_for_shortfall():
+                while ctrl._batch_shortfall != {0: 1}:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_shortfall(), timeout=1.0)
+            ctrl._trainer_version = 1
+            await asyncio.wait_for(pump_task, timeout=1.0)
+            return ctrl
+
+        ctrl = asyncio.run(exercise())
+
+        assert ctrl._batch_shortfall == {0: 1}
+        assert len(ctrl._pending_rollout_admissions) == 1
+        assert ctrl._pending_rollout_admissions[0]["dispatch_index"] == 1
+
+    def test_reserve_drain_gate_does_not_deadlock_skipped_prompt(self):
+        """Reserve ownership is durable without holding the lock across admit."""
+
+        class _GateObservingSampler(InOrderSampler):
+            def __init__(self, buffer):
+                super().__init__(buffer, max_lookahead_versions=0)
+                self.calls = 0
+                self.second_entered = asyncio.Event()
+
+            async def admit(self, *, trainer_version_fn):
+                self.calls += 1
+                if self.calls == 2:
+                    self.second_entered.set()
+                return await super().admit(trainer_version_fn=trainer_version_fn)
+
+        class _DelayedSkipManager:
+            def __init__(self):
+                self.calls = 0
+                self.allow_skip = asyncio.Event()
+
+            async def generate_and_push(self, prompt, **kwargs):
+                del prompt, kwargs
+                self.calls += 1
+                if self.calls == 1:
+                    await self.allow_skip.wait()
+                    return RolloutOutcome.SKIPPED
+                return RolloutOutcome.COMMITTED
+
+        async def exercise():
+            buffer = _RecordingBuffer()
+            manager = _DelayedSkipManager()
+            ctrl = _pump_controller(
+                manager,
+                [],
+                on_dropped_prompt="shrink",
+                buffer=buffer,
+                max_num_steps=2,
+            )
+            ctrl._current_epoch = 1
+            ctrl._replacement_reserve.extend(
+                _pending_prompts(
+                    _pending_admission(0, None, "reserve0", "reserve1")
+                )
+            )
+            sampler = _GateObservingSampler(buffer)
+            sampler.set_dispatch_index(0)
+            ctrl._sampler = sampler
+
+            pump_task = asyncio.create_task(ctrl._rollout_pump())
+            await sampler.second_entered.wait()
+            manager.allow_skip.set()
+
+            async def wait_for_shortfall():
+                while ctrl._batch_shortfall != {0: 1}:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_shortfall(), timeout=1.0)
+            ctrl._trainer_version = 1
+            await asyncio.wait_for(pump_task, timeout=1.0)
+            return ctrl
+
+        ctrl = asyncio.run(exercise())
+
+        assert ctrl._batch_shortfall == {0: 1}
+        assert len(ctrl._pending_rollout_admissions) == 1
+        assert ctrl._pending_rollout_admissions[0]["dispatch_index"] == 1
 
 
 class TestReplaceDroppedPrompt:
@@ -770,6 +1722,8 @@ def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"fresh": (fresh, 5), "stale": (stale, 1)}
+        ctrl._pending_rollout_admissions = deque()
+        ctrl._legacy_untracked_replay_group_ids = set()
 
         aborted = await ctrl._abort_stale_inflight()
 
@@ -800,6 +1754,8 @@ def test_abort_stale_inflight_aggregates_cleanup_failures() -> None:
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=0)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"g": (task, 0)}
+        ctrl._pending_rollout_admissions = deque()
+        ctrl._legacy_untracked_replay_group_ids = set()
 
         with pytest.raises(BaseExceptionGroup) as exc_info:
             await ctrl._abort_stale_inflight()

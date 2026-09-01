@@ -22,6 +22,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
 
 import mlflow
@@ -131,11 +132,58 @@ class LoggerInterface(ABC):
         pass
 
 
+def _tensorboard_json_value(value: Any) -> Any:
+    """Convert one structured HParam value to deterministic JSON data."""
+    if isinstance(value, Enum):
+        return _tensorboard_json_value(value.value)
+    if isinstance(value, os.PathLike):
+        return os.fsdecode(value)
+    if isinstance(value, (list, tuple)):
+        return [_tensorboard_json_value(item) for item in value]
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("TensorBoard HParam mappings must use string keys")
+        return {key: _tensorboard_json_value(item) for key, item in sorted(value.items())}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(
+        "TensorBoard HParam structured values support only JSON-compatible "
+        f"leaves, Enum values, and paths; got {type(value).__name__}"
+    )
+
+
+def _normalize_tensorboard_hparams(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Flatten config values into the scalar contract accepted by HParams.
+
+    PyTorch accepts scalar ``None`` and deliberately omits it from the HParams
+    protobuf, so it remains untouched here. Enum and path leaves are resolved to
+    their stable values. Tuples retain their ordered structure as compact canonical
+    JSON rather than relying on a process-specific ``repr``.
+    """
+    normalized: dict[str, Any] = {}
+    for name, value in flatten_dict(params).items():
+        if isinstance(value, Enum):
+            value = value.value
+        if isinstance(value, os.PathLike):
+            value = os.fsdecode(value)
+        if isinstance(value, tuple):
+            value = json.dumps(
+                _tensorboard_json_value(value),
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        normalized[name] = value
+    return normalized
+
+
 class TensorboardLogger(LoggerInterface):
     """Tensorboard logger backend."""
 
     def __init__(self, cfg: TensorboardConfig, log_dir: Optional[str] = None):
         self.writer = SummaryWriter(log_dir=log_dir)
+        self._finished = False
         print(f"Initialized TensorboardLogger at {log_dir}")
 
     @staticmethod
@@ -200,7 +248,7 @@ class TensorboardLogger(LoggerInterface):
             params: Dictionary of hyperparameters to log
         """
         # Flatten the params because add_hparams does not support nested dicts
-        self.writer.add_hparams(flatten_dict(params), {})
+        self.writer.add_hparams(_normalize_tensorboard_hparams(params), {})
 
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a plot to Tensorboard.
@@ -210,6 +258,22 @@ class TensorboardLogger(LoggerInterface):
             step: Global step value
         """
         self.writer.add_figure(name, figure, step)
+
+    def finish(self) -> None:
+        """Flush pending events and close the writer exactly once.
+
+        Marking the logger finished before touching the writer makes repeated
+        teardown safe even when ``flush`` or ``close`` raises. Closing remains a
+        best attempt after a flush failure, while the original writer exception is
+        still allowed to fail the caller.
+        """
+        if self._finished:
+            return
+        self._finished = True
+        try:
+            self.writer.flush()
+        finally:
+            self.writer.close()
 
 
 class WandbLogger(LoggerInterface):
@@ -553,10 +617,13 @@ class RayGpuMonitorLogger:
         )
 
     def stop(self) -> None:
-        """Stop the GPU monitoring thread."""
+        """Join the GPU monitoring thread, then synchronously flush its tail."""
         self.is_running = False
         if self.collection_thread:
-            self.collection_thread.join(timeout=self.collection_interval * 2)
+            # Do not close any parent backend while this thread can still append
+            # or flush metrics. Network collection has its own request timeout;
+            # teardown must wait for the current collection iteration to finish.
+            self.collection_thread.join()
 
         # Final flush
         self.flush()
@@ -975,6 +1042,7 @@ class Logger(LoggerInterface):
                 - "monitor_gpus": boolean to enable Ray GPU monitoring.
                 - "gpu_monitoring": dict with "collection_interval" and "flush_interval" when GPU monitoring is enabled.
         """
+        self._finished = False
         self.loggers: list[LoggerInterface] = []
         self.wandb_logger = None
         self.swanlab_logger = None
@@ -1062,11 +1130,34 @@ class Logger(LoggerInterface):
             logger.log_hyperparams(params)
 
     def finish(self) -> None:
-        """Flush and close backends that need explicit teardown (e.g. wandb)."""
+        """Stop metric producers, then attempt every backend teardown once.
+
+        The GPU monitor is joined and performs its final flush before any backend
+        is closed. Teardown continues after individual failures, but the earliest
+        failure is retained and raised after every component has been attempted.
+        """
+        if self._finished:
+            return
+        self._finished = True
+
+        first_error: BaseException | None = None
+        if self.gpu_monitor is not None:
+            try:
+                self.gpu_monitor.stop()
+            except BaseException as error:
+                first_error = error
+
         for logger in self.loggers:
             finish = getattr(logger, "finish", None)
             if callable(finish):
-                finish()
+                try:
+                    finish()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+
+        if first_error is not None:
+            raise first_error
 
     def log_batched_dict_as_jsonl(
         self, to_log: BatchedDataDict[Any] | dict[str, Any], filename: str
@@ -1317,8 +1408,12 @@ class Logger(LoggerInterface):
 
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
-        if self.gpu_monitor:
-            self.gpu_monitor.stop()
+        try:
+            self.finish()
+        except BaseException:
+            # Destructors cannot report teardown failures safely. Explicit
+            # callers of finish() receive the retained first failure instead.
+            pass
 
 
 def flatten_dict(

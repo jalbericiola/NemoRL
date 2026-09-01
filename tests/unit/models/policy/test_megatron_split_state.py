@@ -51,22 +51,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-# megatron.bridge is only available with the mcore extras. Without it the
-# eager import of megatron_policy_worker (transitively imports megatron.bridge)
-# fails at COLLECTION time on non-mcore shards, which then breaks every other
-# test in that shard. importorskip stops collection cleanly here.
-pytest.importorskip("megatron.bridge")
+from tests.unit.models.policy._isolated_megatron_policy_worker import (  # noqa: E402
+    WORKER_MODULE,
+    assert_import_isolation,
+)
 
-# Eagerly import the worker module so ``unittest.mock.patch`` can resolve
-# attributes on it via ``getattr``. Without this the patch path
-# ``nemo_rl.models.policy.workers.megatron_policy_worker.<symbol>`` fails
-# at ``getattr(workers, "megatron_policy_worker")``.
-import nemo_rl.models.policy.workers.megatron_policy_worker  # noqa: E402,F401
+assert_import_isolation()
 
 pytestmark = pytest.mark.mcore
-
-# Module path of the worker under test
-WORKER_MOD = "nemo_rl.models.policy.workers.megatron_policy_worker"
 
 
 # ── Mock fabric ──────────────────────────────────────────────────────────
@@ -78,6 +70,10 @@ def _make_mock_model():
     ``modules()`` that yields nothing (so the inference-cache reset loop
     is a no-op)."""
     model = MagicMock()
+    # This helper models the unwrapped MCore model.  Pin ``module`` to a real
+    # None so MagicMock cannot fabricate a Float16Module-shaped wrapper and
+    # divert _get_model_config() away from the explicit config below.
+    model.module = None
     model.config = MagicMock()
     model.config.grad_sync_func = "ORIGINAL_GRAD_SYNC_FUNC"  # sentinel
     # Set explicitly rather than letting MagicMock auto-create it: the finish
@@ -85,6 +81,7 @@ def _make_mock_model():
     # hook need to be able to clear it to a real None.
     model.config.finalize_model_grads_func = MagicMock(name="ORIGINAL_FINALIZE")
     model.config.num_moe_experts = None  # disable MoE branch
+    model.config.mtp_num_layers = None  # disable MTP branch
     # no_sync() is a context manager — return a MagicMock that supports
     # __enter__/__exit__ so the `with self.model.no_sync():` block works.
     model.no_sync = MagicMock(
@@ -104,17 +101,12 @@ def _make_mock_model():
 def _make_worker(loss_type):
     """Construct a MegatronPolicyWorkerImpl instance with all heavy
     attributes mocked. Bypasses __init__ via ``object.__new__``."""
-    # Lazy import so the module-level mcore imports happen inside the
-    # mcore-marked test process.
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
-
-    w = object.__new__(MegatronPolicyWorkerImpl)
+    w = object.__new__(WORKER_MODULE.MegatronPolicyWorkerImpl)
     w.model = _make_mock_model()
     w.optimizer = MagicMock()
     # MegatronOptimizer.step returns (success, grad_norm, num_zeros)
     w.optimizer.step.return_value = (True, 0.5, 0)
+    w.optimizer.grad_norms_by_group = {}
     w.optimizer.param_groups = [{"lr": 1e-4, "weight_decay": 0.01}]
     w.scheduler = MagicMock()
     w.scheduler.get_lr.return_value = 1e-4
@@ -143,6 +135,9 @@ def _make_worker(loss_type):
     w.defer_fp32_logits = False
     w.dtype = torch.float32
     w._is_reward_model = False
+    # Normally initialized from policy.shared_prefix_training.mode in
+    # __init__, which this focused state-machine helper deliberately bypasses.
+    w._shared_prefix_training_enabled = False
     w._router_replay_enabled = False
     # Normally set from get_rank_safe() in __init__, which object.__new__ skips.
     # The step summary in finish_train_step reads it eagerly to decide whether
@@ -165,6 +160,23 @@ def mock_module_symbols():
     # finish path expects.
     agg_ret = ({"loss": [0.0]}, torch.tensor(0.5))
 
+    # The real worker is GPU-only and its split-step scalars intentionally live
+    # on CUDA. These lifecycle tests are CPU-only, so redirect only constructors
+    # that explicitly request CUDA while preserving every ordinary CPU tensor
+    # construction in the test and its dependencies.
+    real_zeros = torch.zeros
+    real_tensor = torch.tensor
+
+    def cpu_cuda_zeros(*args, **kwargs):
+        if str(kwargs.get("device", "")) == "cuda":
+            kwargs = {**kwargs, "device": "cpu"}
+        return real_zeros(*args, **kwargs)
+
+    def cpu_cuda_tensor(*args, **kwargs):
+        if str(kwargs.get("device", "")) == "cuda":
+            kwargs = {**kwargs, "device": "cpu"}
+        return real_tensor(*args, **kwargs)
+
     patches = {
         "megatron_forward_backward": [
             {"loss": 0.5, "global_valid_seqs": 8.0, "global_valid_toks": 256.0}
@@ -180,42 +192,55 @@ def mock_module_symbols():
     }
 
     with (
-        patch(
-            f"{WORKER_MOD}.megatron_forward_backward",
+        patch.object(
+            WORKER_MODULE,
+            "megatron_forward_backward",
             return_value=patches["megatron_forward_backward"],
         ) as mfb,
-        patch(
-            f"{WORKER_MOD}.get_microbatch_iterator",
+        patch.object(
+            WORKER_MODULE,
+            "get_microbatch_iterator",
             return_value=patches["get_microbatch_iterator"],
         ) as gmi,
-        patch(
-            f"{WORKER_MOD}.LossPostProcessor", return_value=patches["LossPostProcessor"]
+        patch.object(
+            WORKER_MODULE,
+            "LossPostProcessor",
+            return_value=patches["LossPostProcessor"],
         ) as lpp,
-        patch(
-            f"{WORKER_MOD}.broadcast_loss_metrics_from_last_stage",
+        patch.object(
+            WORKER_MODULE,
+            "broadcast_loss_metrics_from_last_stage",
             side_effect=patches["broadcast_loss_metrics_from_last_stage"],
         ) as bcast,
-        patch(
-            f"{WORKER_MOD}.get_pg_collection", return_value=patches["get_pg_collection"]
+        patch.object(
+            WORKER_MODULE,
+            "get_pg_collection",
+            return_value=patches["get_pg_collection"],
         ) as gpgc,
-        patch(
-            f"{WORKER_MOD}.logical_and_across_model_parallel_group",
+        patch.object(
+            WORKER_MODULE,
+            "logical_and_across_model_parallel_group",
             side_effect=patches["logical_and_across_model_parallel_group"],
         ) as land,
-        patch(
-            f"{WORKER_MOD}.reduce_max_stat_across_model_parallel_group",
+        patch.object(
+            WORKER_MODULE,
+            "reduce_max_stat_across_model_parallel_group",
             side_effect=patches["reduce_max_stat_across_model_parallel_group"],
         ) as rmax,
-        patch(
-            f"{WORKER_MOD}.aggregate_training_statistics",
+        patch.object(
+            WORKER_MODULE,
+            "aggregate_training_statistics",
             return_value=patches["aggregate_training_statistics"],
         ) as agg,
-        patch(f"{WORKER_MOD}.get_moe_metrics", return_value={}) as moe,
-        patch(f"{WORKER_MOD}.get_rerun_state_machine") as grsm,
-        patch(f"{WORKER_MOD}.parallel_state") as pstate,
+        patch.object(WORKER_MODULE, "get_moe_metrics", return_value={}) as moe,
+        patch.object(WORKER_MODULE, "get_rerun_state_machine") as grsm,
+        patch.object(WORKER_MODULE, "parallel_state") as pstate,
+        patch.object(WORKER_MODULE.torch, "zeros", side_effect=cpu_cuda_zeros),
+        patch.object(WORKER_MODULE.torch, "tensor", side_effect=cpu_cuda_tensor),
         patch("torch.distributed.all_reduce") as ar,
         patch("torch.cuda.empty_cache") as cec,
         patch("torch.cuda.get_device_name", return_value="H100"),
+        patch("torch.cuda.synchronize"),
         patch("torch.distributed.get_rank", return_value=0),
     ):
         # rerun state machine: fire forward+backward once per train_microbatch
@@ -233,6 +258,9 @@ def mock_module_symbols():
             "lpp": lpp,
             "bcast": bcast,
             "gpgc": gpgc,
+            # Expose the exact process-group collection returned to production
+            # code, not only the patched callable, for metric-group assertions.
+            "get_pg_collection": gpgc.return_value,
             "land": land,
             "rmax": rmax,
             "agg": agg,
@@ -411,6 +439,24 @@ class TestTrainMicrobatch:
         w.train_microbatch(_fake_batch())
         w.train_microbatch(_fake_batch())
         assert w._train_step_state["total_num_microbatches"] == 6
+
+    def test_attaches_mtp_loss_mask_before_building_streamed_iterator(
+        self, mock_module_symbols
+    ):
+        """The split API must match sync train's MTP-mask preprocessing."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 5
+        batch = _fake_batch()
+        expected = batch["token_mask"] * batch["sample_mask"].unsqueeze(-1)
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(batch)
+
+        iterator_batch = mock_module_symbols["gmi"].call_args.args[0]
+        assert iterator_batch is batch
+        assert torch.equal(iterator_batch["mtp_loss_mask"], expected)
 
     def test_does_not_call_optimizer_step(self, mock_module_symbols):
         """trainer_version semantics: optimizer.step() must NOT fire
@@ -592,6 +638,93 @@ class TestFinish:
         # get_moe_metrics receives loss_scale=1/6
         kwargs = mock_module_symbols["moe"].call_args.kwargs
         assert kwargs["loss_scale"] == pytest.approx(1.0 / 6.0, rel=1e-6)
+
+    def test_first_step_forwards_scalar_moe_and_mtp5_metrics(self, mock_module_symbols, monkeypatch):
+        """Exercise worker -> TQ -> SC metric logging for a real split finish.
+
+        MCore's tracker is deliberately seeded with stale setup-forward values.
+        begin_train_step must clear those before the first optimizer step; the
+        values installed after the mocked forward represent two pipeline
+        microbatches and must surface under the exact ``train/mtp`` tags.
+        """
+        from megatron.core.transformer.multi_token_prediction import (
+            MTPLossLoggingHelper,
+        )
+
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.algorithms.single_controller_utils.utils import (
+            aggregate_step_metrics,
+        )
+        from nemo_rl.models.policy.tq_policy import _aggregate_train_results
+
+        tracker = {
+            "loss_values": torch.full((5,), 99.0),
+            "correct_values": torch.full((5,), 99.0),
+            "total_values": torch.full((5,), 99.0),
+            "reduce_group": None,
+            "avg_group": None,
+        }
+        monkeypatch.setattr(MTPLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(MTPLossLoggingHelper, "reduce_metrics_in_tracker", lambda: None)
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.num_moe_experts = 8
+        w.model.config.mtp_num_layers = 5
+        w.optimizer.grad_norms_by_group = {"mtp": 2.5}
+        mock_module_symbols["moe"].return_value = {"load_balancing_loss": 0.125}
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        assert torch.count_nonzero(tracker["loss_values"]) == 0
+        assert torch.count_nonzero(tracker["correct_values"]) == 0
+        assert torch.count_nonzero(tracker["total_values"]) == 0
+
+        w.train_microbatch(_fake_batch())
+        # One split chunk contains two pipeline microbatches in this fixture.
+        # Losses are accumulated sums; acceptance uses unscaled counts.
+        tracker["loss_values"].copy_(torch.tensor([2.0, 4.0, 6.0, 8.0, 10.0]))
+        tracker["correct_values"].copy_(torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]))
+        tracker["total_values"].copy_(torch.tensor([2.0, 5.0, 10.0, 10.0, 20.0]))
+
+        worker_result = w.finish_train_step()
+        tq_result = _aggregate_train_results([worker_result])
+        step_metrics = aggregate_step_metrics(tq_result)
+
+        assert step_metrics["moe/load_balancing_loss"] == pytest.approx(0.125)
+        first_log_record = {
+            "step": 1,
+            "prefix": "train",
+            "metrics": step_metrics,
+        }
+        assert first_log_record["step"] == 1
+        logged_mtp = {
+            f"{first_log_record['prefix']}/{key}": value
+            for key, value in first_log_record["metrics"].items()
+            if key.startswith("mtp/")
+        }
+        expected_mtp = {
+            "train/mtp/mtp_1_loss": 1.0,
+            "train/mtp/mtp_1_acceptance_rate": 50.0,
+            "train/mtp/mtp_2_loss": 2.0,
+            "train/mtp/mtp_2_acceptance_rate": 40.0,
+            "train/mtp/mtp_3_loss": 3.0,
+            "train/mtp/mtp_3_acceptance_rate": 30.0,
+            "train/mtp/mtp_4_loss": 4.0,
+            "train/mtp/mtp_4_acceptance_rate": 40.0,
+            "train/mtp/mtp_5_loss": 5.0,
+            "train/mtp/mtp_5_acceptance_rate": 25.0,
+            "train/mtp/grad_norm": 2.5,
+        }
+        assert logged_mtp == pytest.approx(expected_mtp)
+        assert torch.count_nonzero(tracker["loss_values"]) == 0
+        assert torch.count_nonzero(tracker["correct_values"]) == 0
+        assert torch.count_nonzero(tracker["total_values"]) == 0
+
+        assert mock_module_symbols["gpgc"].return_value is mock_module_symbols["get_pg_collection"]
+        mp_group = mock_module_symbols["get_pg_collection"].mp
+        assert any(
+            call.args == (2.5,) and call.kwargs == {"mp_group": mp_group}
+            for call in mock_module_symbols["rmax"].call_args_list
+        )
 
     def test_loss_advertised_normalizers_applied(self, mock_module_symbols):
         """finish scales each metric by the denominator the loss advertised:
@@ -1004,7 +1137,7 @@ class TestStepSummaryIsEmitted:
     defaulting to INFO, so this pins the record at INFO and not below.
     """
 
-    LOGGER = "nemo_rl.models.policy.workers.megatron_policy_worker"
+    LOGGER = WORKER_MODULE.__name__
 
     def test_logs_chunk_count_and_grad_norm(self, mock_module_symbols, caplog):
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -1046,7 +1179,7 @@ class TestChunkRecordIsGuarded:
     raised, which is what ``NRL_LOG_LEVEL`` in ``nemo_rl/__init__.py`` provides.
     """
 
-    LOGGER = "nemo_rl.models.policy.workers.megatron_policy_worker"
+    LOGGER = WORKER_MODULE.__name__
 
     def test_silent_at_the_default_level(self, mock_module_symbols, caplog):
         """INFO is what a default run gets, and this record sits below it."""

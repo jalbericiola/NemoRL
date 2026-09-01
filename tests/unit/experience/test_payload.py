@@ -185,6 +185,8 @@ def test_shared_prefix_payload_metadata_is_explicitly_opt_in() -> None:
         "sample_mask",
         "prompt_ids_for_adv",
         "total_reward",
+        "truncated",
+        "response_token_lengths",
         "routed_experts",
     }
     _, disabled_fields, _ = pack_payload(
@@ -208,8 +210,14 @@ def test_shared_prefix_payload_metadata_is_explicitly_opt_in() -> None:
     )
     wire_fields = _promote_1d_leaves(observed_fields)
     assert wire_fields[SHARED_PREFIX_PROMPT_LENGTHS].shape == (2, 1)
+    assert wire_fields["response_token_lengths"].shape == (2, 1)
+    assert wire_fields["truncated"].shape == (2, 1)
     restored_fields = _from_wire(wire_fields)
     assert restored_fields[SHARED_PREFIX_PROMPT_LENGTHS].shape == (2,)
+    assert restored_fields["response_token_lengths"].shape == (2,)
+    assert restored_fields["response_token_lengths"].tolist() == [2, 2]
+    assert restored_fields["truncated"].shape == (2,)
+    assert restored_fields["truncated"].tolist() == [False, False]
 
     materialized = materialize(restored_fields)
     group_ids = materialized[SHARED_PREFIX_GROUP_ID]
@@ -281,6 +289,64 @@ def _failed_completion() -> Completion:
         truncated=False,
         reward=0.0,
     )
+
+
+def test_record_to_train_batch_preserves_reward_shaping_metadata() -> None:
+    first = _completion(route_start=10, reward=1.0)
+    first.truncated = True
+    first.message_log.append(
+        {
+            "role": "assistant",
+            "content": "later assistant turn",
+            "token_ids": torch.tensor([40, 41, 42]),
+            "generation_logprobs": torch.tensor([-0.3, -0.4, -0.5]),
+            "routed_experts": _fallback_routes(3),
+        }
+    )
+    record = _record([first, _failed_completion()])
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+
+    assert train_batch["truncated"].dtype is torch.bool
+    assert train_batch["truncated"].tolist() == [True, False]
+    # Match decompose_message_log: use the first assistant response, and zero when
+    # generation failed before producing any assistant turn.
+    assert train_batch["response_token_lengths"].tolist() == [2, 0]
+
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+    )
+    assert "truncated" in fields
+    assert "response_token_lengths" in fields
+
+
+def test_response_length_keeps_zero_length_first_assistant() -> None:
+    completion = _completion(route_start=10, reward=1.0)
+    first_assistant = completion.message_log[1]
+    first_assistant["token_ids"] = torch.empty(0, dtype=torch.long)
+    first_assistant["generation_logprobs"] = torch.empty(0)
+    first_assistant["routed_experts"] = _routes(12, 0)
+    completion.message_log.append(
+        {
+            "role": "assistant",
+            "content": "later nonempty assistant",
+            "token_ids": torch.tensor([40, 41, 42]),
+            "generation_logprobs": torch.tensor([-0.3, -0.4, -0.5]),
+            "routed_experts": _fallback_routes(3),
+        }
+    )
+
+    train_batch = record_to_train_batch(
+        _record([completion]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+
+    assert train_batch["response_token_lengths"].tolist() == [0]
 
 
 def test_record_to_train_batch_backfills_routes_for_failed_completion() -> None:

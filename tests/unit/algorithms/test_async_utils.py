@@ -46,6 +46,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packing.shared_prefix_metadata import SHARED_PREFIX_GROUP_ID
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -392,6 +393,97 @@ class TestReplayBufferImplCheckpointing:
                     "last_target_weight_already_generated": 1,
                 }
             )
+
+    @pytest.mark.parametrize(
+        ("checkpoint_mode", "restore_mode"),
+        [
+            ("disabled", "observe"),
+            ("disabled", "train"),
+            ("observe", "disabled"),
+            ("train", "disabled"),
+        ],
+    )
+    def test_local_restore_rejects_shared_prefix_schema_mismatch(
+        self,
+        checkpoint_mode,
+        restore_mode,
+    ):
+        state = self._state(
+            trajectory_versions=[0],
+            target_weight_versions=[1],
+            last_target_weight_already_generated=1,
+        )
+        if checkpoint_mode != "disabled":
+            state["trajectories"][0]["batch"][SHARED_PREFIX_GROUP_ID] = [
+                "checkpoint-group"
+            ]
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=False,
+            include_shared_prefix_metadata=restore_mode != "disabled",
+        )
+
+        with pytest.raises(ValueError, match="shared-prefix schema mismatch"):
+            buffer.load_state_dict(state)
+
+        assert buffer.size() == 0
+
+    @pytest.mark.parametrize(
+        ("checkpoint_mode", "restore_mode"),
+        [
+            ("disabled", "disabled"),
+            ("observe", "observe"),
+            ("train", "train"),
+            ("observe", "train"),
+            ("train", "observe"),
+        ],
+    )
+    def test_local_restore_accepts_matching_shared_prefix_schema(
+        self,
+        checkpoint_mode,
+        restore_mode,
+    ):
+        state = self._state(
+            trajectory_versions=[0],
+            target_weight_versions=[1],
+            last_target_weight_already_generated=1,
+        )
+        if checkpoint_mode != "disabled":
+            state["trajectories"][0]["batch"][SHARED_PREFIX_GROUP_ID] = [
+                "checkpoint-group"
+            ]
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=False,
+            include_shared_prefix_metadata=restore_mode != "disabled",
+        )
+
+        buffer.load_state_dict(state)
+
+        assert buffer.size() == 1
+        restored_batch = buffer.state_dict()["trajectories"][0]["batch"]
+        assert (SHARED_PREFIX_GROUP_ID in restored_batch) == (
+            restore_mode != "disabled"
+        )
+
+    def test_local_restore_default_schema_is_disabled(self):
+        state = self._state(
+            trajectory_versions=[0],
+            target_weight_versions=[1],
+            last_target_weight_already_generated=1,
+        )
+        state["trajectories"][0]["batch"][SHARED_PREFIX_GROUP_ID] = [
+            "checkpoint-group"
+        ]
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=False,
+        )
+
+        with pytest.raises(ValueError, match="shared-prefix schema mismatch"):
+            buffer.load_state_dict(state)
+
+        assert buffer.size() == 0
 
     def test_local_actor_side_checkpoint_preserves_compact_media_and_resume_metadata(
         self, tmp_path

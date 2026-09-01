@@ -52,6 +52,11 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     collect_sharded_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
+from nemo_rl.utils.vllm_replay_bundle import (
+    reject_vllm_direct_async_generation_during_replay,
+    validate_vllm_replay_config,
+    validate_vllm_replay_environment_contract,
+)
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 logger = logging.getLogger(__name__)
@@ -124,6 +129,19 @@ class VllmGeneration(GenerationInterface):
         )
         self.dp_size = cluster.world_size() // self.model_parallel_size
         self.vllm_dp_size = self.ep_size // self.tp_size
+
+        # Replay response claims are held in one model-owner actor. Validate
+        # the independently configured intent against the real NeMo-RL DP
+        # topology before allocating any workers; DP>1 cannot provide global
+        # one-shot semantics without a distributed claim coordinator.
+        validate_vllm_replay_config(
+            self.cfg["vllm_cfg"], data_parallel_size=self.dp_size
+        )
+        validate_vllm_replay_environment_contract(self.cfg["vllm_cfg"])
+        # The worker uses this allocator-derived value for its independent
+        # startup attestation. Always overwrite it so a recipe cannot claim a
+        # topology different from the allocated Ray generation world.
+        self.cfg["_replay_data_parallel_size"] = self.dp_size
 
         if self.pp_size > 1:
             assert self.cfg["vllm_cfg"]["async_engine"], (
@@ -767,6 +785,10 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError(
                 f"{method_name} can only be used when async_engine is enabled in vLLM config."
             )
+
+        reject_vllm_direct_async_generation_during_replay(
+            self.cfg["vllm_cfg"], method_name=method_name
+        )
 
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"

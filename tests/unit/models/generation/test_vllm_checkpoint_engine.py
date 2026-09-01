@@ -15,6 +15,7 @@
 """Tests for vLLM checkpoint-engine worker lifecycle helpers."""
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -92,10 +93,15 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
     worker = VllmCheckpointEngineMixin()
     worker.checkpoint_engine = FakeEngine()
     events = []
-    worker._load_weights = lambda batch: events.append(
-        ("load", [name for name, _weight in batch])
-    )
-    worker._maybe_process_fp8_kv_cache = lambda: events.append(("fp8",))
+    worker._load_weights = lambda batch: events.append(("load", [name for name, _weight in batch]))
+
+    @contextlib.contextmanager
+    def lifecycle(transport):
+        assert transport == "checkpoint_engine"
+        yield lambda: events.append(("finalize",))
+        events.append(("fp8",))
+
+    worker._weight_update_lifecycle = lifecycle
     monkeypatch.setattr(
         torch.cuda,
         "current_stream",
@@ -108,8 +114,65 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
         ("sync",),
         ("load", ["b", "c"]),
         ("sync",),
+        ("finalize",),
         ("fp8",),
     ]
+
+
+@pytest.mark.vllm
+def test_checkpoint_engine_load_failure_fences_and_resets_lifecycle(monkeypatch):
+    from nemo_rl.models.generation.vllm.checkpoint_engine import (
+        VllmCheckpointEngineMixin,
+    )
+
+    class FakeEngine:
+        shard_expert_weights = False
+
+        async def receive_weight_batches(self):
+            yield [("a", torch.ones(2, 2))]
+
+    worker = VllmCheckpointEngineMixin()
+    worker.checkpoint_engine = FakeEngine()
+    worker._nrl_test_lifecycle_marker = None
+    events = []
+
+    @contextlib.contextmanager
+    def lifecycle(transport):
+        assert transport == "checkpoint_engine"
+        worker._nrl_test_lifecycle_marker = object()
+        events.append("lifecycle_enter")
+        try:
+            yield lambda: events.append("finalize")
+        finally:
+            worker._nrl_test_lifecycle_marker = None
+            events.append("lifecycle_reset")
+
+    def fail_after_enqueue(_batch):
+        events.append("load")
+        raise ValueError("loader failed after enqueue")
+
+    def fail_fence():
+        events.append("synchronize")
+        raise RuntimeError("secondary fence failure")
+
+    worker._weight_update_lifecycle = lifecycle
+    worker._load_weights = fail_after_enqueue
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: SimpleNamespace(synchronize=fail_fence),
+    )
+
+    with pytest.raises(ValueError, match="loader failed after enqueue"):
+        asyncio.run(worker._update_weights_from_checkpoint_engine_async())
+
+    assert events == [
+        "lifecycle_enter",
+        "load",
+        "synchronize",
+        "lifecycle_reset",
+    ]
+    assert worker._nrl_test_lifecycle_marker is None
 
 
 @pytest.mark.vllm
@@ -145,27 +208,36 @@ def test_checkpoint_engine_methods_only_exist_on_configured_extension():
 
 
 @pytest.mark.vllm
-def test_checkpoint_engine_rpc_mixins_reduce_update_results():
+@pytest.mark.parametrize(
+    ("worker_results", "expected"),
+    [
+        ([True, None], True),
+        ([True, False], False),
+        ([], False),
+        ([None, None], False),
+    ],
+)
+def test_checkpoint_engine_rpc_mixins_reduce_update_results(worker_results, expected):
     from nemo_rl.models.generation.vllm.checkpoint_engine import (
         VllmAsyncCheckpointEngineRpcMixin,
         VllmCheckpointEngineRpcMixin,
     )
 
-    sync_worker = SimpleNamespace(
-        llm=SimpleNamespace(collective_rpc=MagicMock(return_value=[True, None]))
-    )
-    assert VllmCheckpointEngineRpcMixin.checkpoint_engine_rpc(
-        sync_worker, "update_weights_from_checkpoint_engine", ("arg",)
-    )
-    sync_worker.llm.collective_rpc.assert_called_once_with(
-        "update_weights_from_checkpoint_engine", args=("arg",)
-    )
-
-    async_worker = SimpleNamespace(
-        llm=SimpleNamespace(collective_rpc=AsyncMock(return_value=[True, None]))
-    )
-    assert asyncio.run(
-        VllmAsyncCheckpointEngineRpcMixin.checkpoint_engine_rpc_async(
-            async_worker, "update_weights_from_checkpoint_engine"
+    sync_worker = SimpleNamespace(llm=SimpleNamespace(collective_rpc=MagicMock(return_value=worker_results)))
+    assert (
+        VllmCheckpointEngineRpcMixin.checkpoint_engine_rpc(
+            sync_worker, "update_weights_from_checkpoint_engine", ("arg",)
         )
+        is expected
+    )
+    sync_worker.llm.collective_rpc.assert_called_once_with("update_weights_from_checkpoint_engine", args=("arg",))
+
+    async_worker = SimpleNamespace(llm=SimpleNamespace(collective_rpc=AsyncMock(return_value=worker_results)))
+    assert (
+        asyncio.run(
+            VllmAsyncCheckpointEngineRpcMixin.checkpoint_engine_rpc_async(
+                async_worker, "update_weights_from_checkpoint_engine"
+            )
+        )
+        is expected
     )

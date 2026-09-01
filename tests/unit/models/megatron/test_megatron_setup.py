@@ -27,7 +27,7 @@ nemo_rl.models.megatron.setup, focusing on:
 import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -717,6 +717,46 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_enable_deepep is False
         assert model_cfg.moe_token_dispatcher_type == "alltoall"
         assert model_cfg.moe_shared_expert_overlap is True
+
+    @pytest.mark.parametrize(
+        ("field_name", "provider_default", "recipe_value"),
+        [
+            ("moe_aux_loss_coeff", 0.01, 0.0),
+            ("moe_z_loss_coeff", 0.01, None),
+            ("moe_input_jitter_eps", 0.01, None),
+        ],
+    )
+    def test_router_regularizer_explicit_zero_or_null_overrides_provider_default(
+        self, field_name, provider_default, recipe_value
+    ):
+        """Explicit disabled values must reach the resolved model config."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = SimpleNamespace(**{field_name: provider_default})
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg[field_name] = recipe_value
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+        assert getattr(model_cfg, field_name) is recipe_value
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["moe_aux_loss_coeff", "moe_z_loss_coeff", "moe_input_jitter_eps"],
+    )
+    def test_router_regularizer_absent_preserves_provider_default(self, field_name):
+        """An omitted recipe key must not replace the provider's model default."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        provider_default = 0.01
+        model_cfg = SimpleNamespace(**{field_name: provider_default})
+
+        _apply_moe_config(
+            model_cfg,
+            {"megatron_cfg": self._base_moe_megatron_cfg()},
+        )
+
+        assert getattr(model_cfg, field_name) == provider_default
 
     @staticmethod
     def _base_moe_megatron_cfg() -> dict:
@@ -2042,6 +2082,22 @@ class TestValidateSharedPrefixModelCapability:
 
         _validate_shared_prefix_model_capability(config, object())
 
+    @pytest.mark.parametrize("mode", ["disabled", "observe"])
+    def test_non_train_modes_do_not_gate_peft(
+        self,
+        mode: Literal["disabled", "observe"],
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {
+            "shared_prefix_training": {"mode": mode},
+            "megatron_cfg": {"peft": {"enabled": True}},
+        }
+
+        _validate_shared_prefix_model_capability(config, object())
+
     def test_train_rejects_non_hybrid_provider(self):
         from nemo_rl.models.megatron.setup import (
             _validate_shared_prefix_model_capability,
@@ -2051,6 +2107,25 @@ class TestValidateSharedPrefixModelCapability:
 
         with pytest.raises(NotImplementedError, match="HybridModelProvider"):
             _validate_shared_prefix_model_capability(config, object())
+
+    def test_train_rejects_peft_before_model_construction(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {
+            "shared_prefix_training": {"mode": "train"},
+            "megatron_cfg": {"peft": {"enabled": True}},
+        }
+
+        with pytest.raises(
+            NotImplementedError,
+            match=r"policy\.megatron_cfg\.peft\.enabled=false.*PEFT/LoRA",
+        ):
+            _validate_shared_prefix_model_capability(
+                config,
+                self._supported_model_cfg(),
+            )
 
     @pytest.mark.parametrize("capability", [None, "hybrid_star_v1"])
     def test_train_rejects_incompatible_mcore_capability(self, capability):
@@ -2246,14 +2321,18 @@ class TestValidateSharedPrefixModelCapability:
                 "full",
                 "hybrid_star_full_uniform_recompute_v1",
             ),
-            ("mtp_num_layers", 1, "policy.megatron_cfg.mtp_num_layers"),
+            ("mtp_num_layers", 1, "hybrid_star_mtp_dense_heads_v1"),
             ("cuda_graph_impl", "local", "policy.megatron_cfg.cuda_graph_impl"),
             ("fp8", "e4m3", "policy.megatron_cfg.fp8_cfg.enabled"),
             ("fp4", "e2m1", "policy.quant_cfg=null"),
             ("attention_dropout", 0.1, "model_cfg.attention_dropout=0.0"),
             ("hidden_dropout", 0.1, "model_cfg.hidden_dropout=0.0"),
             ("window_size", (1023, 0), "sliding-window attention"),
-            ("position_embedding_type", "yarn", "requires standard RoPE"),
+            (
+                "position_embedding_type",
+                "yarn",
+                "supports only standard RoPE or positionless",
+            ),
             ("multi_latent_attention", True, "multi_latent_attention=true"),
             ("softmax_type", "off-by-one", "softmax_type='vanilla'"),
             (
@@ -2310,6 +2389,102 @@ class TestValidateSharedPrefixModelCapability:
                 return_value=self._supported_capabilities(),
             ),
             pytest.raises(NotImplementedError, match=expected_error),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    @pytest.mark.parametrize(
+        ("field_name", "disabled_value", "expected_error"),
+        [
+            ("moe_aux_loss_coeff", 0.0, "moe_aux_loss_coeff=0.0"),
+            ("moe_z_loss_coeff", None, "moe_z_loss_coeff"),
+            ("moe_input_jitter_eps", None, "moe_input_jitter_eps"),
+        ],
+    )
+    def test_train_validates_explicit_moe_regularizer_override_after_resolution(
+        self, field_name: str, disabled_value: Any, expected_error: str
+    ) -> None:
+        """Safe recipe overrides replace provider defaults; nonzero values still fail."""
+        from nemo_rl.models.megatron.setup import (
+            _apply_moe_config,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {
+            "shared_prefix_training": {"mode": "train"},
+            "megatron_cfg": {
+                "expert_tensor_parallel_size": 1,
+                "expert_model_parallel_size": 4,
+                "moe_router_dtype": "fp32",
+                "moe_router_load_balancing_type": "none",
+                "moe_router_bias_update_rate": 0.0,
+                "moe_permute_fusion": True,
+                "moe_enable_deepep": False,
+                "moe_token_dispatcher_type": "alltoall",
+                "moe_shared_expert_overlap": False,
+                field_name: disabled_value,
+            },
+        }
+        model_cfg = self._supported_model_cfg()
+        setattr(model_cfg, field_name, 0.01)
+
+        with patch(
+            "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+            return_value=self._supported_capabilities(),
+        ):
+            _apply_moe_config(model_cfg, config)
+            assert getattr(model_cfg, field_name) is disabled_value
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+            config["megatron_cfg"][field_name] = 0.01
+            _apply_moe_config(model_cfg, config)
+            with pytest.raises(NotImplementedError, match=expected_error):
+                _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_accepts_mtp_only_with_dense_head_capability(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.mtp_num_layers = 1
+
+        with patch(
+            "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+            return_value=self._supported_capabilities(
+                SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY
+            ),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_accepts_positionless_only_with_explicit_capability(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.position_embedding_type = "none"
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=self._supported_capabilities(),
+            ),
+            pytest.raises(
+                NotImplementedError,
+                match=SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+            ),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+        with patch(
+            "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+            return_value=self._supported_capabilities(
+                SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY
+            ),
         ):
             _validate_shared_prefix_model_capability(config, model_cfg)
 

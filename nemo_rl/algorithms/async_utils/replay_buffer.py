@@ -40,6 +40,37 @@ from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 
+_ASYNC_REPLAY_SHARED_PREFIX_FIELDS = frozenset({SHARED_PREFIX_GROUP_ID})
+_TQ_REPLAY_SHARED_PREFIX_FIELDS = frozenset(
+    {SHARED_PREFIX_GROUP_ID, SHARED_PREFIX_PROMPT_LENGTHS}
+)
+
+
+def _validate_shared_prefix_checkpoint_schema(
+    *,
+    checkpoint_fields: Iterable[str],
+    shared_prefix_fields: frozenset[str],
+    include_shared_prefix_metadata: bool,
+    location: str,
+) -> None:
+    """Reject replay data whose shared-prefix fields differ from this run."""
+    present_shared_prefix_fields = shared_prefix_fields.intersection(
+        checkpoint_fields
+    )
+    expected_shared_prefix_fields = (
+        shared_prefix_fields if include_shared_prefix_metadata else frozenset()
+    )
+    if present_shared_prefix_fields != expected_shared_prefix_fields:
+        raise ValueError(
+            "Replay buffer checkpoint shared-prefix schema mismatch: "
+            f"location={location}, "
+            f"checkpoint_fields={sorted(present_shared_prefix_fields)}, "
+            f"expected_fields={sorted(expected_shared_prefix_fields)}. "
+            "Resume with the same policy.shared_prefix_training.mode or "
+            "delete replay_buffer.pt to start with an empty buffer."
+        )
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 class ReplayBufferImpl(ReplayBufferProtocol):
     """Replay buffer storing per-prompt groups.
@@ -52,6 +83,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         self,
         max_size: int,
         drop_incomplete_targets_on_restore: bool,
+        include_shared_prefix_metadata: bool = False,
     ) -> None:
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
@@ -59,6 +91,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         # True discards partial restored rows. The dataloader is not rewound,
         # so replacement rollouts come from subsequent prompts.
         self._drop_incomplete_targets_on_restore = drop_incomplete_targets_on_restore
+        self._include_shared_prefix_metadata = include_shared_prefix_metadata
         self.trajectories = []  # List[dict[str, Any]]
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
@@ -443,6 +476,16 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                     f"trajectories={len(trajectories)}, "
                     f"trajectory_versions={len(trajectory_versions)}, "
                     f"target_weight_versions={len(target_weight_versions)}"
+                )
+
+            for trajectory_index, trajectory in enumerate(trajectories):
+                _validate_shared_prefix_checkpoint_schema(
+                    checkpoint_fields=trajectory.get("batch", ()),
+                    shared_prefix_fields=_ASYNC_REPLAY_SHARED_PREFIX_FIELDS,
+                    include_shared_prefix_metadata=(
+                        self._include_shared_prefix_metadata
+                    ),
+                    location=f"trajectories[{trajectory_index}].batch",
                 )
 
             if "max_size" in state and state["max_size"] != self.max_size:
@@ -1056,10 +1099,6 @@ class TQReplayBuffer:
             "fields_data",
         }
         seen_sample_ids: set[str] = set()
-        shared_prefix_fields = {
-            SHARED_PREFIX_GROUP_ID,
-            SHARED_PREFIX_PROMPT_LENGTHS,
-        }
         for group in groups:
             missing_group_keys = group_keys - set(group)
             if missing_group_keys:
@@ -1080,20 +1119,12 @@ class TQReplayBuffer:
                     f"sequence_lengths={num_lengths}, "
                     f"expected_group_size={expected_group_size}"
                 )
-            present_shared_prefix_fields = shared_prefix_fields.intersection(
-                meta.fields or ()
+            _validate_shared_prefix_checkpoint_schema(
+                checkpoint_fields=meta.fields or (),
+                shared_prefix_fields=_TQ_REPLAY_SHARED_PREFIX_FIELDS,
+                include_shared_prefix_metadata=self._include_shared_prefix_metadata,
+                location=f"group_id={group['group_id']!r}",
             )
-            expected_shared_prefix_fields = (
-                shared_prefix_fields if self._include_shared_prefix_metadata else set()
-            )
-            if present_shared_prefix_fields != expected_shared_prefix_fields:
-                raise ValueError(
-                    "Replay buffer checkpoint shared-prefix schema mismatch: "
-                    f"checkpoint_fields={sorted(present_shared_prefix_fields)}, "
-                    f"expected_fields={sorted(expected_shared_prefix_fields)}. "
-                    "Resume with the same policy.shared_prefix_training.mode or "
-                    "delete replay_buffer.pt to start with an empty buffer."
-                )
             for sid in meta.sample_ids:
                 if sid in seen_sample_ids:
                     raise ValueError(

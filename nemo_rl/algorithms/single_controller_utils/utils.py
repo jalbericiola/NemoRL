@@ -69,11 +69,23 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
         metrics["num_ranks"] = int(train_result["num_ranks"])
 
     # moe/mtp share the same reduction rules as all_mb_metrics in grpo.py.
+    # Worker-side auxiliary collectors return already-reduced scalar floats,
+    # while all_mb_metrics contains per-microbatch lists. Normalize the former
+    # to one-element lists before applying the common reducers; treating the
+    # scalar itself as a sequence makes min/max iteration fail and is outside
+    # the metric-list contract used below.
+    def metric_values(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
     mb: dict[str, list[Any]] = {}
     if "moe_metrics" in train_result:
-        mb.update({f"moe/{k}": v for k, v in train_result["moe_metrics"].items()})
+        mb.update({f"moe/{k}": metric_values(v) for k, v in train_result["moe_metrics"].items()})
     if "mtp_metrics" in train_result:
-        mb.update({f"mtp/{k}": v for k, v in train_result["mtp_metrics"].items()})
+        mb.update({f"mtp/{k}": metric_values(v) for k, v in train_result["mtp_metrics"].items()})
     mb.update(train_result.get("all_mb_metrics", {}))
 
     for k, v in mb.items():
@@ -95,23 +107,50 @@ def reduce_advantage_pump_metrics(
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
+    verifier_rewards: list[torch.Tensor] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
     Args:
-        rewards: One tensor per advantage_stage call; each row a sample reward.
+        rewards: One tensor per advantage-stage call that reached F/B; each row
+            is a sample reward. Partially masked payloads retain all rows so
+            this cohort matches the trainer payload and train-data JSONL.
         masked_advantages: Token-masked advantages, one tensor per call.
         sequence_lengths: All input_lengths trained on this step.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
+        verifier_rewards: Raw environment/verifier rewards before reward scaling
+            or shaping, aligned one-for-one with ``rewards``.
 
     Returns:
         Step-level reward, advantage, token-count, and optional sequence
         log-probability error metrics.
     """
     out: dict[str, float] = {}
-    if rewards:
-        out["reward"] = float(torch.cat([r.flatten() for r in rewards]).mean())
+    if verifier_rewards is not None and (
+        len(verifier_rewards) != len(rewards)
+        or any(
+            raw.numel() != processed.numel()
+            for processed, raw in zip(rewards, verifier_rewards, strict=False)
+        )
+    ):
+        raise ValueError(
+            "processed and verifier reward cohorts must align chunk-for-chunk"
+        )
+    populated_rewards = [r.flatten() for r in rewards if r.numel() > 0]
+    if populated_rewards:
+        out["reward"] = float(torch.cat(populated_rewards).mean())
+    populated_verifier_rewards = [
+        r.flatten() for r in (verifier_rewards or []) if r.numel() > 0
+    ]
+    if populated_verifier_rewards:
+        out["verifier_reward"] = float(
+            torch.cat(populated_verifier_rewards).mean()
+        )
+        if populated_rewards:
+            out["reward_processing_delta"] = (
+                out["reward"] - out["verifier_reward"]
+            )
     if masked_advantages:
         cat = torch.cat([a.flatten() for a in masked_advantages])
         if cat.numel() > 0:

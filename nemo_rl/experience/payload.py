@@ -49,7 +49,8 @@ def record_to_train_batch(
 
     Returns:
         BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
-        sample_mask, prompt_ids_for_adv, total_reward, and optional routed_experts.
+        sample_mask, prompt_ids_for_adv, total_reward, truncated,
+        response_token_lengths, and optional routed_experts.
     """
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
@@ -88,6 +89,26 @@ def record_to_train_batch(
     total_reward = torch.tensor(
         [float(c.reward) for c in completions], dtype=torch.float32
     )
+    truncated = torch.tensor([c.truncated for c in completions], dtype=torch.bool)
+
+    def _first_assistant_token_length(completion: Any) -> int:
+        for message in completion.message_log:
+            if message["role"] != "assistant":
+                continue
+            token_ids = message.get("token_ids")
+            if token_ids is None:
+                continue
+            return (
+                int(token_ids.shape[0])
+                if isinstance(token_ids, torch.Tensor)
+                else len(token_ids)
+            )
+        return 0
+
+    response_token_lengths = torch.tensor(
+        [_first_assistant_token_length(c) for c in completions],
+        dtype=torch.long,
+    )
     sample_mask = torch.ones(n, dtype=torch.float32)
 
     train_data: dict[str, Any] = {
@@ -98,6 +119,8 @@ def record_to_train_batch(
         "sample_mask": sample_mask,
         "prompt_ids_for_adv": prompt_flat["token_ids"],
         "total_reward": total_reward,
+        "truncated": truncated,
+        "response_token_lengths": response_token_lengths,
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
@@ -120,8 +143,9 @@ def pack_payload(
         weight_version: Trainer weight version stamped on every row's tag.
         group_id: Per-group identifier used as the sample_id prefix; the caller owns uniqueness.
         include_shared_prefix_metadata: Store the same stable group identity as
-            an object column for policy workers. Disabled mode keeps the legacy
-            payload schema byte-for-byte unchanged.
+            an object column for policy workers. Disabled mode omits only the
+            shared-prefix metadata; rollout fields such as ``truncated`` and
+            ``response_token_lengths`` remain part of the current payload schema.
 
     Returns:
         sample_ids of the form {group_id}_g{i}, a jagged-packed TensorDict, and per-row tags.

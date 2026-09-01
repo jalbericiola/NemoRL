@@ -667,6 +667,14 @@ def validate_shared_prefix_training_config(
         )
     megatron_config = cast(MegatronConfig, megatron_config)
 
+    peft_config = megatron_config.get("peft")
+    if peft_config is not None and peft_config["enabled"]:
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train currently requires "
+            "policy.megatron_cfg.peft.enabled=false; PEFT/LoRA adapter dropout "
+            "and shared-prefix gradient semantics have not been validated."
+        )
+
     sequence_packing_config = config.get("sequence_packing")
     if sequence_packing_config is None or not sequence_packing_config["enabled"]:
         raise ValueError(
@@ -743,13 +751,6 @@ def validate_shared_prefix_training_config(
                 "recomputation requires policy.megatron_cfg.recompute_num_layers=1 "
                 f"when supplied; got {recompute_num_layers!r}."
             )
-
-    mtp_num_layers = megatron_config.get("mtp_num_layers")
-    if mtp_num_layers is not None and mtp_num_layers > 0:
-        raise ValueError(
-            "policy.shared_prefix_training.mode=train currently requires "
-            "policy.megatron_cfg.mtp_num_layers=0."
-        )
 
     cuda_graph_impl = megatron_config.get("cuda_graph_impl")
     if cuda_graph_impl is not None and cuda_graph_impl != "none":

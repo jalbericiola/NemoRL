@@ -20,6 +20,7 @@ from nemo_rl.models.generation.vllm.refit_layout import (
     VllmExpertParamLayout,
     VllmWeightLayout,
     parse_hf_expert_weight,
+    resolve_vllm_expert_parameter_name,
 )
 
 
@@ -58,9 +59,7 @@ class VllmShardedExpertRefitMixin:
             weight_loader = getattr(param, "weight_loader", None)
             owner = getattr(weight_loader, "__self__", None)
             if owner is None:
-                raise RuntimeError(
-                    f"Could not inspect the vLLM expert weight loader for {name}."
-                )
+                raise RuntimeError(f"Could not inspect the vLLM expert weight loader for {name}.")
 
             self._validate_expert_storage(name, param)
 
@@ -90,9 +89,7 @@ class VllmShardedExpertRefitMixin:
                     )
                 expert_map = getattr(owner, "_expert_map", None)
                 if expert_map is None:
-                    raise RuntimeError(
-                        f"vLLM reports EP for {name} without an expert ownership map."
-                    )
+                    raise RuntimeError(f"vLLM reports EP for {name} without an expert ownership map.")
                 logical_num_experts = int(
                     cast(
                         int,
@@ -106,14 +103,10 @@ class VllmShardedExpertRefitMixin:
                     )
                 )
                 if global_num_experts != logical_num_experts:
-                    raise RuntimeError(
-                        "Sharded refit does not support redundant vLLM experts."
-                    )
+                    raise RuntimeError("Sharded refit does not support redundant vLLM experts.")
                 local_expert_ids = [
                     expert_id
-                    for expert_id, local_id in enumerate(
-                        expert_map.detach().cpu().tolist()[:logical_num_experts]
-                    )
+                    for expert_id, local_id in enumerate(expert_map.detach().cpu().tolist()[:logical_num_experts])
                     if int(local_id) >= 0
                 ]
 
@@ -133,9 +126,7 @@ class VllmShardedExpertRefitMixin:
         # engine would then serve stale experts for the whole run with no
         # exception and no warning, since there is no require_complete()
         # equivalent on this path.
-        if expert_params and not all(
-            ".routed_experts." in name for name in expert_params
-        ):
+        if expert_params and not all(".routed_experts." in name for name in expert_params):
             raise RuntimeError(
                 "vLLM expert parameters are not under the expected "
                 "'.routed_experts.' submodule (saw "
@@ -147,9 +138,7 @@ class VllmShardedExpertRefitMixin:
 
         return {
             "expert_params": expert_params,
-            "missing_weight_prefixes": get_pp_missing_layer_names(
-                self.model_runner.model
-            ),
+            "missing_weight_prefixes": get_pp_missing_layer_names(self.model_runner.model),
         }
 
     @staticmethod
@@ -157,10 +146,7 @@ class VllmShardedExpertRefitMixin:
         """Reject incompatible vLLM storage before advertising shards."""
         is_w13 = param_name.endswith(".w13_weight")
         if param.ndim != 3 or (is_w13 and param.shape[1] % 2 != 0):
-            raise RuntimeError(
-                f"Unsupported vLLM expert storage for {param_name}: "
-                f"shape={tuple(param.shape)}."
-            )
+            raise RuntimeError(f"Unsupported vLLM expert storage for {param_name}: " f"shape={tuple(param.shape)}.")
 
     def _local_expert_id(self, param: torch.nn.Parameter, expert_id: int) -> int:
         weight_loader = getattr(param, "weight_loader", None)
@@ -176,41 +162,55 @@ class VllmShardedExpertRefitMixin:
         param: torch.nn.Parameter,
         shard_id: str,
         items: list[tuple[int, torch.Tensor]],
+        *,
+        split_w13: bool = True,
     ) -> None:
         """Copy destination-local experts into canonical vLLM storage."""
         if shard_id not in {"w1", "w2", "w3"}:
             raise ValueError(f"Unexpected sharded expert shard_id: {shard_id}")
 
         target = param.data
-        if shard_id in {"w1", "w3"}:
+        if shard_id in {"w1", "w3"} and split_w13:
             shard_size = target.shape[1] // 2
             shard_offset = 0 if shard_id == "w1" else shard_size
             target = target.narrow(1, shard_offset, shard_size)
 
-        def copy_to_target(destination: torch.Tensor, source: torch.Tensor) -> None:
-            for dim, size in enumerate(source.shape):
-                destination = destination.narrow(dim, 0, size)
-            destination.copy_(source)
-
         sorted_items = sorted(items, key=lambda item: item[0])
+        expected_item_shape = target.shape[1:]
+        for local_expert_id, source in sorted_items:
+            if not 0 <= local_expert_id < target.shape[0]:
+                raise ValueError(
+                    f"Sharded expert {param_name} local expert id "
+                    f"{local_expert_id} is outside destination extent "
+                    f"{target.shape[0]}."
+                )
+            if source.shape != expected_item_shape:
+                raise ValueError(
+                    f"Sharded expert {param_name}/{shard_id} source for local "
+                    f"expert {local_expert_id} has shape {tuple(source.shape)}, "
+                    f"but the selected destination region requires "
+                    f"{tuple(expected_item_shape)}."
+                )
+
         expert_ids = [expert_id for expert_id, _tensor in sorted_items]
+        if not expert_ids:
+            return
         contiguous_ids = list(range(expert_ids[0], expert_ids[0] + len(expert_ids)))
         with torch.no_grad():
             if expert_ids == contiguous_ids:
                 expert_data = target.narrow(0, expert_ids[0], len(expert_ids))
-                loaded_weight = torch.stack(
-                    [tensor for _expert_id, tensor in sorted_items]
-                )
-                copy_to_target(expert_data, loaded_weight)
+                loaded_weight = torch.stack([tensor for _expert_id, tensor in sorted_items])
+                expert_data.copy_(loaded_weight)
             else:
                 for local_expert_id, loaded_weight in sorted_items:
-                    copy_to_target(target[local_expert_id], loaded_weight)
+                    target[local_expert_id].copy_(loaded_weight)
 
     def _load_sharded_expert_weight_groups(
         self, weights: list[tuple[str, torch.Tensor]]
     ) -> list[tuple[str, torch.Tensor]]:
         params = self._get_named_parameters()
-        groups: dict[tuple[str, str], list[tuple[int, torch.Tensor]]] = {}
+        groups: dict[tuple[str, str, bool], list[tuple[int, torch.Tensor]]] = {}
+        group_source_names: dict[tuple[str, str, bool], set[str]] = {}
         remaining_weights: list[tuple[str, torch.Tensor]] = []
 
         for name, tensor in weights:
@@ -219,24 +219,19 @@ class VllmShardedExpertRefitMixin:
                 remaining_weights.append((name, tensor))
                 continue
 
-            mapped_name = expert_weight.parameter_name
-            param = params.get(mapped_name)
+            mapped_name = resolve_vllm_expert_parameter_name(expert_weight.parameter_name, params)
+            param = params.get(mapped_name) if mapped_name is not None else None
             if param is None:
                 remaining_weights.append((name, tensor))
                 continue
 
             owner = getattr(getattr(param, "weight_loader", None), "__self__", None)
-            if not self._is_sharded_refit_weight(name, tensor) and not bool(
-                getattr(owner, "use_ep", False)
-            ):
+            if not self._is_sharded_refit_weight(name, tensor) and not bool(getattr(owner, "use_ep", False)):
                 remaining_weights.append((name, tensor))
                 continue
 
             if owner is None:
-                raise RuntimeError(
-                    "Could not resolve the vLLM expert weight loader for "
-                    f"{mapped_name}."
-                )
+                raise RuntimeError("Could not resolve the vLLM expert weight loader for " f"{mapped_name}.")
 
             if param.data.ndim != 3 or tensor.ndim != 2:
                 raise ValueError(
@@ -260,26 +255,60 @@ class VllmShardedExpertRefitMixin:
             if local_expert_id == -1:
                 continue
 
-            groups.setdefault((mapped_name, expert_weight.shard_id), []).append(
-                (local_expert_id, tensor)
-            )
+            # Nemotron-H's ``mixer.experts`` block is non-gated. vLLM 0.25
+            # stores its sole input projection in ``w13_weight`` with I (not
+            # 2I) rows and the official loader treats HF ``up_proj`` as w1.
+            # Use vLLM's authoritative activation/storage flag. Missing gate
+            # metadata cannot be treated as proof of a non-gated layer: that
+            # would turn a dropped gate into a false success.
+            split_w13 = bool(getattr(getattr(owner, "moe_config", None), "is_act_and_mul", True))
+            shard_id = expert_weight.shard_id
+            if not split_w13:
+                if name.endswith(".gate_proj.weight"):
+                    raise ValueError(
+                        "Non-gated vLLM expert destination received an unexpected "
+                        f"gate projection: {name}. Refusing to alias it onto w1."
+                    )
+                if name.endswith(".up_proj.weight"):
+                    shard_id = "w1"
 
-        for (mapped_name, shard_id), items in groups.items():
+            group_key = (mapped_name, shard_id, split_w13)
+            groups.setdefault(group_key, []).append((local_expert_id, tensor))
+            group_source_names.setdefault(group_key, set()).add(name)
+
+        for (mapped_name, shard_id, split_w13), items in groups.items():
             self._load_destination_local_expert_group(
-                mapped_name, params[mapped_name], shard_id, items
+                mapped_name,
+                params[mapped_name],
+                shard_id,
+                items,
+                split_w13=split_w13,
+            )
+        if groups:
+            # These parameters bypass vLLM's load_weights API. Accumulate the
+            # exact source expert/shard tokens across the entire transaction;
+            # checkpoint-engine buckets are allowed to split experts and
+            # w1/w2/w3 between calls, so completeness is checked only by the
+            # lifecycle finalizer.
+            self._record_direct_main_load(
+                {
+                    source_name: mapped_name
+                    for (
+                        mapped_name,
+                        _shard_id,
+                        _split_w13,
+                    ), source_names in group_source_names.items()
+                    for source_name in source_names
+                }
             )
 
         return remaining_weights
 
-    def _load_sharded_expert_weights(
-        self, policy_weights: list[tuple[str, torch.Tensor]]
-    ) -> None:
+    def _load_sharded_expert_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         if fp8.is_fp8_model(self.model_runner.vllm_config):
-            raise ValueError(
-                "Sharded NIXL expert refit is not supported for FP8 vLLM models."
-            )
+            raise ValueError("Sharded NIXL expert refit is not supported for FP8 vLLM models.")
 
         remaining_weights = self._load_sharded_expert_weight_groups(policy_weights)
         if remaining_weights:

@@ -1253,11 +1253,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             )
 
             result_or_coro = self.llm.collective_rpc("nccl_reshard_refit", args=tuple())
-            worker_result = result_or_coro[0]
+            worker_results = cast(list[bool], result_or_coro)
 
-            if not worker_result:
+            if not worker_results or not all(worker_results):
                 print(
-                    f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
+                    "Error: Worker failed nccl_reshard_refit. "
+                    f"Results: {worker_results}"
                 )
                 return False
             return True

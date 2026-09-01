@@ -209,6 +209,9 @@ class GenerationConfig(TypedDict):
     val_temperature: float
     val_top_p: float
     val_top_k: int | None
+    # NeMo-Gym only: add the zero-based rollout index as the vLLM request seed.
+    # This is opt-in so normal stochastic training behavior remains unchanged.
+    nemo_gym_add_seed_per_rollout: NotRequired[bool]
     model_name: NotRequired[str]  # Not Required b/c GRPO writes this
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None

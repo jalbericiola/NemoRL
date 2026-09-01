@@ -282,6 +282,112 @@ class TestGenerateAndPushFlow:
         assert buf.remove_calls == [impl.rollout_group_ids[0]]
         assert [call[0] for call in buf.commit_calls] == [impl.rollout_group_ids[1]]
 
+    def test_refit_gate_blocks_every_redispatch_attempt(self):
+        class _GatedRegistry(dict):
+            def __init__(self) -> None:
+                super().__init__()
+                self.permitted = asyncio.Event()
+                self.wait_calls = 0
+
+            async def wait_until_permitted(self) -> None:
+                self.wait_calls += 1
+                await self.permitted.wait()
+
+            def is_permitted(self) -> bool:
+                return self.permitted.is_set()
+
+        async def _main() -> None:
+            attempts = 0
+            registry = _GatedRegistry()
+            registry.permitted.set()
+
+            async def _fail_first_attempt(_sample):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    registry.permitted.clear()
+                    raise GenerationUnavailable("injected first-attempt failure")
+
+            buf = _FakeBuffer()
+            policy = RolloutRetryPolicy.single_attempt(
+                max_infra_attempts=2,
+                backoff_base_s=0.0,
+            )
+            mgr = _make_manager(
+                buf,
+                _FakeImpl(record="recovered", on_run=_fail_first_attempt),
+                retry_policy=policy,
+            )
+
+            rollout_task = asyncio.create_task(
+                mgr.generate_and_push(
+                    {"prompt": "p"},
+                    inflight_registry=registry,
+                )
+            )
+            while registry.wait_calls < 2:
+                await asyncio.sleep(0)
+
+            assert len(buf.reserve_calls) == 1
+            assert not rollout_task.done()
+
+            registry.permitted.set()
+            await rollout_task
+
+            assert registry.wait_calls == 2
+            assert len(buf.reserve_calls) == 2
+
+        _run(_main())
+
+    def test_refit_gate_recheck_closes_resolved_waiter_race(self):
+        class _RacingRegistry(dict):
+            def __init__(self) -> None:
+                super().__init__()
+                self.permitted = asyncio.Event()
+                self.permitted.set()
+                self.wait_calls = 0
+
+            async def wait_until_permitted(self) -> None:
+                self.wait_calls += 1
+                await self.permitted.wait()
+                if self.wait_calls == 1:
+                    # Model Event.wait() resolving just before refit clears the
+                    # gate. RolloutManager must catch this after reserve but before
+                    # the registry insertion that marks generation as admitted.
+                    self.permitted.clear()
+
+            def is_permitted(self) -> bool:
+                return self.permitted.is_set()
+
+        async def _main() -> None:
+            registry = _RacingRegistry()
+            buf = _FakeBuffer()
+            impl = _FakeImpl(record="recovered")
+            mgr = _make_manager(buf, impl)
+
+            rollout_task = asyncio.create_task(
+                mgr.generate_and_push(
+                    {"prompt": "p"},
+                    inflight_registry=registry,
+                )
+            )
+            while registry.wait_calls < 2:
+                await asyncio.sleep(0)
+
+            assert len(buf.reserve_calls) == 1
+            assert len(buf.remove_calls) == 1
+            assert impl.rollout_group_ids == []
+            assert registry == {}
+            assert not rollout_task.done()
+
+            registry.permitted.set()
+            await rollout_task
+
+            assert len(buf.reserve_calls) == 2
+            assert len(buf.commit_calls) == 1
+
+        _run(_main())
+
     def test_start_weight_version_pinned_at_reserve_time(self):
         """If set_weight_version is called mid-rollout, start != end."""
         buf = _FakeBuffer()
@@ -417,7 +523,10 @@ def test_rollout_manager_forwards_mask_env_flagged_samples():
 
 
 def _nemo_gym_impl(
-    mask_env_flagged_samples: bool, num_generations_per_prompt: int = 1
+    mask_env_flagged_samples: bool,
+    num_generations_per_prompt: int = 1,
+    *,
+    add_seed_per_rollout: bool = False,
 ) -> AsyncNemoGymRolloutImpl:
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
@@ -432,6 +541,7 @@ def _nemo_gym_impl(
             "temperature": 0.7,
             "top_p": 0.9,
             "max_new_tokens": 64,
+            "nemo_gym_add_seed_per_rollout": add_seed_per_rollout,
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
     )
@@ -504,6 +614,151 @@ def test_nemo_gym_inputs_isolate_repeated_attempts():
     )
 
     assert first[0][NEMO_GYM_TASK_INDEX_KEY] != second[0][NEMO_GYM_TASK_INDEX_KEY]
+
+
+def test_nemo_gym_inputs_add_per_rollout_seed_and_preserve_extra_body():
+    input_sample = cast(
+        DatumSpec,
+        {
+            "extra_env_info": {
+                "responses_create_params": {
+                    "metadata": {
+                        "request_label": "kept",
+                        "extra_body": json.dumps(
+                            {
+                                "guided_decoding": {"choice": ["A", "B"]},
+                                "seed": 99,
+                            }
+                        ),
+                    }
+                }
+            }
+        },
+    )
+    original = deepcopy(input_sample)
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        num_generations_per_prompt=4,
+        add_seed_per_rollout=True,
+    )
+
+    rows = impl._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000001",
+    )
+
+    assert input_sample == original
+    assert [
+        json.loads(row["responses_create_params"]["metadata"]["extra_body"])["seed"]
+        for row in rows
+    ] == [0, 1, 2, 3]
+    for row in rows:
+        metadata = row["responses_create_params"]["metadata"]
+        assert metadata["request_label"] == "kept"
+        assert json.loads(metadata["extra_body"])["guided_decoding"] == {
+            "choice": ["A", "B"]
+        }
+
+
+def test_nemo_gym_inputs_leave_existing_seed_unchanged_when_disabled():
+    input_sample = cast(
+        DatumSpec,
+        {
+            "extra_env_info": {
+                "responses_create_params": {
+                    "metadata": {"extra_body": json.dumps({"seed": 91})}
+                }
+            }
+        },
+    )
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        num_generations_per_prompt=2,
+    )
+
+    rows = impl._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000001",
+    )
+
+    assert [
+        json.loads(row["responses_create_params"]["metadata"]["extra_body"])["seed"]
+        for row in rows
+    ] == [91, 91]
+
+
+def test_nemo_gym_inputs_reuse_per_rollout_seeds_across_attempts():
+    input_sample = cast(
+        DatumSpec,
+        {"extra_env_info": {"responses_create_params": {}}},
+    )
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        num_generations_per_prompt=3,
+        add_seed_per_rollout=True,
+    )
+
+    first = impl._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000001",
+    )
+    second = impl._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000002",
+    )
+
+    for rows in (first, second):
+        assert [
+            json.loads(row["responses_create_params"]["metadata"]["extra_body"])["seed"]
+            for row in rows
+        ] == [0, 1, 2]
+
+
+@pytest.mark.parametrize(
+    ("extra_body", "error_match"),
+    [
+        ("{not-json", "must be valid JSON"),
+        ("[]", "must decode to a JSON object"),
+        ("null", "must decode to a JSON object"),
+        ({"seed": 4}, "must be a JSON-encoded object string"),
+    ],
+)
+def test_nemo_gym_inputs_reject_malformed_seed_extra_body(extra_body, error_match):
+    input_sample = cast(
+        DatumSpec,
+        {
+            "extra_env_info": {
+                "responses_create_params": {"metadata": {"extra_body": extra_body}}
+            }
+        },
+    )
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        add_seed_per_rollout=True,
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        impl._build_inputs(
+            input_sample,
+            rollout_group_id="00000000-0000-4000-8000-000000000001",
+        )
+
+
+def test_nemo_gym_inputs_reject_non_object_seed_metadata():
+    input_sample = cast(
+        DatumSpec,
+        {"extra_env_info": {"responses_create_params": {"metadata": []}}},
+    )
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        add_seed_per_rollout=True,
+    )
+
+    with pytest.raises(ValueError, match="metadata must be an object"):
+        impl._build_inputs(
+            input_sample,
+            rollout_group_id="00000000-0000-4000-8000-000000000001",
+        )
 
 
 def _mask_gate_result():

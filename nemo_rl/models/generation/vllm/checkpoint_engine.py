@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import logging
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -26,6 +27,8 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from nemo_rl.utils.checkpoint_engines.base import CheckpointEngine
@@ -44,8 +47,7 @@ def configure_nixl_worker(config: VllmConfig, vllm_kwargs: dict[str, Any]) -> No
     worker_cls = vllm_kwargs.setdefault("worker_cls", NIXL_VLLM_WORKER)
     if worker_cls != NIXL_VLLM_WORKER:
         raise ValueError(
-            "NIXL checkpoint-engine refit requires vllm_kwargs.worker_cls to "
-            f"be unset or {NIXL_VLLM_WORKER}."
+            "NIXL checkpoint-engine refit requires vllm_kwargs.worker_cls to " f"be unset or {NIXL_VLLM_WORKER}."
         )
 
     additional_config = dict(vllm_kwargs.get("additional_config") or {})
@@ -64,12 +66,8 @@ def preinit_nixl_from_vllm_config(vllm_config: Any) -> Any:
         resolve_nixl_backend_kwargs,
     )
 
-    backend_name, backend_init_params = resolve_nixl_backend_kwargs(
-        checkpoint_config["engine_kwargs"]["nixl"]
-    )
-    return preinit_nixl_agent(
-        backend_name=backend_name, backend_init_params=backend_init_params
-    )
+    backend_name, backend_init_params = resolve_nixl_backend_kwargs(checkpoint_config["engine_kwargs"]["nixl"])
+    return preinit_nixl_agent(backend_name=backend_name, backend_init_params=backend_init_params)
 
 
 def resolve_rollout_rank(rank_prefix: int, rollout_world_size: int) -> int:
@@ -143,18 +141,41 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
         load_time = 0.0
         start_time = time.time()
 
-        async for weight_batch in self.checkpoint_engine.receive_weight_batches():
-            loaded_batches += 1
-            loaded_tensors += len(weight_batch)
-            loaded_bytes += sum(weight.nbytes for _name, weight in weight_batch)
+        # One checkpoint-engine update can arrive in many batches. Keep the
+        # same transaction lifecycle as IPC/collective so destination coverage
+        # is checked only after every vLLM loader result has been accumulated.
+        with self._weight_update_lifecycle("checkpoint_engine") as finalize:
+            async for weight_batch in self.checkpoint_engine.receive_weight_batches():
+                loaded_batches += 1
+                loaded_tensors += len(weight_batch)
+                loaded_bytes += sum(weight.nbytes for _name, weight in weight_batch)
 
-            load_start = time.time()
-            self._load_weights(weight_batch)
-            torch.cuda.current_stream().synchronize()
-            load_time += time.time() - load_start
-            del weight_batch
+                load_start = time.time()
+                try:
+                    try:
+                        self._load_weights(weight_batch)
+                    except BaseException:
+                        # A loader/direct-expert path may enqueue CUDA copies
+                        # before failing. Fence them before the checkpoint
+                        # engine can recycle this batch's NIXL backing buffer.
+                        # Preserve the original loader exception even if the
+                        # fence also fails.
+                        try:
+                            torch.cuda.current_stream().synchronize()
+                        except BaseException:
+                            logger.exception(
+                                "CUDA synchronization also failed while "
+                                "unwinding a checkpoint-engine weight-load "
+                                "failure"
+                            )
+                        raise
+                    else:
+                        torch.cuda.current_stream().synchronize()
+                finally:
+                    load_time += time.time() - load_start
+                    del weight_batch
 
-        self._maybe_process_fp8_kv_cache()
+            finalize()
 
         total_time = time.time() - start_time
         loaded_gib = loaded_bytes / (1024 * 1024 * 1024)
@@ -166,9 +187,7 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
         )
         return True
 
-    @wrap_with_nvtx_name(
-        "vllm_internal_worker_extension/update_weights_from_checkpoint_engine"
-    )
+    @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_from_checkpoint_engine")
     def update_weights_from_checkpoint_engine(self) -> bool:  # pragma: no cover
         return asyncio.run(self._update_weights_from_checkpoint_engine_async())
 
@@ -181,7 +200,8 @@ class VllmCheckpointEngineRpcMixin:
     ) -> Any:  # pragma: no cover
         result = self.llm.collective_rpc(checkpoint_method, args=method_args)
         if checkpoint_method == "update_weights_from_checkpoint_engine":
-            return all(item for item in result if item is not None)
+            worker_results = [item for item in result if item is not None]
+            return bool(worker_results) and all(worker_results)
         return result
 
 
@@ -198,5 +218,6 @@ class VllmAsyncCheckpointEngineRpcMixin:
         result = await self.llm.collective_rpc(checkpoint_method, args=method_args)
         result = await resolve_collective_rpc_result(result)
         if checkpoint_method == "update_weights_from_checkpoint_engine":
-            return all(item for item in result if item is not None)
+            worker_results = [item for item in result if item is not None]
+            return bool(worker_results) and all(worker_results)
         return result

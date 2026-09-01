@@ -486,6 +486,46 @@ def materialize_shared_prefix_layout(
     )
 
 
+def materialize_shared_prefix_token_aligned_tensor(
+    source: torch.Tensor,
+    *,
+    tensor_bin: SharedPrefixTensorBin,
+    padding_value: int | float = 0,
+) -> torch.Tensor:
+    """Gather a token-aligned source tensor into the star's physical order.
+
+    This is used for metadata such as MTP loss masks that must follow exactly
+    the same prompt deduplication, branch padding, and row permutation as token
+    IDs.  The returned tensor is global and unsharded; topology-only padding is
+    applied by the caller together with the model input.
+    """
+    if source.ndim != 2:
+        raise ValueError(
+            "shared-prefix token-aligned source must have shape [batch, sequence]"
+        )
+    indices = tensor_bin.indices
+    if indices.token_gather_rows.numel() != tensor_bin.layout.physical_total_length:
+        raise ValueError("shared-prefix token gather rows do not match physical length")
+    if source.shape[0] <= int(indices.token_gather_rows.max().item()):
+        raise ValueError("shared-prefix token-aligned source is missing a referenced row")
+
+    required_width = int(indices.token_gather_columns.max().item()) + 1
+    gather_source = source
+    if required_width > source.shape[1]:
+        gather_source = torch.nn.functional.pad(
+            source,
+            (0, required_width - source.shape[1]),
+            value=padding_value,
+        )
+    packed = gather_source[
+        indices.token_gather_rows,
+        indices.token_gather_columns,
+    ].clone()
+    if indices.physical_padding_positions.numel():
+        packed[indices.physical_padding_positions] = padding_value
+    return packed
+
+
 def build_shared_prefix_tensor_plan(
     *,
     input_ids: torch.Tensor,

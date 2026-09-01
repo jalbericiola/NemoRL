@@ -50,21 +50,37 @@ Every rollout row is stamped with a stable shared-prefix group ID and its
 unpadded prompt length. The group ID is authoritative. Rows with different IDs
 are never merged merely because their prompt tokens happen to be equal.
 
-A group is eligible only when all of the following hold:
+A rollout group is complete for opportunity accounting only when:
 
 1. It contains exactly the configured number of generations.
 2. Every row has the same complete, unpadded prompt token sequence.
-3. The whole group is local to the same data-parallel rank and execution slot.
 
-An incomplete group uses the conventional per-row path. A group ID that maps
-to different prompt tokens is treated as corrupted metadata and fails instead
-of silently sharing the wrong state.
+For execution, the rows that form a star must also be local to the same
+data-parallel rank and driver-prescribed execution slot. A complete group may
+be split across several slots to satisfy the token capacity.
 
-The driver shards complete groups coherently across data-parallel ranks and
-assigns fixed execution slots using conservative padded lengths. Every rank
-therefore executes the same number of real forwards; dummy model forwards are
-not used. If a star cannot be constructed within its prescribed slot, the
-whole slot falls back to conventional execution.
+Opportunity accounting treats rows without a group ID and incomplete groups as
+fallback sequences. A group ID that maps to different prompt tokens is treated
+as corrupted metadata and fails in both `observe` and `train` instead of
+silently sharing the wrong state. The backend-neutral bin planner also records
+per-row fallback reasons and keys candidate stars by both group ID and exact
+prompt; that defensive behavior does not relax the driver contract below.
+
+The `train` driver planners are intentionally stricter than opportunity
+accounting. They require complete equal-size groups, prevent a group from
+crossing a logical global-batch boundary, and require an integral number of
+groups per data-parallel rank. These are invariants established by the
+supported rollout stamping and admission paths. A violation raises before
+model execution rather than degrading an incomplete group to per-row training.
+
+The driver then shards complete groups coherently across data-parallel ranks
+and assigns fixed execution slots using conservative padded lengths. Every
+rank therefore executes the same number of real forwards; dummy model forwards
+are not used. Each prescribed slot is re-planned from the live tensors. It runs
+as one star only if exact validation covers every row in that slot; otherwise,
+the whole slot uses one conventional packed fallback forward. That fallback
+must still fit the prescribed capacity, or the step raises. Rows are never
+silently dropped, and fallback is per slot rather than per row.
 
 ## Model Execution
 
@@ -121,22 +137,52 @@ shareable prompt from those effects.
 
 `train` is deliberately fail-closed. The current capability is limited to:
 
-- Megatron Hybrid models with the matching shared-prefix capability marker.
-- tensor parallel, context parallel, and pipeline parallel sizes all equal to
-  one; sequence parallelism disabled.
-- sequence packing enabled and MTP disabled.
-- no full/core-attention recompute, fine-grained activation offload, training
-  CUDA graphs, FP8, or FP4.
-- zero attention and hidden dropout, standard RoPE, vanilla softmax, no
-  sliding-window attention, and no multi-latent attention.
+- Megatron Bridge `HybridModelProvider` models backed by an MCore build that
+  advertises the exact topology capability: `hybrid_star_cp1_tp1_v1` for
+  TP1/CP1, `hybrid_star_cp_v1` for TP1/CP>1,
+  `hybrid_star_cp1_tp_sp_v1` for TP>1/CP1, or
+  `hybrid_star_cp_tp_sp_v1` for combined TP>1/CP>1. A kernel-only port is not
+  sufficient.
+- pipeline parallel size one. TP and CP may be greater than one, but sequence
+  parallelism must be enabled exactly when TP>1. Every topology also requires
+  `hybrid_star_explicit_physical_padding_v1`; packing capacities and an
+  explicit `make_sequence_length_divisible_by` value must be multiples of the
+  resolved TP/CP physical alignment.
+- sequence packing enabled, with dynamic batching, model-owned packing,
+  model-owned context-parallel slicing, multimodal/VLM batches, router replay,
+  separate Eagle draft-model training, fused linear log-probabilities, and
+  Megatron PEFT/LoRA disabled.
+- activation recompute may be disabled. When it is enabled, selective
+  recompute must exclude `core_attn`, while full recompute requires
+  `recompute_method: uniform` and
+  `recompute_num_layers: 1`. Full recompute additionally requires
+  `hybrid_star_full_uniform_recompute_v1`. Fine-grained activation offload is
+  not supported.
+- zero attention and hidden dropout, vanilla softmax, no sliding-window
+  attention, and no multi-latent attention.
 - deterministic MoE routing without auxiliary or z losses, router jitter,
-  capacity dropping, forced/random routing, or expert-bias updates.
+  capacity dropping, or forced/random routing. Expert-bias updates are
+  supported only with `hybrid_star_moe_expert_bias_v1`; routed-token counts
+  then use dense-baseline multiplicity so a shared prompt contributes once per
+  completion.
+- MTP is supported only with `hybrid_star_mtp_dense_heads_v1`. The shared
+  backbone may contain Mamba, but the MTP predictor pattern must use
+  attention/MLP or attention/MoE layers rather than Mamba layers.
+- positionless Hybrid attention is supported only with
+  `hybrid_star_positionless_attention_v1`; other supported models must use
+  standard RoPE.
+- no training CUDA graphs, FP8, or FP4.
 - no QK clipping or log-max-attention-logit modification.
 - sampling without top-k or top-p log-probability truncation.
 
-Unsupported resolved model settings raise before the first training forward.
-This is important because a configuration field that is dormant for a dense
-model does not necessarily make that dense model unsupported.
+Capability requirements are conjunctive: the resolved model must advertise its
+topology token, explicit-padding token, and every feature token used by the
+recipe. Configuration validation rejects backend-independent incompatibilities
+first; after Megatron Bridge resolves the provider, model-capability validation
+rejects unsupported resolved settings before the first training forward, and
+the worker repeats critical runtime checks. This is important because a
+configuration field that is dormant for a dense model does not necessarily
+make that dense model unsupported.
 
 The fused forest-attention implementation retains a Triton merge kernel for
 future work, but production use is hard-disabled pending a fix for observed

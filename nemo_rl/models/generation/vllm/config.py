@@ -75,6 +75,11 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Independent, fail-closed intent for captured-cohort replay. The bundle
+    # path is supplied separately through NEMORL_VLLM_REPLAY_BUNDLE, while this
+    # config digest remains authoritative if actor environment variables vanish.
+    replay_required: NotRequired[bool]
+    replay_bundle_sha256: NotRequired[str | None]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
     # Invalidate weight-dependent multimodal encoder outputs after a successful
@@ -168,6 +173,9 @@ class VllmRefitConfig(BaseModel, extra="allow"):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # Derived from the allocated generation world and injected by
+    # VllmGeneration before actor construction. It is not a recipe option.
+    _replay_data_parallel_size: NotRequired[int]
     # Null uses the topology default (IPC colocated, NCCL non-colocated).
     # Built-ins select sparse delta over S3/ZeroMQ or NIXL.
     # A custom checkpoint engine may use a ``module:ClassName`` selector.
