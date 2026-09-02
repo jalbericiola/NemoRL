@@ -255,6 +255,10 @@ class SyncRolloutActor:
             uses for compute (rewards, masks, lengths, prompt_ids_for_adv,
             …) — stays on the driver, never crosses an actor boundary.
         """
+        if "loss_multiplier" not in input_batch:
+            raise ValueError("rollout input batch requires loss_multiplier")
+        _resolve_training_sample_mask(input_batch["loss_multiplier"], None)
+
         # Lazy imports keep rollout-specific dependencies off the actor startup path.
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
@@ -288,7 +292,8 @@ class SyncRolloutActor:
         )
 
         # Rollout dispatch (mirrors grpo_sync.py:294-349).
-        if should_use_nemo_gym(cfg):
+        use_nemo_gym = should_use_nemo_gym(cfg)
+        if use_nemo_gym:
             r = run_nemo_gym_rollout_sync(
                 **common,
                 max_seq_len=None,
@@ -327,21 +332,17 @@ class SyncRolloutActor:
         del final_batch
         sample_mask = _resolve_training_sample_mask(
             fb["loss_multiplier"],
-            fb.get("mask_sample"),
+            fb.get("mask_sample") if use_nemo_gym else None,
         )
         # Native environments have no Gym shaping/penalty stages. Materialize
         # independent snapshots at this boundary so every row uses the same
         # observability schema without aliasing effective reward storage.
-        raw_environment_reward = (
-            fb[RAW_ENVIRONMENT_REWARD].clone()
-            if RAW_ENVIRONMENT_REWARD in fb
-            else fb["total_reward"].clone()
-        )
-        pre_penalty_reward = (
-            fb[PRE_PENALTY_REWARD].clone()
-            if PRE_PENALTY_REWARD in fb
-            else fb["total_reward"].clone()
-        )
+        if use_nemo_gym:
+            raw_environment_reward = fb[RAW_ENVIRONMENT_REWARD].clone()
+            pre_penalty_reward = fb[PRE_PENALTY_REWARD].clone()
+        else:
+            raw_environment_reward = fb["total_reward"].clone()
+            pre_penalty_reward = fb["total_reward"].clone()
 
         # Flatten message_log → bulk tensors + extract original prompt ids.
         # GRPO masks only generated assistant turns, even if the dataset

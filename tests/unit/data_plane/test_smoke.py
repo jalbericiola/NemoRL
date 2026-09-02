@@ -73,6 +73,30 @@ def test_sync_rollout_actor_rejects_invalid_gym_mask(
         _resolve_training_sample_mask(torch.ones(2), mask_sample)
 
 
+@pytest.mark.parametrize(
+    ("input_data", "match"),
+    [
+        ({"row": [0]}, "requires loss_multiplier"),
+        (
+            {"loss_multiplier": torch.tensor([float("nan")])},
+            "finite and nonnegative",
+        ),
+    ],
+)
+def test_sync_rollout_actor_requires_valid_loss_multiplier_before_work(
+    input_data: dict[str, object],
+    match: str,
+) -> None:
+    import nemo_rl.experience.sync_rollout_actor as actor_mod
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    actor_cls = actor_mod.SyncRolloutActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+
+    with pytest.raises(ValueError, match=match):
+        actor.rollout_to_tq(BatchedDataDict(input_data), partition_id="train")
+
+
 @pytest.mark.parametrize(("gate_enabled", "expected_mask"), [(True, 0.0), (False, 0.5)])
 def test_sync_rollout_actor_writes_one_resolved_mask_and_reward_schema(
     monkeypatch: pytest.MonkeyPatch,
@@ -163,7 +187,7 @@ def test_sync_rollout_actor_writes_one_resolved_mask_and_reward_schema(
     monkeypatch.setattr(actor_mod, "kv_first_write", fake_first_write)
 
     _, driver_carry, _, _ = actor.rollout_to_tq(
-        BatchedDataDict({"row": [0]}),
+        BatchedDataDict({"loss_multiplier": torch.tensor([0.5])}),
         partition_id="train",
     )
 
@@ -176,6 +200,95 @@ def test_sync_rollout_actor_writes_one_resolved_mask_and_reward_schema(
     assert bulk["total_reward"].tolist() == [0.0]
     assert bulk["extra_env_info"].tolist() == [raw_extras]
     assert raw_extras["instance_config"]["mask_sample"] is True
+
+
+def test_sync_rollout_actor_ignores_native_mask_sample_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nemo_rl.experience.sync_rollout_actor as actor_mod
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    actor_cls = actor_mod.SyncRolloutActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor.policy_generation = None
+    actor.tokenizer = SimpleNamespace(pad_token_id=0)
+    actor.task_to_env = {}
+    actor._dp_client = object()
+    actor.master_config = SimpleNamespace(
+        policy={
+            "generation": {},
+            "max_total_sequence_length": 16,
+            "make_sequence_length_divisible_by": 1,
+            "router_replay": {"enabled": False},
+        },
+        env={},
+        grpo=SimpleNamespace(
+            max_rollout_turns=1,
+            deduplicate_multimodal_data=True,
+        ),
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_run_multi_turn_rollout(**_kwargs):
+        return BatchedDataDict(
+            {
+                "message_log": [
+                    [
+                        {
+                            "role": "user",
+                            "content": "prompt",
+                            "token_ids": torch.tensor([1]),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "answer",
+                            "token_ids": torch.tensor([2, 3]),
+                            "generation_logprobs": torch.tensor([-0.1, -0.2]),
+                        },
+                    ]
+                ],
+                "length": torch.tensor([1]),
+                "loss_multiplier": torch.tensor([0.5]),
+                # Native rollouts preserve arbitrary DatumSpec extras. This name
+                # must not be interpreted as NeMo-Gym's resolved mask channel.
+                "mask_sample": torch.tensor([True]),
+                "raw_environment_reward": torch.tensor([99.0]),
+                "pre_penalty_reward": torch.tensor([88.0]),
+                "total_reward": torch.tensor([1.25]),
+                "truncated": torch.tensor([False]),
+                "extra_env_info": [{"mask_sample": True}],
+            }
+        ), {}
+
+    def fake_first_write(data, **kwargs):
+        captured["bulk"] = data
+        return SimpleNamespace(sample_ids=kwargs["sample_ids"])
+
+    monkeypatch.setattr(
+        actor_mod,
+        "run_multi_turn_rollout",
+        fake_run_multi_turn_rollout,
+    )
+    monkeypatch.setattr(
+        actor_mod,
+        "get_shared_prefix_training_config",
+        lambda _policy: SimpleNamespace(mode="off"),
+    )
+    monkeypatch.setattr(actor_mod, "trace_rollout_payload", lambda **_kwargs: None)
+    monkeypatch.setattr(actor_mod, "kv_first_write", fake_first_write)
+
+    _, driver_carry, _, _ = actor.rollout_to_tq(
+        BatchedDataDict({"loss_multiplier": torch.tensor([0.5])}),
+        partition_id="train",
+    )
+
+    bulk = captured["bulk"]
+    assert bulk["sample_mask"].tolist() == [0.5]
+    assert driver_carry["loss_multiplier"].tolist() == [0.5]
+    assert bulk["raw_environment_reward"].tolist() == [1.25]
+    assert bulk["pre_penalty_reward"].tolist() == [1.25]
+    assert bulk["total_reward"].tolist() == [1.25]
 
 
 def test_sync_rollout_actor_registered_under_vllm_tier() -> None:
