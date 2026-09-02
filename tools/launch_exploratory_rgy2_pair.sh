@@ -46,7 +46,7 @@ readonly FIXTURE_PATH="${BASE_RUNNABLE}/single_env_ab/data/reasoning_gym_example
 readonly MODEL_PATH="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/venkats/nemo-evaluator-rundirs/nano_v35_sft/conversions/upsampled-iter6000/hf"
 readonly CONTAINER="/lustre/fs1/portfolios/llmservice/projects/llmservice_nemotron_ultra/users/sauramishra/containers/rl-gym.63635108.sqsh"
 readonly SANDBOX_CONTAINER="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/geshen/mopd_nano_fast/images/nemo-skills-sandbox-no-sync.sqsh"
-readonly STATE_ROOT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/exploratory_rgy2_flashinfer_45783907_qfix_NON_ACCEPTANCE"
+readonly STATE_ROOT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/exploratory_rgy2_flashinfer_45783907_qfix_mem20_NON_ACCEPTANCE"
 
 readonly EXPECTED_NEMO_HEAD="45783907244256fce0ed8c8f7512c3fd6ed51acd"
 readonly EXPECTED_NEMO_TREE="5e446d1ba1e5b544f09b6459526a8d77263d4ab6"
@@ -67,10 +67,11 @@ readonly ACCOUNT="nemotron_sw_post"
 readonly PARTITION="batch"
 readonly QOS="short"
 readonly WALLTIME="02:00:00"
-# The 0.6 calibration left only 3.56 MiB free when fused Adam lazily
-# materialized its first-step state. Four 2k-token eager rollouts need far less
-# KV capacity, so reserve deterministic optimizer headroom for this canary.
-readonly VLLM_GPU_MEMORY_UTILIZATION="0.4"
+# The 0.4 calibration still retained 93.09 GiB in vLLM (including a roughly
+# 71-GiB automatic KV allocation) and left only 13.56 MiB when fused Adam
+# lazily materialized its state. Four 2k-token eager rollouts need far less KV
+# capacity, so release roughly another 37 GiB for the optimizer canary.
+readonly VLLM_GPU_MEMORY_UTILIZATION="0.2"
 
 usage() {
   printf 'Usage: %s <--check|--submit>\n' "${0##*/}" >&2
@@ -286,7 +287,7 @@ fi
 }
 umask 077
 readonly pair_nonce="$(/cm/local/apps/python3/bin/python3 -I -B -c 'import secrets; print(secrets.token_hex(8))')"
-readonly pair_id="exploratory-rgy2-flashinfer-45783907-qfix-mem40-NON-ACCEPTANCE-$(date -u +%Y%m%dT%H%M%SZ)-${pair_nonce}"
+readonly pair_id="exploratory-rgy2-flashinfer-45783907-qfix-mem20-NON-ACCEPTANCE-$(date -u +%Y%m%dT%H%M%SZ)-${pair_nonce}"
 readonly pair_root="${STATE_ROOT}/${pair_id}"
 mkdir -p -- "${pair_root}/off" "${pair_root}/on"
 
