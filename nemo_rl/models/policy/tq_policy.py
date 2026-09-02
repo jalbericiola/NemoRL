@@ -29,8 +29,10 @@ no key minting). Workers fetch their slice from TQ via
 
 from __future__ import annotations
 
+import math
 import warnings
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Optional
@@ -65,13 +67,152 @@ from nemo_rl.utils.timer import Timer
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+def _finite_scalar(value: Any, field: str) -> float:
+    if callable(getattr(value, "numel", None)) and callable(
+        getattr(value, "item", None)
+    ):
+        if value.numel() != 1:
+            raise TypeError(f"replicated {field} must contain exactly one scalar")
+        value = value.item()
+    if isinstance(value, bool):
+        raise TypeError(f"replicated {field} must be a numeric scalar, not bool")
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"replicated {field} must be a numeric scalar") from exc
+    if not math.isfinite(scalar):
+        raise ValueError(f"replicated {field} must be finite, got {scalar}")
+    return scalar
+
+
+def _aggregate_replicated_scalar_metrics(
+    results: list[dict[str, Any]],
+    field: str,
+    *,
+    expected_keys: frozenset[str] | None = None,
+) -> dict[str, float] | None:
+    """Return one canonical copy of an already globally reduced metric map.
+
+    Megatron's MTP tracker reduces loss/acceptance statistics over DP×CP and
+    broadcasts them over PP before the worker returns. The detached-head grad
+    norm is likewise model-parallel reduced. Consequently every DP-replica
+    leader must return the same scalar map; summing those copies would inflate
+    the values by DP size. Validate that contract and sort the keys so result
+    order and mapping insertion order cannot affect the controller payload.
+    """
+    present = [field in result for result in results]
+    if not any(present):
+        if expected_keys:
+            raise RuntimeError(
+                f"required replicated {field} is missing; expected keys "
+                f"{sorted(expected_keys)}"
+            )
+        return None
+    if expected_keys == frozenset():
+        raise RuntimeError(f"unexpected replicated {field} while feature is disabled")
+    if not all(present):
+        missing = [index for index, has_field in enumerate(present) if not has_field]
+        raise RuntimeError(
+            f"inconsistent replicated {field}: missing from result(s) {missing}"
+        )
+
+    metric_maps = [result[field] for result in results]
+    if any(not isinstance(metrics, Mapping) for metrics in metric_maps):
+        raise TypeError(f"replicated {field} must be a mapping of scalar metrics")
+    if any(
+        not isinstance(metric_name, str)
+        for metrics in metric_maps
+        for metric_name in metrics
+    ):
+        raise TypeError(f"replicated {field} keys must be strings")
+
+    actual_keys = set(metric_maps[0])
+    for index, metrics in enumerate(metric_maps[1:], start=1):
+        if set(metrics) != actual_keys:
+            raise RuntimeError(
+                f"inconsistent replicated {field} keys in result {index}: "
+                f"expected {sorted(actual_keys)}, got {sorted(metrics)}"
+            )
+    if expected_keys is not None and actual_keys != expected_keys:
+        raise RuntimeError(
+            f"replicated {field} schema does not match configuration: "
+            f"expected {sorted(expected_keys)}, got {sorted(actual_keys)}"
+        )
+
+    canonical: dict[str, float] = {}
+    for metric_name in sorted(actual_keys):
+        values = [
+            _finite_scalar(metrics[metric_name], f"{field}/{metric_name}")
+            for metrics in metric_maps
+        ]
+        expected = values[0]
+        if any(value != expected for value in values[1:]):
+            raise RuntimeError(
+                f"inconsistent replicated {field}/{metric_name}: {values}"
+            )
+        canonical[metric_name] = expected
+    return canonical
+
+
+def _aggregate_replicated_scalar(
+    results: list[dict[str, Any]],
+    field: str,
+    *,
+    expected: bool | None = None,
+) -> float | None:
+    """Validate and canonicalize an optional globally replicated scalar."""
+    present = [field in result for result in results]
+    if not any(present):
+        if expected is True:
+            raise RuntimeError(f"required replicated {field} is missing")
+        return None
+    if expected is False:
+        raise RuntimeError(f"unexpected replicated {field} while feature is disabled")
+    if not all(present):
+        missing = [index for index, has_field in enumerate(present) if not has_field]
+        raise RuntimeError(
+            f"inconsistent replicated {field}: missing from result(s) {missing}"
+        )
+    values = [_finite_scalar(result[field], field) for result in results]
+    expected = values[0]
+    if any(value != expected for value in values[1:]):
+        raise RuntimeError(f"inconsistent replicated {field}: {values}")
+    return expected
+
+
+def _aggregate_train_results(
+    results: list[dict[str, Any]],
+    *,
+    replicated_results: list[dict[str, Any]] | None = None,
+    expected_mtp_metric_keys: frozenset[str] | None = None,
+    expect_draft_grad_norm: bool | None = None,
+) -> dict[str, Any]:
+    if not results:
+        raise ValueError("cannot aggregate an empty list of training results")
+    replicas = results if replicated_results is None else replicated_results
+    if not replicas:
+        raise ValueError("cannot validate an empty list of replicated results")
+
     out: dict[str, Any] = {
         "loss": results[0]["global_loss"],
         "grad_norm": results[0]["grad_norm"],
     }
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
+    mtp_metrics = _aggregate_replicated_scalar_metrics(
+        replicas,
+        "mtp_metrics",
+        expected_keys=expected_mtp_metric_keys,
+    )
+    if mtp_metrics is not None:
+        out["mtp_metrics"] = mtp_metrics
+    draft_grad_norm = _aggregate_replicated_scalar(
+        replicas,
+        "draft_grad_norm",
+        expected=expect_draft_grad_norm,
+    )
+    if draft_grad_norm is not None:
+        out["draft_grad_norm"] = draft_grad_norm
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():
@@ -135,6 +276,57 @@ class TQPolicy(Policy):
             self.worker_group.run_all_workers_single_data(
                 "setup_data_plane", cfg=dp_cfg
             )
+        )
+
+    def _optimizer_clips_gradients(self) -> bool:
+        megatron_cfg = self.cfg.get("megatron_cfg") or {}
+        optimizer_cfg = megatron_cfg.get("optimizer") or {}
+        clip_grad = optimizer_cfg.get("clip_grad", 0.0)
+        if isinstance(clip_grad, bool):
+            raise TypeError("policy.megatron_cfg.optimizer.clip_grad must be numeric")
+        try:
+            clip_grad_value = float(clip_grad)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "policy.megatron_cfg.optimizer.clip_grad must be numeric"
+            ) from exc
+        if not math.isfinite(clip_grad_value) or clip_grad_value < 0:
+            raise ValueError(
+                "policy.megatron_cfg.optimizer.clip_grad must be finite and >= 0"
+            )
+        return clip_grad_value > 0
+
+    def _expected_mtp_metric_keys(self) -> frozenset[str]:
+        """Resolve the exact MTP telemetry schema from policy configuration."""
+        megatron_cfg = self.cfg.get("megatron_cfg") or {}
+        mtp_num_layers = megatron_cfg.get("mtp_num_layers", 0)
+        if mtp_num_layers is None:
+            mtp_num_layers = 0
+        if type(mtp_num_layers) is not int or mtp_num_layers < 0:
+            raise ValueError(
+                "policy.megatron_cfg.mtp_num_layers must be a non-negative integer"
+            )
+        if mtp_num_layers == 0:
+            return frozenset()
+
+        expected = {
+            metric_name
+            for head_index in range(1, mtp_num_layers + 1)
+            for metric_name in (
+                f"mtp_{head_index}_loss",
+                f"mtp_{head_index}_acceptance_rate",
+            )
+        }
+        if bool(megatron_cfg.get("mtp_detach_heads", False)) and (
+            self._optimizer_clips_gradients()
+        ):
+            expected.add("grad_norm")
+        return frozenset(expected)
+
+    def _expects_draft_grad_norm(self) -> bool:
+        draft_cfg = self.cfg.get("draft") or {}
+        return bool(draft_cfg.get("enabled", False)) and (
+            self._optimizer_clips_gradients()
         )
 
     def _with_shared_prefix_fields(
@@ -619,7 +811,12 @@ class TQPolicy(Policy):
         # gets this for free via ``output_is_replicated`` on its sharded
         # dispatch; finish has no data to shard, so we dedupe here.
         leader_results = [r for r in results if r.get("is_replica_leader", True)]
-        aggregated_results = _aggregate_train_results(leader_results)
+        aggregated_results = _aggregate_train_results(
+            leader_results,
+            replicated_results=results,
+            expected_mtp_metric_keys=self._expected_mtp_metric_keys(),
+            expect_draft_grad_norm=self._expects_draft_grad_norm(),
+        )
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops

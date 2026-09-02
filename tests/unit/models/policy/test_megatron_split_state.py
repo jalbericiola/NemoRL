@@ -169,6 +169,21 @@ def _make_worker(loss_type):
 def mock_module_symbols():
     """Patch every module-level symbol that the split-API methods call
     into. Yields a dict of name → mock for assertions."""
+    real_zeros = torch.zeros
+    real_tensor = torch.tensor
+
+    def cpu_zeros(*args, **kwargs):
+        """Keep production CUDA state allocations hermetic in CPU unit tests."""
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return real_zeros(*args, **kwargs)
+
+    def cpu_tensor(*args, **kwargs):
+        """Keep production CUDA scalar allocations hermetic in CPU unit tests."""
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return real_tensor(*args, **kwargs)
+
     # Make `aggregate_training_statistics` return ({}, scalar) — what the
     # finish path expects.
     agg_ret = ({"loss": [0.0]}, torch.tensor(0.5))
@@ -225,7 +240,15 @@ def mock_module_symbols():
         patch("torch.cuda.empty_cache") as cec,
         patch("torch.cuda.synchronize") as sync,
         patch("torch.cuda.get_device_name", return_value="H100"),
+        patch(
+            "torch.cuda._lazy_init",
+            side_effect=AssertionError(
+                "CPU split-state test attempted to initialize CUDA"
+            ),
+        ),
         patch("torch.distributed.get_rank", return_value=0),
+        patch(f"{WORKER_MOD}.torch.zeros", side_effect=cpu_zeros),
+        patch(f"{WORKER_MOD}.torch.tensor", side_effect=cpu_tensor),
     ):
         # rerun state machine: fire forward+backward once per train_microbatch
         rsm = MagicMock()
@@ -273,6 +296,17 @@ def _fake_batch():
 
 
 class TestBegin:
+    def test_cpu_fixture_redirects_mtp_worker_cuda_allocations(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.models.policy.workers import megatron_policy_worker
+
+        state_value = megatron_policy_worker.torch.zeros((), device="cuda")
+        scalar_value = megatron_policy_worker.torch.tensor(1.0, device="cuda")
+
+        assert state_value.device.type == "cpu"
+        assert scalar_value.device.type == "cpu"
+
     def test_opens_state(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
@@ -726,6 +760,20 @@ class TestFinish:
         mp_group = mock_module_symbols["gpgc"].return_value.mp
         mock_module_symbols["rmax"].assert_any_call(2.5, mp_group=mp_group)
         w._collect_mtp_metrics.assert_called_once_with(metrics, 2, 2.5)
+
+    def test_collects_reduced_draft_grad_norm(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.optimizer.grad_norms_by_group = {"draft": 3.5}
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+
+        metrics = w.finish_train_step()
+
+        mp_group = mock_module_symbols["gpgc"].return_value.mp
+        mock_module_symbols["rmax"].assert_any_call(3.5, mp_group=mp_group)
+        torch.testing.assert_close(metrics["draft_grad_norm"], torch.tensor([3.5]))
 
     def test_collects_all_five_mtp_head_metrics(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType

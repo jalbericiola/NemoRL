@@ -84,10 +84,26 @@ class TestAggregateStepMetrics:
         result = {
             "loss": torch.tensor([1.0, 3.0]),
             "grad_norm": torch.tensor(2.0),
+            "draft_grad_norm": torch.tensor([2.0]),
         }
         out = aggregate_step_metrics(result)
         assert out["loss"] == pytest.approx(2.0)
         assert out["grad_norm"] == pytest.approx(2.0)
+        assert out["draft_grad_norm"] == pytest.approx(2.0)
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            True,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            torch.tensor([1.0, 3.0]),
+        ],
+    )
+    def test_draft_grad_norm_rejects_invalid_scalar(self, invalid) -> None:
+        with pytest.raises((TypeError, ValueError), match="draft_grad_norm"):
+            aggregate_step_metrics({"draft_grad_norm": invalid})
 
     def test_float_loss_and_optional_scalars(self) -> None:
         out = aggregate_step_metrics({"loss": 0.5, "total_flops": 10, "num_ranks": 4})
@@ -124,12 +140,36 @@ class TestAggregateStepMetrics:
 
     def test_moe_and_mtp_metrics_are_prefixed(self) -> None:
         result = {
-            "moe_metrics": {"load_balance": [1.0, 3.0]},
-            "mtp_metrics": {"acc": [2.0, 2.0]},
+            "moe_metrics": {"load_balance": 4.0},
+            "mtp_metrics": {"acc": 4.0},
         }
         out = aggregate_step_metrics(result)
         assert out["moe/load_balance"] == pytest.approx(4.0)
         assert out["mtp/acc"] == pytest.approx(4.0)
+
+    def test_mtp5_worker_schema_maps_to_exact_wandb_keys(self) -> None:
+        mtp_metrics = {
+            metric_name: head_index / 10
+            for head_index in range(1, 6)
+            for metric_name in (
+                f"mtp_{head_index}_loss",
+                f"mtp_{head_index}_acceptance_rate",
+            )
+        }
+        mtp_metrics["grad_norm"] = 1.25
+
+        out = aggregate_step_metrics({"mtp_metrics": mtp_metrics})
+        wandb_metrics = {f"train/{key}": value for key, value in out.items()}
+        expected_keys = {"train/mtp/grad_norm"}
+        expected_keys.update(
+            f"train/mtp/mtp_{head_index}_{suffix}"
+            for head_index in range(1, 6)
+            for suffix in ("loss", "acceptance_rate")
+        )
+
+        assert set(wandb_metrics) == expected_keys
+        assert wandb_metrics["train/mtp/grad_norm"] == pytest.approx(1.25)
+        assert wandb_metrics["train/mtp/mtp_5_loss"] == pytest.approx(0.5)
 
 
 class TestReduceAdvantagePumpMetrics:

@@ -2174,6 +2174,7 @@ class MegatronPolicyWorkerImpl(
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
         mtp_grad_norm = self.optimizer.grad_norms_by_group.get("mtp")
+        draft_grad_norm = self.optimizer.grad_norms_by_group.get("draft")
 
         pg_collection = get_pg_collection(self.model)
         update_successful = logical_and_across_model_parallel_group(
@@ -2187,6 +2188,9 @@ class MegatronPolicyWorkerImpl(
         )
         mtp_grad_norm = reduce_max_stat_across_model_parallel_group(
             mtp_grad_norm, mp_group=pg_collection.mp
+        )
+        draft_grad_norm = reduce_max_stat_across_model_parallel_group(
+            draft_grad_norm, mp_group=pg_collection.mp
         )
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
@@ -2328,6 +2332,8 @@ class MegatronPolicyWorkerImpl(
             state["total_num_microbatches"],
             mtp_grad_norm,
         )
+        if draft_grad_norm is not None:
+            metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
 
         self._train_step_state = None
         return metrics

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -43,6 +44,24 @@ _MB_METRIC_MEAN: frozenset[str] = frozenset(
 )
 
 
+def _finite_scalar_metric(value: Any, field: str) -> float:
+    """Return one finite scalar without silently reducing schema drift."""
+    if isinstance(value, torch.Tensor):
+        value = value.detach()
+        if value.numel() != 1:
+            raise TypeError(f"{field} must contain exactly one scalar")
+        value = value.item()
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{field} must be numeric, not bool")
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{field} must be a numeric scalar") from exc
+    if not math.isfinite(scalar):
+        raise ValueError(f"{field} must be finite, got {scalar}")
+    return scalar
+
+
 def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
     """Reduce per-microbatch metric lists into step-level scalars.
 
@@ -63,13 +82,20 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
         metrics["grad_norm"] = grad_norm.detach().mean().item()
     elif grad_norm is not None:
         metrics["grad_norm"] = float(grad_norm)
+    draft_grad_norm = train_result.get("draft_grad_norm")
+    if draft_grad_norm is not None:
+        metrics["draft_grad_norm"] = _finite_scalar_metric(
+            draft_grad_norm, "draft_grad_norm"
+        )
     if "total_flops" in train_result:
         metrics["total_flops"] = float(train_result["total_flops"])
     if "num_ranks" in train_result:
         metrics["num_ranks"] = int(train_result["num_ranks"])
 
     # moe/mtp share the same reduction rules as all_mb_metrics in grpo.py.
-    mb: dict[str, list[Any]] = {}
+    # MoE/MTP values are already-reduced scalar maps; all_mb_metrics values are
+    # per-microbatch lists. Both shapes are accepted by the reducers below.
+    mb: dict[str, Any] = {}
     if "moe_metrics" in train_result:
         mb.update({f"moe/{k}": v for k, v in train_result["moe_metrics"].items()})
     if "mtp_metrics" in train_result:
