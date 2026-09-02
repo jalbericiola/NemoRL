@@ -167,7 +167,6 @@ def _attest_mcore_shared_prefix_deterministic_backward(mode: str) -> None:
     the launcher environment and an import that occurred before the environment was
     installed.
     """
-
     module_name = "megatron.core.models.hybrid.shared_prefix_fused"
     try:
         shared_prefix_fused = import_module(module_name)

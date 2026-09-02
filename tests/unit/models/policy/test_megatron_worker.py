@@ -199,7 +199,9 @@ def test_shared_prefix_worker_rejects_missing_mcore_module(monkeypatch) -> None:
 
     monkeypatch.setattr(worker_module, "import_module", fail_import)
 
-    with pytest.raises(RuntimeError, match="requires an MCore shared-prefix implementation"):
+    with pytest.raises(
+        RuntimeError, match="requires an MCore shared-prefix implementation"
+    ):
         worker_module._attest_mcore_shared_prefix_deterministic_backward("train")
 
 
