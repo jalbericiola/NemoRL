@@ -1061,6 +1061,7 @@ manifest = {
         "training_topology": "TP2/CP2/PP1/EP4/ETP1/SP",
         "vllm_tp": 4,
     },
+    "determinism_receipt_dir": "shared_prefix_determinism_receipts",
     "deployment": {
         "bridge_runnable_manifest_sha256": bridge_manifest_sha256,
         "mcore_runnable_manifest_sha256": mcore_manifest_sha256,

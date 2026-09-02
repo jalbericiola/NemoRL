@@ -258,4 +258,6 @@ exec env \
   EXPECTED_STRICT_PAIR_SANDBOX_CONTAINER_SHA256="${STRICT_PAIR_SANDBOX_CONTAINER_SHA256}" \
   bash "${LAUNCHER}" swe \
   "policy.shared_prefix_training.mode=${SHARED_PREFIX_MODE}" \
-  "policy.shared_prefix_training.require_deterministic_execution=true"
+  "policy.shared_prefix_training.require_deterministic_execution=true" \
+  'policy.megatron_cfg.env_vars.RESULTS_DIR=${RESULTS_DIR}' \
+  'policy.megatron_cfg.env_vars.NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR=${NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR}'

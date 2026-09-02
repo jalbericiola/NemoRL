@@ -651,6 +651,10 @@ def _compose_strict_config(mode: str):
         [
             f"policy.shared_prefix_training.mode={mode}",
             "policy.shared_prefix_training.require_deterministic_execution=true",
+            "policy.megatron_cfg.env_vars.RESULTS_DIR=/strict-pair/results",
+            "policy.megatron_cfg.env_vars."
+            "NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR="
+            "/strict-pair/results/shared_prefix_determinism_receipts/12345-0",
         ],
     )
     resolved = OmegaConf.to_container(config, resolve=True, throw_on_missing=True)
@@ -739,6 +743,10 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
             "single_env_reasoning_gym_sc.yaml",
             f"policy.shared_prefix_training.mode={mode}",
             "policy.shared_prefix_training.require_deterministic_execution=true",
+            "policy.megatron_cfg.env_vars.RESULTS_DIR=${RESULTS_DIR}",
+            "policy.megatron_cfg.env_vars."
+            "NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR="
+            "${NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR}",
             "cluster.num_nodes=1",
             "cluster.segment_size=1",
             "cluster.gpus_per_node=4",
@@ -778,6 +786,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
     manifest = json.loads(run.manifest)
     assert manifest["schema"] == "nemo-rl-strict-single-env-pair-v1"
     assert manifest["pair_id"] == run.pair_id
+    assert manifest["determinism_receipt_dir"] == "shared_prefix_determinism_receipts"
     assert manifest["arms"] == {"off": "observe", "on": "train"}
     assert manifest["campaign"]["training_topology"] == "TP2/CP2/PP1/EP4/ETP1/SP"
     assert manifest["campaign"]["padding_multiple"] == 128
@@ -1430,6 +1439,11 @@ def test_strict_pair_config_composes_for_both_arms(mode: str) -> None:
     assert megatron["recompute_method"] == "uniform"
     assert megatron["recompute_num_layers"] == 1
     assert megatron["cuda_graph_impl"] == "none"
+    assert megatron["env_vars"]["RESULTS_DIR"] == "/strict-pair/results"
+    assert (
+        megatron["env_vars"]["NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR"]
+        == "/strict-pair/results/shared_prefix_determinism_receipts/12345-0"
+    )
     assert generation["vllm_cfg"]["tensor_parallel_size"] == 4
     assert generation["max_new_tokens"] == 768
     assert generation["temperature"] == 1.0

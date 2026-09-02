@@ -134,6 +134,11 @@ policy:
       NVTE_ALLOW_NONDETERMINISTIC_ALGO: "0"
       CUBLAS_WORKSPACE_CONFIG: ":4096:8"
       NCCL_ALGO: "Ring"
+      # The external immutable job wrapper resolves these job/restart-specific
+      # paths immediately before driver execution.  Keeping them mandatory here
+      # prevents direct or unreceipted deterministic-worker construction.
+      RESULTS_DIR: ???
+      NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR: ???
     model_overrides:
       deterministic_mode: true
       cross_entropy_loss_fusion: false
