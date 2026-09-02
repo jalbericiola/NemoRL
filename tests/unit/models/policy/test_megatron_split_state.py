@@ -78,6 +78,7 @@ def _make_mock_model():
     ``modules()`` that yields nothing (so the inference-cache reset loop
     is a no-op)."""
     model = MagicMock()
+    model.module = None
     model.config = MagicMock()
     model.config.grad_sync_func = "ORIGINAL_GRAD_SYNC_FUNC"  # sentinel
     # Set explicitly rather than letting MagicMock auto-create it: the finish
@@ -85,6 +86,8 @@ def _make_mock_model():
     # hook need to be able to clear it to a real None.
     model.config.finalize_model_grads_func = MagicMock(name="ORIGINAL_FINALIZE")
     model.config.num_moe_experts = None  # disable MoE branch
+    model.config.mtp_num_layers = None  # disable MTP branch by default
+    model.config.mtp_grad_scale_func = None
     # no_sync() is a context manager — return a MagicMock that supports
     # __enter__/__exit__ so the `with self.model.no_sync():` block works.
     model.no_sync = MagicMock(
@@ -115,6 +118,7 @@ def _make_worker(loss_type):
     w.optimizer = MagicMock()
     # MegatronOptimizer.step returns (success, grad_norm, num_zeros)
     w.optimizer.step.return_value = (True, 0.5, 0)
+    w.optimizer.grad_norms_by_group = {}
     w.optimizer.param_groups = [{"lr": 1e-4, "weight_decay": 0.01}]
     w.scheduler = MagicMock()
     w.scheduler.get_lr.return_value = 1e-4
@@ -144,6 +148,10 @@ def _make_worker(loss_type):
     w.dtype = torch.float32
     w._is_reward_model = False
     w._router_replay_enabled = False
+    w._shared_prefix_training_enabled = False
+    w.delegate_pack_to_model = False
+    w.delegate_mtp_loss_mask_to_model = False
+    w.model_slices_context_parallel_inputs = False
     # Normally set from get_rank_safe() in __init__, which object.__new__ skips.
     # The step summary in finish_train_step reads it eagerly to decide whether
     # this rank prints.
@@ -215,6 +223,7 @@ def mock_module_symbols():
         patch(f"{WORKER_MOD}.parallel_state") as pstate,
         patch("torch.distributed.all_reduce") as ar,
         patch("torch.cuda.empty_cache") as cec,
+        patch("torch.cuda.synchronize") as sync,
         patch("torch.cuda.get_device_name", return_value="H100"),
         patch("torch.distributed.get_rank", return_value=0),
     ):
@@ -241,6 +250,7 @@ def mock_module_symbols():
             "pstate": pstate,
             "all_reduce": ar,
             "empty_cache": cec,
+            "synchronize": sync,
         }
 
 
@@ -282,6 +292,21 @@ class TestBegin:
         w.model.zero_grad_buffer.assert_called_once()
         w.optimizer.zero_grad.assert_called_once()
         w.model.train.assert_called_once()
+
+    def test_clears_mtp_tracker_and_stale_scale_at_step_boundary(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 5
+        w.model.config.mtp_grad_scale_func = object()
+        w._clear_mtp_metrics_tracker = MagicMock()
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+
+        w._clear_mtp_metrics_tracker.assert_called_once_with()
+        assert w.model.config.mtp_grad_scale_func is None
 
     def test_saves_and_nulls_grad_sync_func(self, mock_module_symbols):
         """The PP scheduler's direct reduce dispatch must be suppressed
@@ -411,6 +436,96 @@ class TestTrainMicrobatch:
         w.train_microbatch(_fake_batch())
         w.train_microbatch(_fake_batch())
         assert w._train_step_state["total_num_microbatches"] == 6
+
+    def test_attaches_mtp_loss_mask_before_building_streamed_iterator(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 5
+        w._clear_mtp_metrics_tracker = MagicMock()
+        batch = _fake_batch()
+        batch["sample_mask"][1] = 0
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(batch)
+
+        iterator_batch = mock_module_symbols["gmi"].call_args.args[0]
+        assert iterator_batch is batch
+        torch.testing.assert_close(
+            iterator_batch["mtp_loss_mask"],
+            batch["token_mask"] * batch["sample_mask"].unsqueeze(-1),
+        )
+        iterator_kwargs = mock_module_symbols["gmi"].call_args.kwargs
+        assert iterator_kwargs["delegate_pack_to_model"] is False
+        assert iterator_kwargs["delegate_mtp_loss_mask_to_model"] is False
+
+    def test_disabled_mtp_preserves_streamed_batch_without_auxiliary_mask(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        batch = _fake_batch()
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(batch)
+
+        iterator_batch = mock_module_symbols["gmi"].call_args.args[0]
+        assert iterator_batch is batch
+        assert "mtp_loss_mask" not in iterator_batch
+
+    def test_mtp_streamed_microbatch_requires_token_mask(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 5
+        w._clear_mtp_metrics_tracker = MagicMock()
+        batch = _fake_batch()
+        batch.pop("token_mask")
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        with pytest.raises(ValueError, match="requires token_mask"):
+            w.train_microbatch(batch)
+
+        mock_module_symbols["gmi"].assert_not_called()
+
+    def test_mtp_streamed_microbatch_requires_sample_mask(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 5
+        w._clear_mtp_metrics_tracker = MagicMock()
+        batch = _fake_batch()
+        batch.pop("sample_mask")
+
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        with pytest.raises(ValueError, match="sample_mask required"):
+            w.train_microbatch(batch)
+
+        mock_module_symbols["gmi"].assert_not_called()
+
+    def test_mtp_inherits_main_grad_scale_during_streamed_forward(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 5
+        w.model.config.grad_scale_func = object()
+        w.model.config.mtp_grad_scale_func = object()
+        w._clear_mtp_metrics_tracker = MagicMock()
+
+        def _forward_backward(**_kwargs):
+            assert w.model.config.mtp_grad_scale_func is None
+            return [{"loss": 0.5}]
+
+        mock_module_symbols["mfb"].side_effect = _forward_backward
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+
+        assert w.model.config.mtp_grad_scale_func is None
 
     def test_does_not_call_optimizer_step(self, mock_module_symbols):
         """trainer_version semantics: optimizer.step() must NOT fire
@@ -593,6 +708,49 @@ class TestFinish:
         kwargs = mock_module_symbols["moe"].call_args.kwargs
         assert kwargs["loss_scale"] == pytest.approx(1.0 / 6.0, rel=1e-6)
 
+    def test_collects_reduced_mtp_metrics_for_accumulated_microbatches(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 5
+        w.optimizer.grad_norms_by_group = {"mtp": 2.5}
+        w._clear_mtp_metrics_tracker = MagicMock()
+        w._collect_mtp_metrics = MagicMock()
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+
+        metrics = w.finish_train_step()
+
+        mp_group = mock_module_symbols["gpgc"].return_value.mp
+        mock_module_symbols["rmax"].assert_any_call(2.5, mp_group=mp_group)
+        w._collect_mtp_metrics.assert_called_once_with(metrics, 2, 2.5)
+
+    def test_collects_all_five_mtp_head_metrics(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 5
+        expected = {
+            metric_name: float(head_index)
+            for head_index in range(1, 6)
+            for metric_name in (
+                f"mtp_{head_index}_loss",
+                f"mtp_{head_index}_acceptance_rate",
+            )
+        }
+        metrics: dict[str, object] = {}
+
+        with patch(
+            "nemo_rl.models.megatron.common.get_mtp_metrics",
+            return_value=expected.copy(),
+        ) as get_mtp_metrics:
+            w._collect_mtp_metrics(metrics, total_num_microbatches=4, mtp_grad_norm=2.5)
+
+        get_mtp_metrics.assert_called_once_with(loss_scale=0.25)
+        assert metrics["mtp_metrics"] == {**expected, "grad_norm": 2.5}
+
     def test_loss_advertised_normalizers_applied(self, mock_module_symbols):
         """finish scales each metric by the denominator the loss advertised:
         TOKENS → 1/global_valid_toks, SEQUENCES → 1/global_valid_seqs,
@@ -705,6 +863,21 @@ class TestAbort:
         w.abort_train_step()
         w.model.zero_grad_buffer.assert_called_once()
         w.optimizer.zero_grad.assert_called_once()
+
+    def test_clears_mtp_scale_and_tracker(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.config.mtp_num_layers = 5
+        w._clear_mtp_metrics_tracker = MagicMock()
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w._clear_mtp_metrics_tracker.reset_mock()
+        w.model.config.mtp_grad_scale_func = object()
+
+        w.abort_train_step()
+
+        assert w.model.config.mtp_grad_scale_func is None
+        w._clear_mtp_metrics_tracker.assert_called_once_with()
 
     def test_does_not_call_optimizer_step(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType

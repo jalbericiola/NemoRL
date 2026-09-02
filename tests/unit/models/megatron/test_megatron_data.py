@@ -82,6 +82,63 @@ class TestProcessedMicrobatchDataclass:
         assert microbatch.shared_prefix_train_mode is False
 
 
+def _make_shared_prefix_mtp_batch(
+    mtp_loss_mask: torch.Tensor | None,
+) -> BatchedDataDict:
+    from nemo_rl.data.packing.shared_prefix_metadata import (
+        SHARED_PREFIX_EXECUTION_SLOT,
+        SHARED_PREFIX_GROUP_ID,
+        SHARED_PREFIX_PROMPT_LENGTHS,
+    )
+    from nemo_rl.models.megatron.data import SHARED_PREFIX_SOURCE_ROW_INDEX
+
+    values = {
+        "input_ids": torch.tensor(
+            [
+                [10, 11, 12, 20, 21, 0],
+                [10, 11, 12, 30, 31, 32],
+            ]
+        ),
+        "input_lengths": torch.tensor([5, 6]),
+        SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([3, 3]),
+        SHARED_PREFIX_GROUP_ID: ["g", "g"],
+        SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0]),
+        SHARED_PREFIX_SOURCE_ROW_INDEX: torch.tensor([0, 1]),
+    }
+    if mtp_loss_mask is not None:
+        values["mtp_loss_mask"] = mtp_loss_mask
+    return BatchedDataDict(values)
+
+
+def _process_shared_prefix_test_batch(
+    batch: BatchedDataDict,
+    **layout_ownership: bool,
+):
+    from nemo_rl.models.megatron.data import process_shared_prefix_microbatch
+
+    return list(
+        process_shared_prefix_microbatch(
+            data_dict=batch,
+            cfg={
+                "make_sequence_length_divisible_by": 4,
+                "megatron_cfg": {
+                    "tensor_model_parallel_size": 1,
+                    "context_parallel_size": 2,
+                    "sequence_parallel": False,
+                },
+                "sequence_packing": {"enabled": True, "algorithm": "ffd"},
+            },
+            bin_capacity=16,
+            seq_length_key="input_lengths",
+            pad_individual_seqs_to_multiple_of=4,
+            pad_packed_seq_to_multiple_of=1,
+            pad_full_seq_to=None,
+            straggler_timer=None,
+            **layout_ownership,
+        )
+    )
+
+
 def test_shared_prefix_microbatch_materializes_one_star_without_dense_mask():
     from nemo_rl.data.packing.shared_prefix_metadata import (
         SHARED_PREFIX_EXECUTION_SLOT,
@@ -103,6 +160,12 @@ def test_shared_prefix_microbatch_materializes_one_star_without_dense_mask():
                 ]
             ),
             "input_lengths": torch.tensor([5, 6]),
+            "mtp_loss_mask": torch.tensor(
+                [
+                    [0, 0, 0, 1, 1, 0],
+                    [0, 0, 0, 1, 1, 1],
+                ]
+            ),
             SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([3, 3]),
             SHARED_PREFIX_GROUP_ID: ["g", "g"],
             SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0]),
@@ -137,6 +200,10 @@ def test_shared_prefix_microbatch_materializes_one_star_without_dense_mask():
         microbatch.data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX],
         torch.tensor([1, 0]),
     )
+    torch.testing.assert_close(
+        microbatch.mtp_loss_mask,
+        torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1]]),
+    )
     assert microbatch.shared_prefix is not None
     assert microbatch.shared_prefix_train_mode is True
     assert microbatch.shared_prefix.tensor_bin.attention_allow_mask is None
@@ -163,6 +230,12 @@ def test_shared_prefix_microbatch_uses_context_parallel_zigzag_shard():
                 ]
             ),
             "input_lengths": torch.tensor([5, 6]),
+            "mtp_loss_mask": torch.tensor(
+                [
+                    [0, 0, 0, 1, 1, 0],
+                    [0, 0, 0, 1, 1, 1],
+                ]
+            ),
             SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([3, 3]),
             SHARED_PREFIX_GROUP_ID: ["g", "g"],
             SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0]),
@@ -206,6 +279,10 @@ def test_shared_prefix_microbatch_uses_context_parallel_zigzag_shard():
         microbatch.position_ids,
         torch.tensor([[4, 5, 6, 7, 3, 4, 5, 6]]),
     )
+    torch.testing.assert_close(
+        microbatch.mtp_loss_mask,
+        torch.tensor([[1, 1, 0, 0, 1, 1, 0, 0]]),
+    )
     assert microbatch.shared_prefix is not None
     assert microbatch.shared_prefix.cp_rank == 1
     assert microbatch.shared_prefix.cp_size == 2
@@ -214,6 +291,88 @@ def test_shared_prefix_microbatch_uses_context_parallel_zigzag_shard():
     assert microbatch.shared_prefix.padded_total_length == 16
     assert microbatch.shared_prefix.padding_multiple == 4
     assert microbatch.shared_prefix.topology_padding_multiple == 4
+
+
+def test_shared_prefix_mtp_mask_zeros_physical_and_topology_padding_for_cp2():
+    batch = _make_shared_prefix_mtp_batch(
+        torch.tensor(
+            [
+                [0, 0, 0, 1, 1, 9],
+                [0, 0, 0, 1, 1, 1],
+            ]
+        )
+    )
+
+    with patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_rank",
+        return_value=0,
+    ):
+        (microbatch,) = _process_shared_prefix_test_batch(batch)
+
+    torch.testing.assert_close(
+        microbatch.mtp_loss_mask,
+        torch.tensor([[0, 0, 0, 1, 0, 0, 0, 0]]),
+    )
+    assert microbatch.shared_prefix is not None
+    assert microbatch.shared_prefix.tensor_bin.layout.physical_total_length == 13
+    assert microbatch.shared_prefix.padded_total_length == 16
+
+
+def test_shared_prefix_mtp_mask_requires_exact_source_shape():
+    batch = _make_shared_prefix_mtp_batch(torch.ones((2, 5), dtype=torch.long))
+
+    with pytest.raises(ValueError, match="must exactly match input_ids shape"):
+        _process_shared_prefix_test_batch(batch)
+
+
+def test_shared_prefix_mtp_mask_requires_zero_prompt_positions():
+    batch = _make_shared_prefix_mtp_batch(
+        torch.tensor(
+            [
+                [0, 0, 0, 1, 1, 0],
+                [0, 1, 0, 1, 1, 1],
+            ]
+        )
+    )
+
+    with pytest.raises(ValueError, match="prompt positions must all be zero"):
+        _process_shared_prefix_test_batch(batch)
+
+
+@pytest.mark.parametrize(
+    "layout_ownership",
+    [
+        {"delegate_pack_to_model": True},
+        {"delegate_mtp_loss_mask_to_model": True},
+        {"model_slices_context_parallel_inputs": True},
+    ],
+)
+def test_shared_prefix_mtp_mask_rejects_model_owned_layout(
+    layout_ownership: dict[str, bool],
+):
+    batch = _make_shared_prefix_mtp_batch(
+        torch.tensor(
+            [
+                [0, 0, 0, 1, 1, 0],
+                [0, 0, 0, 1, 1, 1],
+            ]
+        )
+    )
+
+    with pytest.raises(NotImplementedError, match="model-owned layout controls"):
+        _process_shared_prefix_test_batch(batch, **layout_ownership)
+
+
+def test_shared_prefix_without_mtp_mask_preserves_disabled_path():
+    batch = _make_shared_prefix_mtp_batch(None)
+
+    with patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_rank",
+        return_value=0,
+    ):
+        (microbatch,) = _process_shared_prefix_test_batch(batch)
+
+    assert microbatch.mtp_loss_mask is None
 
 
 def test_shared_prefix_microbatch_keeps_m128_branches_and_q8_global_star():

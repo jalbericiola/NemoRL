@@ -216,6 +216,27 @@ def create_shared_prefix_train_config(
     return config
 
 
+def create_shared_prefix_mtp5_train_config() -> PolicyConfig:
+    """Create the one validated shared-prefix MTP provider/topology slice."""
+    config = create_shared_prefix_train_config(tp=2, cp=2)
+    config["make_sequence_length_divisible_by"] = 128
+    cast(dict[str, Any], config["megatron_cfg"]).update(
+        {
+            "mtp_num_layers": 5,
+            "mtp_loss_scaling_factor": 0.3,
+            "mtp_use_repeated_layer": True,
+            "mtp_detach_heads": True,
+            "tensor_model_parallel_size": 2,
+            "context_parallel_size": 2,
+            "sequence_parallel": True,
+            "pipeline_model_parallel_size": 1,
+            "expert_model_parallel_size": 4,
+            "expert_tensor_parallel_size": 1,
+        }
+    )
+    return config
+
+
 def test_shared_prefix_training_defaults_to_disabled_for_legacy_config() -> None:
     config = create_dtensor_config("test-model", tp=1)
 
@@ -421,6 +442,95 @@ def test_shared_prefix_train_mode_accepts_tp_sp_for_late_capability_gate(
     assert resolved_config.mode == "train"
 
 
+def test_shared_prefix_train_mode_accepts_exact_mtp5_target_early() -> None:
+    config = create_shared_prefix_mtp5_train_config()
+
+    resolved_config = validate_shared_prefix_training_config(config)
+
+    assert resolved_config.mode == "train"
+    assert config["make_sequence_length_divisible_by"] == 128
+
+
+@pytest.mark.parametrize(
+    "hybrid_layer_pattern",
+    [
+        None,
+        "",
+        "M",
+        "M/*E",
+        "M/*E/*E/*E/*E/*E/*E",
+        "M/*A/*A/*A/*A/*A",
+        "M/*E/*E/*A/*E/*E",
+    ],
+)
+def test_shared_prefix_mtp5_resolved_pattern_requires_five_exact_dense_heads(
+    hybrid_layer_pattern: object,
+) -> None:
+    from nemo_rl.models.policy import get_shared_prefix_mtp_target_mismatch
+
+    config = create_shared_prefix_mtp5_train_config()
+    values = dict(cast(dict[str, Any], config["megatron_cfg"]))
+    values.update(
+        {
+            "mtp_hybrid_override_pattern": "*E",
+            "position_embedding_type": "none",
+            "bf16": True,
+            "fp16": False,
+            "hybrid_layer_pattern": hybrid_layer_pattern,
+        }
+    )
+
+    mismatch = get_shared_prefix_mtp_target_mismatch(
+        values,
+        require_provider_pattern=True,
+        resolved_world_size=4,
+    )
+
+    assert mismatch is not None
+    assert mismatch[0] == "hybrid_layer_pattern"
+
+
+@pytest.mark.parametrize("mtp_num_layers", [None, 0])
+def test_shared_prefix_train_mode_preserves_disabled_mtp_legacy_path(
+    mtp_num_layers: int | None,
+) -> None:
+    config = create_shared_prefix_train_config()
+    cast(dict[str, Any], config["megatron_cfg"])["mtp_num_layers"] = mtp_num_layers
+
+    assert validate_shared_prefix_training_config(config).mode == "train"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_error"),
+    [
+        ("mtp_num_layers", 5.0, "mtp_num_layers=5"),
+        ("mtp_loss_scaling_factor", None, "mtp_loss_scaling_factor=0.3"),
+        ("mtp_use_repeated_layer", 1, "mtp_use_repeated_layer=True"),
+        ("mtp_detach_heads", False, "mtp_detach_heads=True"),
+        ("tensor_model_parallel_size", 4, "tensor_model_parallel_size=2"),
+        ("context_parallel_size", 4, "context_parallel_size=2"),
+        (
+            "sequence_parallel",
+            False,
+            "sequence_parallel=true exactly when TP>1",
+        ),
+        ("pipeline_model_parallel_size", 2, "pipeline_model_parallel_size=1"),
+        ("expert_model_parallel_size", 2, "expert_model_parallel_size=4"),
+        ("expert_tensor_parallel_size", 2, "expert_tensor_parallel_size=1"),
+    ],
+)
+def test_shared_prefix_train_mode_rejects_exact_mtp5_target_drift_early(
+    field: str,
+    value: object,
+    expected_error: str,
+) -> None:
+    config = create_shared_prefix_mtp5_train_config()
+    cast(dict[str, Any], config["megatron_cfg"])[field] = value
+
+    with pytest.raises(ValueError, match=expected_error):
+        validate_shared_prefix_training_config(config)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -502,7 +612,7 @@ def test_shared_prefix_train_mode_rejects_unsupported_first_slice_topology(
         (
             {"mtp_num_layers": 1},
             {},
-            "policy.megatron_cfg.mtp_num_layers=0",
+            "policy.megatron_cfg.mtp_num_layers=5",
         ),
         (
             {"cuda_graph_impl": "local"},

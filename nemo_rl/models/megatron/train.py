@@ -181,10 +181,6 @@ def model_forward(
             raise ValueError(
                 "shared-prefix Hybrid forward cannot also use packed_seq_params"
             )
-        if mtp_loss_mask is not None:
-            raise NotImplementedError(
-                "shared-prefix Hybrid forward does not support MTP"
-            )
         if multimodal_data or media_token_validity_mask is not None:
             raise NotImplementedError(
                 "shared-prefix Hybrid forward does not support multimodal inputs"

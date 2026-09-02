@@ -41,6 +41,9 @@ from nemo_rl.data.packing import (
     resolve_shared_prefix_physical_padding_multiple,
     shard_shared_prefix_tensor_bin_for_context_parallel,
 )
+from nemo_rl.data.packing.shared_prefix_tensors import (
+    materialize_shared_prefix_token_aligned_tensor,
+)
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_EXECUTION_SLOT,
     SHARED_PREFIX_GROUP_ID,
@@ -199,6 +202,11 @@ def make_processed_microbatch_iterator(
                 pad_full_seq_to=pad_full_seq_to,
                 straggler_timer=straggler_timer,
                 padding_multiple=shared_prefix_padding_multiple,
+                delegate_pack_to_model=delegate_pack_to_model,
+                delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
+                model_slices_context_parallel_inputs=(
+                    model_slices_context_parallel_inputs
+                ),
             )
             continue
 
@@ -695,6 +703,60 @@ def _get_shared_prefix_execution_shape(
     return len(units), max(unit.physical_length for unit in units)
 
 
+def _validate_shared_prefix_mtp_loss_mask(
+    data_dict: BatchedDataDict[Any],
+) -> Optional[torch.Tensor]:
+    """Validate the source-row MTP mask before star packing changes its layout."""
+    if "mtp_loss_mask" not in data_dict:
+        return None
+
+    mtp_loss_mask = data_dict["mtp_loss_mask"]
+    input_ids = data_dict["input_ids"]
+    if not isinstance(mtp_loss_mask, torch.Tensor):
+        raise TypeError(
+            "shared-prefix mtp_loss_mask must be a torch.Tensor, got "
+            f"{type(mtp_loss_mask).__name__}"
+        )
+    if mtp_loss_mask.shape != input_ids.shape:
+        raise ValueError(
+            "shared-prefix mtp_loss_mask must exactly match input_ids shape; "
+            f"got {tuple(mtp_loss_mask.shape)} and {tuple(input_ids.shape)}"
+        )
+
+    prompt_lengths = data_dict[SHARED_PREFIX_PROMPT_LENGTHS]
+    if not isinstance(prompt_lengths, torch.Tensor):
+        raise TypeError(
+            "shared-prefix prompt lengths must be a torch.Tensor when MTP is enabled"
+        )
+    expected_prompt_shape = (input_ids.shape[0],)
+    if prompt_lengths.shape != expected_prompt_shape:
+        raise ValueError(
+            "shared-prefix prompt lengths must have shape [batch] when MTP is "
+            f"enabled; got {tuple(prompt_lengths.shape)}"
+        )
+    prompt_lengths_on_mask_device = prompt_lengths.to(device=mtp_loss_mask.device)
+    if torch.any(prompt_lengths_on_mask_device < 0) or torch.any(
+        prompt_lengths_on_mask_device > input_ids.shape[1]
+    ):
+        raise ValueError(
+            "shared-prefix prompt lengths must fall within the source sequence width"
+        )
+    prompt_positions = torch.arange(
+        input_ids.shape[1],
+        device=mtp_loss_mask.device,
+    ).unsqueeze(0) < prompt_lengths_on_mask_device.unsqueeze(1)
+    rows_with_prompt_loss = torch.nonzero(
+        torch.any((mtp_loss_mask != 0) & prompt_positions, dim=1),
+        as_tuple=False,
+    ).flatten()
+    if rows_with_prompt_loss.numel():
+        raise ValueError(
+            "shared-prefix mtp_loss_mask prompt positions must all be zero; "
+            f"offending source rows={rows_with_prompt_loss.tolist()}"
+        )
+    return mtp_loss_mask
+
+
 def process_shared_prefix_microbatch(
     *,
     data_dict: BatchedDataDict[Any],
@@ -706,16 +768,39 @@ def process_shared_prefix_microbatch(
     pad_full_seq_to: Optional[int],
     straggler_timer: Optional[StragglerDetector],
     padding_multiple: Optional[int] = None,
+    delegate_pack_to_model: bool = False,
+    delegate_mtp_loss_mask_to_model: bool = False,
+    model_slices_context_parallel_inputs: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Expand one conventional local batch into star and fallback forwards."""
+    model_owned_layout_controls = tuple(
+        name
+        for name, value in (
+            ("model_owns_packing", delegate_pack_to_model),
+            (
+                "model_owns_mtp_loss_mask_packing",
+                delegate_mtp_loss_mask_to_model,
+            ),
+            (
+                "model_slices_context_parallel_inputs",
+                model_slices_context_parallel_inputs,
+            ),
+        )
+        if value is not False
+    )
+    if model_owned_layout_controls:
+        raise NotImplementedError(
+            "shared-prefix train mode requires NeMo-RL-owned token and MTP "
+            "loss-mask packing; model-owned layout controls are unsupported: "
+            f"{model_owned_layout_controls}"
+        )
+
     data_dict = _normalize_shared_prefix_group_ids(data_dict)
     if data_dict.get_multimodal_dict():
         raise NotImplementedError(
             "shared-prefix train mode does not support multimodal/VLM batches"
         )
-    unsupported_fields = [
-        field for field in ("mtp_loss_mask", "routed_experts") if field in data_dict
-    ]
+    unsupported_fields = [field for field in ("routed_experts",) if field in data_dict]
     if unsupported_fields:
         raise NotImplementedError(
             "shared-prefix train mode does not support batch fields "
@@ -725,6 +810,8 @@ def process_shared_prefix_microbatch(
         raise ValueError(
             "shared-prefix train mode requires seq_length_key='input_lengths'"
         )
+
+    source_mtp_loss_mask = _validate_shared_prefix_mtp_loss_mask(data_dict)
 
     tp_size, cp_size, _sequence_parallel = _get_shared_prefix_execution_topology(cfg)
     if padding_multiple is None:
@@ -787,6 +874,31 @@ def process_shared_prefix_microbatch(
                 padding_multiple=resolved_padding_multiple,
                 topology_padding_multiple=topology_padding_multiple,
             )
+            mtp_loss_mask = None
+            if source_mtp_loss_mask is not None:
+                global_mtp_loss_mask = materialize_shared_prefix_token_aligned_tensor(
+                    source_mtp_loss_mask,
+                    tensor_bin=tensor_bin,
+                    padding_value=0,
+                )
+                topology_padding_length = (
+                    cp_shard.padded_total_length - global_mtp_loss_mask.shape[0]
+                )
+                if topology_padding_length < 0:
+                    raise RuntimeError(
+                        "shared-prefix MTP loss mask is longer than the padded "
+                        "model input"
+                    )
+                if topology_padding_length:
+                    global_mtp_loss_mask = torch.nn.functional.pad(
+                        global_mtp_loss_mask,
+                        (0, topology_padding_length),
+                        value=0,
+                    )
+                mtp_loss_mask = global_mtp_loss_mask.index_select(
+                    0,
+                    cp_shard.global_token_indices,
+                ).unsqueeze(0)
             yield ProcessedMicrobatch(
                 data_dict=unit_data,
                 input_ids=unit_data["input_ids"],
@@ -795,6 +907,7 @@ def process_shared_prefix_microbatch(
                 position_ids=cp_shard.position_ids.unsqueeze(0),
                 packed_seq_params=None,
                 cu_seqlens_padded=None,
+                mtp_loss_mask=mtp_loss_mask,
                 shared_prefix=shared_prefix,
                 shared_prefix_train_mode=True,
             )

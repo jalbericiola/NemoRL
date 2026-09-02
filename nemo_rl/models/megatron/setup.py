@@ -251,8 +251,12 @@ from nemo_rl.models.megatron.router_replay import (
 )
 from nemo_rl.models.policy import (
     SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES,
+    SHARED_PREFIX_MTP_TARGET_PROVIDER_VALUES,
+    SHARED_PREFIX_MTP_TARGET_TOPOLOGY_VALUES,
+    SHARED_PREFIX_MTP_TARGET_VALUES,
     MegatronConfig,
     PolicyConfig,
+    get_shared_prefix_mtp_target_mismatch,
     get_shared_prefix_training_config,
     shared_prefix_deterministic_execution_required,
 )
@@ -272,6 +276,10 @@ SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY = (
     "hybrid_star_explicit_physical_padding_v1"
 )
 SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY = "hybrid_star_moe_expert_bias_v1"
+SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY = "hybrid_star_mtp_dense_heads_v1"
+SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY = (
+    "hybrid_star_positionless_attention_v1"
+)
 SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY = (
     "hybrid_star_full_uniform_recompute_v1"
 )
@@ -500,6 +508,68 @@ def _normalize_shared_prefix_training_capabilities(
     return capabilities
 
 
+def _attest_mcore_shared_prefix_mtp_capabilities() -> frozenset[str]:
+    """Attest the exact MTP capability token in both MCore import views.
+
+    ``HybridModel`` imports the scalar and aggregate capability symbols by value.
+    Requiring both views to agree prevents a partially overlaid MCore install from
+    accepting NeMo-RL's MTP mask contract in setup but dropping it at runtime.
+    """
+    try:
+        from megatron.core.models.hybrid import hybrid_model, shared_prefix
+    except ImportError as error:
+        raise NotImplementedError(
+            "shared-prefix MTP5 requires the MCore Hybrid shared-prefix integration"
+        ) from error
+
+    capability_views: dict[str, frozenset[str]] = {}
+    for view_name, module in (
+        ("shared_prefix", shared_prefix),
+        ("HybridModel", hybrid_model),
+    ):
+        scalar = getattr(module, "SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY", None)
+        if (
+            type(scalar) is not str
+            or scalar != SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY
+        ):
+            raise NotImplementedError(
+                "shared-prefix MTP5 requires both MCore import views to expose "
+                "SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY="
+                f"{SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY!r}; "
+                f"{view_name} exposed {scalar!r}."
+            )
+
+        advertised = getattr(module, "SHARED_PREFIX_TRAINING_CAPABILITIES", None)
+        if advertised is None or isinstance(advertised, str):
+            raise NotImplementedError(
+                f"MCore {view_name} must expose the plural shared-prefix "
+                "capability collection for MTP5"
+            )
+        try:
+            capabilities = _normalize_shared_prefix_training_capabilities(advertised)
+        except TypeError as error:
+            raise NotImplementedError(
+                f"MCore {view_name} exposed a malformed shared-prefix capability set"
+            ) from error
+        if scalar not in capabilities:
+            raise NotImplementedError(
+                f"MCore {view_name} does not include its exact MTP capability "
+                "token in SHARED_PREFIX_TRAINING_CAPABILITIES."
+            )
+        capability_views[view_name] = capabilities
+
+    public_capabilities = capability_views["shared_prefix"]
+    bound_capabilities = capability_views["HybridModel"]
+    if public_capabilities != bound_capabilities:
+        raise NotImplementedError(
+            "shared-prefix MTP5 requires the shared_prefix module and "
+            "HybridModel's bound import to advertise the same MCore capability "
+            f"set; got shared_prefix={sorted(public_capabilities)!r}, "
+            f"HybridModel={sorted(bound_capabilities)!r}."
+        )
+    return public_capabilities
+
+
 def _validate_shared_prefix_model_capability(
     config: PolicyConfig,
     model_cfg: Any,
@@ -626,12 +696,47 @@ def _validate_shared_prefix_model_capability(
             "policy.megatron_cfg.recompute_modules or disable activation checkpointing."
         )
 
-    if model_cfg.mtp_num_layers is not None and model_cfg.mtp_num_layers > 0:
-        raise NotImplementedError(
-            "policy.shared_prefix_training.mode=train resolved "
-            f"model_cfg.mtp_num_layers={model_cfg.mtp_num_layers}; "
-            "policy.megatron_cfg.mtp_num_layers must be 0."
+    resolved_mtp_values = {
+        name: getattr(model_cfg, name, None)
+        for name, _expected_value in (
+            SHARED_PREFIX_MTP_TARGET_VALUES
+            + SHARED_PREFIX_MTP_TARGET_TOPOLOGY_VALUES
+            + SHARED_PREFIX_MTP_TARGET_PROVIDER_VALUES
         )
+    }
+    resolved_mtp_values["hybrid_layer_pattern"] = getattr(
+        model_cfg,
+        "hybrid_layer_pattern",
+        None,
+    )
+    mtp_num_layers = resolved_mtp_values["mtp_num_layers"]
+    mtp_disabled = mtp_num_layers is None or (
+        type(mtp_num_layers) is int and mtp_num_layers == 0
+    )
+    mtp_mismatch = get_shared_prefix_mtp_target_mismatch(
+        resolved_mtp_values,
+        require_provider_pattern=True,
+        resolved_world_size=(
+            None if mtp_disabled else torch.distributed.get_world_size()
+        ),
+    )
+    if mtp_mismatch is not None:
+        name, expected_value, actual_value = mtp_mismatch
+        raise NotImplementedError(
+            "policy.shared_prefix_training.mode=train enables MTP only for the "
+            "validated Nano MTP5 TP2/CP2/SP/PP1/EP4/ETP1 provider; requires "
+            f"resolved model_cfg.{name}={expected_value!r}, got {actual_value!r}."
+        )
+    mtp_enabled = type(mtp_num_layers) is int and mtp_num_layers == 5
+    if mtp_enabled:
+        mtp_capabilities = _attest_mcore_shared_prefix_mtp_capabilities()
+        if capabilities != mtp_capabilities:
+            raise NotImplementedError(
+                "policy.shared_prefix_training.mode=train with MTP resolved a "
+                "different MCore capability set during topology and exact MTP "
+                f"attestation: {sorted(capabilities)!r} != "
+                f"{sorted(mtp_capabilities)!r}."
+            )
 
     if model_cfg.cuda_graph_impl != "none":
         raise NotImplementedError(
@@ -673,9 +778,20 @@ def _validate_shared_prefix_model_capability(
             "The provider must resolve full attention (window_size=None or (-1, -1))."
         )
 
-    if model_cfg.position_embedding_type != "rope":
+    if model_cfg.position_embedding_type == "none":
+        if (
+            SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY
+            not in capabilities
+        ):
+            raise NotImplementedError(
+                "policy.shared_prefix_training.mode=train with positionless "
+                "Nemotron-H attention requires MCore capability "
+                f"{SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY!r}."
+            )
+    elif model_cfg.position_embedding_type != "rope":
         raise NotImplementedError(
-            "policy.shared_prefix_training.mode=train requires standard RoPE; resolved "
+            "policy.shared_prefix_training.mode=train supports only standard RoPE "
+            "or capability-attested positionless attention; resolved "
             f"model_cfg.position_embedding_type={model_cfg.position_embedding_type!r}."
         )
 
@@ -1055,9 +1171,15 @@ def setup_model_config(
     _validate_chunking_config(config)
 
     # Reconstructed providers must be finalized so derived fields reflect the
-    # merged config. Without overrides, preserve the existing checkpoint-load
-    # behavior: only megatron_lm providers need finalization here.
-    if fmt == "megatron_lm" or model_overrides:
+    # merged config. MTP head patterns are derived by ``HybridModelProvider``;
+    # a checkpoint-loaded provider otherwise retains its serialized head count
+    # after NeMo-RL applies the target MTP5 controls above.
+    shared_prefix_config = get_shared_prefix_training_config(config)
+    configured_mtp_num_layers = getattr(model_cfg, "mtp_num_layers", None)
+    shared_prefix_mtp_enabled = shared_prefix_config.mode == "train" and (
+        type(configured_mtp_num_layers) is int and configured_mtp_num_layers > 0
+    )
+    if fmt == "megatron_lm" or model_overrides or shared_prefix_mtp_enabled:
         model_cfg.finalize()
 
     model_cfg.__post_init__()
@@ -1259,6 +1381,16 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_router_load_balancing_type = config["megatron_cfg"][
         "moe_router_load_balancing_type"
     ]
+    # Provider defaults can be nonzero even when a recipe explicitly disables
+    # the corresponding router regularizer. Copy by key presence so zero and
+    # null values survive into the resolved config checked below.
+    for field_name in (
+        "moe_aux_loss_coeff",
+        "moe_z_loss_coeff",
+        "moe_input_jitter_eps",
+    ):
+        if field_name in config["megatron_cfg"]:
+            setattr(model_cfg, field_name, config["megatron_cfg"][field_name])
     # Set this to 0.0 to disable updates to the moe router expert bias
     model_cfg.moe_router_bias_update_rate = config["megatron_cfg"][
         "moe_router_bias_update_rate"

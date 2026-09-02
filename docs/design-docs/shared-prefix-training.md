@@ -161,14 +161,24 @@ shareable prompt from those effects.
 - pipeline parallel size one. TP1 uses sequence parallelism off; TP>1 requires
   sequence parallelism and the matching TP capability. CP>1 likewise requires
   the matching CP or combined TP/CP capability.
-- sequence packing enabled and MTP disabled.
+- sequence packing enabled. MTP may be disabled, or may use only the attested
+  Nemotron-H training target: five repeated detached dense `*E` predictor
+  heads, loss scale `0.3`, BF16, TP2/CP2/SP/PP1/EP4/ETP1 on exactly four
+  ranks. The resolved provider must contain five `/*E` suffixes, every runtime
+  model chunk must parse them as `mtp_pattern="*E"`, `mtp_num_depths=5`, and
+  `mtp_process=true`, and both MCore import views must advertise the exact
+  `hybrid_star_mtp_dense_heads_v1` capability token. Other MTP shapes and
+  model-owned token, MTP-mask, or CP-slicing layouts are rejected.
 - full recompute only with the matching capability, uniform method, and one
   layer per recompute unit; no selective core-attention recompute,
   fine-grained activation offload, training CUDA graphs, FP8, or FP4.
-- zero attention and hidden dropout, standard RoPE, vanilla softmax, no
-  sliding-window attention, and no multi-latent attention.
+- zero attention and hidden dropout, vanilla softmax, no sliding-window
+  attention, and no multi-latent attention. Non-MTP models use standard RoPE;
+  the exact Nemotron-H MTP target uses positionless attention and requires the
+  matching MCore capability.
 - deterministic MoE routing without auxiliary or z losses, router jitter,
-  capacity dropping, forced/random routing, or expert-bias updates.
+  capacity dropping, or forced/random routing. The exact Nano target permits
+  expert-bias updates only with the matching MCore capability.
 - no QK clipping or log-max-attention-logit modification.
 - sampling without top-k or top-p log-probability truncation.
 

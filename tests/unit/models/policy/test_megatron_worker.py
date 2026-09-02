@@ -63,6 +63,17 @@ def _set_deterministic_worker_environment(monkeypatch):
     return worker_module
 
 
+def _deterministic_worker_config(worker_module, shared_prefix_config):
+    return {
+        "shared_prefix_training": shared_prefix_config,
+        "megatron_cfg": {
+            "model_overrides": dict(
+                worker_module.SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES
+            )
+        },
+    }
+
+
 @pytest.mark.parametrize(
     "shared_prefix_config",
     [
@@ -86,12 +97,20 @@ def test_shared_prefix_worker_enables_torch_determinism_before_cuda(
         "are_deterministic_algorithms_enabled",
         lambda: True,
     )
+    log_info = MagicMock()
+    monkeypatch.setattr(worker_module.log, "info", log_info)
 
     worker_module._enable_shared_prefix_deterministic_execution(
-        {"shared_prefix_training": shared_prefix_config}
+        _deterministic_worker_config(worker_module, shared_prefix_config)
     )
 
     enable_determinism.assert_called_once_with(True)
+    log_info.assert_called_once_with(
+        "SHARED_PREFIX_DETERMINISM_ATTESTED mode=%s env_controls=4 "
+        "triton_autotune=absent model_overrides=3 torch_deterministic=true "
+        "total_controls=8",
+        shared_prefix_config["mode"],
+    )
 
 
 def test_worker_constructor_attests_determinism_before_any_other_action() -> None:
@@ -163,13 +182,51 @@ def test_strict_observe_worker_rejects_wrong_effective_environment(monkeypatch) 
 
     with pytest.raises(RuntimeError, match="MAMBA_DETERMINISTIC="):
         worker_module._enable_shared_prefix_deterministic_execution(
-            {
-                "shared_prefix_training": {
+            _deterministic_worker_config(
+                worker_module,
+                {
                     "mode": "observe",
                     "require_deterministic_execution": True,
-                }
-            }
+                },
+            )
         )
+
+    enable_determinism.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("override", "value", "expected_error"),
+    [
+        ("deterministic_mode", None, "field is missing"),
+        ("cross_entropy_loss_fusion", True, "cross_entropy_loss_fusion=False"),
+        ("tp_comm_overlap", 0, "tp_comm_overlap=False"),
+    ],
+)
+def test_shared_prefix_worker_rejects_missing_or_wrong_deterministic_override(
+    monkeypatch,
+    override: str,
+    value: object,
+    expected_error: str,
+) -> None:
+    worker_module = _set_deterministic_worker_environment(monkeypatch)
+    config = _deterministic_worker_config(
+        worker_module,
+        {"mode": "train"},
+    )
+    model_overrides = config["megatron_cfg"]["model_overrides"]
+    if value is None:
+        model_overrides.pop(override)
+    else:
+        model_overrides[override] = value
+    enable_determinism = MagicMock()
+    monkeypatch.setattr(
+        worker_module.torch,
+        "use_deterministic_algorithms",
+        enable_determinism,
+    )
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        worker_module._enable_shared_prefix_deterministic_execution(config)
 
     enable_determinism.assert_not_called()
 
@@ -279,10 +336,365 @@ def test_model_owned_mtp_loss_mask_packing_capability_is_detected():
     )
 
     class ModelOwnedPackingModel:
+        model_owns_packing = True
         model_owns_mtp_loss_mask_packing = True
 
     assert _model_self_packs_mtp_loss_mask(ModelOwnedPackingModel())
     assert not _model_self_packs_mtp_loss_mask(object())
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        "model_owns_packing",
+        "model_owns_mtp_loss_mask_packing",
+        "model_slices_context_parallel_inputs",
+    ],
+)
+def test_model_layout_ownership_requires_exact_boolean(attribute: str) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _resolve_model_layout_ownership,
+    )
+
+    model = SimpleNamespace(**{attribute: 1})
+
+    with pytest.raises(TypeError, match="exact bool"):
+        _resolve_model_layout_ownership(model)
+
+
+def test_model_layout_ownership_requires_all_chunks_to_agree() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _resolve_model_layout_ownership,
+    )
+
+    chunks = [
+        SimpleNamespace(model_owns_packing=False),
+        SimpleNamespace(model_owns_packing=True),
+    ]
+    with (
+        patch("megatron.core.utils.unwrap_model", return_value=chunks),
+        pytest.raises(RuntimeError, match="same layout ownership tuple"),
+    ):
+        _resolve_model_layout_ownership(object())
+
+
+def test_model_layout_ownership_rejects_mask_owner_without_pack_owner() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _resolve_model_layout_ownership,
+    )
+
+    model = SimpleNamespace(
+        model_owns_packing=False,
+        model_owns_mtp_loss_mask_packing=True,
+    )
+
+    with pytest.raises(RuntimeError, match="without owning sequence packing"):
+        _resolve_model_layout_ownership(model)
+
+
+def test_model_layout_ownership_rejects_pack_owner_with_cp_slicer() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _resolve_model_layout_ownership,
+    )
+
+    model = SimpleNamespace(
+        model_owns_packing=True,
+        model_slices_context_parallel_inputs=True,
+    )
+
+    with pytest.raises(RuntimeError, match="both own sequence packing"):
+        _resolve_model_layout_ownership(model)
+
+
+def _shared_prefix_mtp5_worker():
+    """Build a lightweight worker at the exact validated runtime target."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._shared_prefix_training_enabled = True
+    worker._router_replay_enabled = False
+    worker.delegate_pack_to_model = False
+    worker.delegate_mtp_loss_mask_to_model = False
+    worker.model_slices_context_parallel_inputs = False
+    worker.media_placeholder_token_id = None
+    worker.cfg = {
+        "is_vlm": False,
+        "dynamic_batching": {"enabled": False},
+        "megatron_cfg": {
+            "use_fused_linear_logprobs": False,
+            "fp8_cfg": {"enabled": False},
+        },
+    }
+    worker.model = SimpleNamespace(
+        hybrid_layer_pattern="M/*E/*E/*E/*E/*E",
+        mtp_pattern="*E",
+        mtp_num_depths=5,
+        mtp_process=True,
+        config=SimpleNamespace(
+            mtp_num_layers=5,
+            mtp_loss_scaling_factor=0.3,
+            mtp_use_repeated_layer=True,
+            mtp_detach_heads=True,
+            mtp_hybrid_override_pattern="*E",
+            position_embedding_type="none",
+            bf16=True,
+            fp16=False,
+            tensor_model_parallel_size=2,
+            context_parallel_size=2,
+            sequence_parallel=True,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=4,
+            expert_tensor_parallel_size=1,
+        ),
+    )
+    return worker
+
+
+def _shared_prefix_mtp5_runtime_capabilities() -> set[str]:
+    from nemo_rl.models.megatron.setup import (
+        SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+        SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+    )
+
+    return {
+        SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+        SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+    }
+
+
+def test_shared_prefix_worker_accepts_exact_mtp5_runtime_capability():
+    worker = _shared_prefix_mtp5_worker()
+    capabilities = _shared_prefix_mtp5_runtime_capabilities()
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_get_mcore_shared_prefix_training_capability",
+            return_value=capabilities,
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_attest_mcore_shared_prefix_mtp_capabilities",
+            return_value=capabilities,
+        ),
+        patch("torch.distributed.get_world_size", return_value=4),
+    ):
+        worker._validate_shared_prefix_worker_features()
+
+
+def test_shared_prefix_worker_preserves_disabled_mtp_without_capability():
+    worker = _shared_prefix_mtp5_worker()
+    worker.model.config.mtp_num_layers = 0
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_get_mcore_shared_prefix_training_capability",
+            side_effect=AssertionError(
+                "disabled MTP must not negotiate MTP capability"
+            ),
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_attest_mcore_shared_prefix_mtp_capabilities",
+            side_effect=AssertionError(
+                "disabled MTP must not negotiate bound capability"
+            ),
+        ),
+        patch(
+            "torch.distributed.get_world_size",
+            side_effect=AssertionError(
+                "disabled MTP must not require exact world size"
+            ),
+        ),
+    ):
+        worker._validate_shared_prefix_worker_features()
+
+
+def test_shared_prefix_worker_rejects_exact_mtp5_without_runtime_capability():
+    from nemo_rl.models.megatron.setup import (
+        SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+    )
+
+    worker = _shared_prefix_mtp5_worker()
+    capabilities = _shared_prefix_mtp5_runtime_capabilities() - {
+        SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY
+    }
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_get_mcore_shared_prefix_training_capability",
+            return_value=capabilities,
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_attest_mcore_shared_prefix_mtp_capabilities",
+            side_effect=NotImplementedError(
+                f"missing {SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY}"
+            ),
+        ),
+        patch("torch.distributed.get_world_size", return_value=4),
+        pytest.raises(
+            NotImplementedError,
+            match=SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+        ),
+    ):
+        worker._validate_shared_prefix_worker_features()
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("mtp_num_layers", 5.0),
+        ("mtp_loss_scaling_factor", None),
+        ("mtp_use_repeated_layer", 1),
+        ("mtp_detach_heads", False),
+        ("mtp_hybrid_override_pattern", "*A"),
+        ("position_embedding_type", "rope"),
+        ("bf16", False),
+        ("fp16", True),
+        ("tensor_model_parallel_size", 4),
+        ("context_parallel_size", 4),
+        ("sequence_parallel", False),
+        ("pipeline_model_parallel_size", 2),
+        ("expert_model_parallel_size", 2),
+        ("expert_tensor_parallel_size", 2),
+    ],
+)
+def test_shared_prefix_worker_rejects_exact_mtp5_runtime_drift(
+    attribute: str,
+    value: object,
+) -> None:
+    worker = _shared_prefix_mtp5_worker()
+    setattr(worker.model.config, attribute, value)
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_get_mcore_shared_prefix_training_capability",
+            return_value=_shared_prefix_mtp5_runtime_capabilities(),
+        ),
+        patch("torch.distributed.get_world_size", return_value=4),
+        pytest.raises(NotImplementedError, match=f"model_config.{attribute}"),
+    ):
+        worker._validate_shared_prefix_worker_features()
+
+
+def test_shared_prefix_worker_rejects_exact_mtp5_runtime_pattern_depth_drift():
+    worker = _shared_prefix_mtp5_worker()
+    worker.model.hybrid_layer_pattern = "M/*E/*E/*E/*E"
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_get_mcore_shared_prefix_training_capability",
+            return_value=_shared_prefix_mtp5_runtime_capabilities(),
+        ),
+        patch("torch.distributed.get_world_size", return_value=4),
+        pytest.raises(NotImplementedError, match="model_config.hybrid_layer_pattern"),
+    ):
+        worker._validate_shared_prefix_worker_features()
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [("mtp_pattern", "*A"), ("mtp_num_depths", 4), ("mtp_process", False)],
+)
+def test_shared_prefix_worker_rejects_runtime_mtp_parser_drift(
+    attribute: str,
+    value: object,
+) -> None:
+    worker = _shared_prefix_mtp5_worker()
+    setattr(worker.model, attribute, value)
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_get_mcore_shared_prefix_training_capability",
+            return_value=_shared_prefix_mtp5_runtime_capabilities(),
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_attest_mcore_shared_prefix_mtp_capabilities",
+            return_value=_shared_prefix_mtp5_runtime_capabilities(),
+        ),
+        patch("torch.distributed.get_world_size", return_value=4),
+        pytest.raises(NotImplementedError, match="runtime Hybrid MTP parser drift"),
+    ):
+        worker._validate_shared_prefix_worker_features()
+
+
+def test_shared_prefix_worker_rejects_exact_mtp5_runtime_world_drift():
+    worker = _shared_prefix_mtp5_worker()
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_get_mcore_shared_prefix_training_capability",
+            return_value=_shared_prefix_mtp5_runtime_capabilities(),
+        ),
+        patch("torch.distributed.get_world_size", return_value=8),
+        pytest.raises(NotImplementedError, match="model_config.world_size"),
+    ):
+        worker._validate_shared_prefix_worker_features()
+
+
+def test_shared_prefix_worker_rejects_mtp_capability_view_disagreement():
+    worker = _shared_prefix_mtp5_worker()
+
+    with (
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_get_mcore_shared_prefix_training_capability",
+            return_value=_shared_prefix_mtp5_runtime_capabilities(),
+        ),
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "_attest_mcore_shared_prefix_mtp_capabilities",
+            side_effect=NotImplementedError("capability-view mismatch"),
+        ),
+        patch("torch.distributed.get_world_size", return_value=4),
+        pytest.raises(NotImplementedError, match="capability-view mismatch"),
+    ):
+        worker._validate_shared_prefix_worker_features()
+
+
+def test_shared_prefix_worker_rejects_model_owned_mtp_mask_packing():
+    worker = _shared_prefix_mtp5_worker()
+    worker.model.config.mtp_num_layers = 0
+    worker.delegate_mtp_loss_mask_to_model = True
+
+    with pytest.raises(NotImplementedError, match="model-owned MTP loss-mask packing"):
+        worker._validate_shared_prefix_worker_features()
+
+
+def test_shared_prefix_mtp_rejects_sequence_level_policy_loss():
+    from nemo_rl.algorithms.loss.interfaces import LossInputType, LossType
+
+    worker = _shared_prefix_mtp5_worker()
+    loss_fn = SimpleNamespace(
+        input_type=LossInputType.LOGPROB,
+        loss_type=LossType.SEQUENCE_LEVEL,
+    )
+
+    with pytest.raises(NotImplementedError, match="TOKEN_LEVEL"):
+        worker._validate_shared_prefix_loss(loss_fn)
+
+
+def test_sync_mtp_scale_composes_token_normalization_with_main_loss_scale():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _compose_mtp_grad_scale,
+    )
+
+    normalization_scale = torch.tensor(0.125)
+
+    composed = _compose_mtp_grad_scale(
+        lambda value: value * 1024.0,
+        normalization_scale,
+    )
+
+    torch.testing.assert_close(composed, torch.tensor(128.0))
 
 
 def _conversion_task(megatron_param: str, hf_param) -> SimpleNamespace:

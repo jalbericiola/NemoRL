@@ -249,6 +249,93 @@ class SharedPrefixTrainingConfig(BaseModel, extra="forbid"):
     require_deterministic_execution: StrictBool = False
 
 
+SHARED_PREFIX_MTP_TARGET_VALUES: tuple[tuple[str, object], ...] = (
+    ("mtp_num_layers", 5),
+    ("mtp_loss_scaling_factor", 0.3),
+    ("mtp_use_repeated_layer", True),
+    ("mtp_detach_heads", True),
+)
+SHARED_PREFIX_MTP_TARGET_TOPOLOGY_VALUES: tuple[tuple[str, object], ...] = (
+    ("tensor_model_parallel_size", 2),
+    ("context_parallel_size", 2),
+    ("sequence_parallel", True),
+    ("pipeline_model_parallel_size", 1),
+    ("expert_model_parallel_size", 4),
+    ("expert_tensor_parallel_size", 1),
+)
+SHARED_PREFIX_MTP_TARGET_PROVIDER_VALUES: tuple[tuple[str, object], ...] = (
+    ("mtp_hybrid_override_pattern", "*E"),
+    ("position_embedding_type", "none"),
+    ("bf16", True),
+    ("fp16", False),
+)
+SHARED_PREFIX_MTP_TARGET_WORLD_SIZE = 4
+SHARED_PREFIX_MTP_TARGET_PREDICTOR_PATTERNS = ("*E",) * 5
+
+
+def get_shared_prefix_mtp_target_mismatch(
+    values: Mapping[str, object],
+    *,
+    require_provider_pattern: bool,
+    resolved_world_size: object | None,
+) -> tuple[str, object, object] | None:
+    """Return the first drift from the only validated shared-prefix MTP target.
+
+    ``mtp_num_layers=None`` and the integer value ``0`` retain the established
+    MTP-disabled path. Every other value opts into MTP and must match the exact
+    Nano repeated-head configuration and parallel topology. Resolved provider
+    and worker checks additionally attest the Nano attention/MoE predictor
+    pattern that MCore's dense-head capability covers. The resolved check also
+    requires a four-rank worker and inspects the unified Hybrid pattern rather
+    than inferring logical prediction depth from checkpoint tensor counts.
+    """
+    mtp_num_layers = values.get("mtp_num_layers")
+    if mtp_num_layers is None or (type(mtp_num_layers) is int and mtp_num_layers == 0):
+        return None
+
+    expected_values = (
+        SHARED_PREFIX_MTP_TARGET_VALUES + SHARED_PREFIX_MTP_TARGET_TOPOLOGY_VALUES
+    )
+    if require_provider_pattern:
+        expected_values += SHARED_PREFIX_MTP_TARGET_PROVIDER_VALUES
+    for name, expected_value in expected_values:
+        actual_value = values.get(name)
+        if (
+            type(actual_value) is not type(expected_value)
+            or actual_value != expected_value
+        ):
+            return name, expected_value, actual_value
+
+    if require_provider_pattern:
+        hybrid_layer_pattern = values.get("hybrid_layer_pattern")
+        if not isinstance(hybrid_layer_pattern, str) or not hybrid_layer_pattern:
+            return (
+                "hybrid_layer_pattern",
+                "<main>/*E/*E/*E/*E/*E",
+                hybrid_layer_pattern,
+            )
+        pattern_parts = hybrid_layer_pattern.split("/")
+        predictor_patterns = tuple(pattern_parts[1:])
+        if not pattern_parts[0] or (
+            predictor_patterns != SHARED_PREFIX_MTP_TARGET_PREDICTOR_PATTERNS
+        ):
+            return (
+                "hybrid_layer_pattern",
+                "<main>/*E/*E/*E/*E/*E",
+                hybrid_layer_pattern,
+            )
+        if (
+            type(resolved_world_size) is not int
+            or resolved_world_size != SHARED_PREFIX_MTP_TARGET_WORLD_SIZE
+        ):
+            return (
+                "world_size",
+                SHARED_PREFIX_MTP_TARGET_WORLD_SIZE,
+                resolved_world_size,
+            )
+    return None
+
+
 class RewardModelConfig(TypedDict):
     enabled: bool
     reward_model_type: str
@@ -842,11 +929,17 @@ def validate_shared_prefix_training_config(
                 f"when supplied; got {recompute_num_layers!r}."
             )
 
-    mtp_num_layers = megatron_config.get("mtp_num_layers")
-    if mtp_num_layers is not None and mtp_num_layers > 0:
+    mtp_mismatch = get_shared_prefix_mtp_target_mismatch(
+        megatron_config,
+        require_provider_pattern=False,
+        resolved_world_size=None,
+    )
+    if mtp_mismatch is not None:
+        name, expected_value, actual_value = mtp_mismatch
         raise ValueError(
-            "policy.shared_prefix_training.mode=train currently requires "
-            "policy.megatron_cfg.mtp_num_layers=0."
+            "policy.shared_prefix_training.mode=train enables MTP only for the "
+            "validated Nano MTP5 TP2/CP2/SP/PP1/EP4/ETP1 target; requires "
+            f"policy.megatron_cfg.{name}={expected_value!r}, got {actual_value!r}."
         )
 
     cuda_graph_impl = megatron_config.get("cuda_graph_impl")

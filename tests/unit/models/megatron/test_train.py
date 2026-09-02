@@ -548,6 +548,7 @@ def test_shared_prefix_model_forward_lowers_outer_layout_to_hybrid_adapter():
     model = MagicMock(return_value=torch.randn(1, 8, 4))
     data_dict = MagicMock()
     data_dict.get_multimodal_dict.return_value = {}
+    mtp_loss_mask = torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1]])
 
     model_forward(
         model=model,
@@ -557,6 +558,7 @@ def test_shared_prefix_model_forward_lowers_outer_layout_to_hybrid_adapter():
         attention_mask=None,
         packed_seq_params=None,
         defer_fp32_logits=True,
+        mtp_loss_mask=mtp_loss_mask,
         shared_prefix=metadata,
         shared_prefix_train_mode=True,
     )
@@ -565,6 +567,7 @@ def test_shared_prefix_model_forward_lowers_outer_layout_to_hybrid_adapter():
     assert call_kwargs["attention_mask"] is None
     assert "fp32_output" not in call_kwargs
     assert "packed_seq_params" not in call_kwargs
+    assert call_kwargs["loss_mask"] is mtp_loss_mask
     assert call_kwargs["shared_prefix_layout"].prefix_len == 3
     assert tuple(call_kwargs["shared_prefix_layout"].completion_lens) == (5, 5)
     assert tuple(call_kwargs["shared_prefix_layout"].logical_completion_lens) == (

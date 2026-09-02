@@ -19,7 +19,9 @@ import re
 import time
 import warnings
 from collections import OrderedDict, defaultdict
+from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from functools import partial
 from typing import Any, Iterable, Iterator, Literal, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
@@ -49,7 +51,7 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
-from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
     chunks_accept_media_token_validity_mask,
@@ -79,6 +81,10 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
+    SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+    _attest_mcore_shared_prefix_mtp_capabilities,
+    _get_mcore_shared_prefix_training_capability,
+    _normalize_shared_prefix_training_capabilities,
     build_inference_model,
     finalize_megatron_setup,
     handle_model_import,
@@ -97,9 +103,14 @@ from nemo_rl.models.megatron.train import (
 )
 from nemo_rl.models.policy import (
     SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES,
+    SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES,
     SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES,
     SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES,
+    SHARED_PREFIX_MTP_TARGET_PROVIDER_VALUES,
+    SHARED_PREFIX_MTP_TARGET_TOPOLOGY_VALUES,
+    SHARED_PREFIX_MTP_TARGET_VALUES,
     PolicyConfig,
+    get_shared_prefix_mtp_target_mismatch,
     get_shared_prefix_training_config,
     shared_prefix_deterministic_execution_required,
 )
@@ -129,6 +140,16 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _compose_mtp_grad_scale(
+    main_grad_scale_func: Any,
+    normalization_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Compose MTP token normalization with the optimizer's loss scale."""
+    if main_grad_scale_func is None:
+        return normalization_scale
+    return main_grad_scale_func(normalization_scale)
 
 
 def _enable_shared_prefix_deterministic_execution(config: PolicyConfig) -> None:
@@ -168,12 +189,46 @@ def _enable_shared_prefix_deterministic_execution(config: PolicyConfig) -> None:
                 f"{actual_value!r}."
             )
 
+    try:
+        model_overrides = config["megatron_cfg"]["model_overrides"]
+    except KeyError as error:
+        raise RuntimeError(
+            f"shared-prefix mode={mode} deterministic worker requires "
+            "policy.megatron_cfg.model_overrides to contain the exact "
+            "deterministic execution contract"
+        ) from error
+    if not isinstance(model_overrides, Mapping):
+        raise RuntimeError(
+            f"shared-prefix mode={mode} deterministic worker requires "
+            "policy.megatron_cfg.model_overrides to be a mapping"
+        )
+    for name, expected_value in SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES.items():
+        if name not in model_overrides:
+            raise RuntimeError(
+                f"shared-prefix mode={mode} deterministic worker requires "
+                f"policy.megatron_cfg.model_overrides.{name}={expected_value!r}; "
+                "the field is missing."
+            )
+        actual_value = model_overrides[name]
+        if type(actual_value) is not bool or actual_value is not expected_value:
+            raise RuntimeError(
+                f"shared-prefix mode={mode} deterministic worker requires "
+                f"policy.megatron_cfg.model_overrides.{name}={expected_value!r}; "
+                f"got {actual_value!r}."
+            )
+
     torch.use_deterministic_algorithms(True)
     if not torch.are_deterministic_algorithms_enabled():
         raise RuntimeError(
             "torch deterministic algorithms were not enabled for the "
             f"shared-prefix mode={mode} deterministic worker"
         )
+    log.info(
+        "SHARED_PREFIX_DETERMINISM_ATTESTED mode=%s env_controls=4 "
+        "triton_autotune=absent model_overrides=3 torch_deterministic=true "
+        "total_controls=8",
+        mode,
+    )
 
 
 def _should_use_router_replay(
@@ -292,49 +347,66 @@ def _require_equal_shared_prefix_execution_count(
     return maximum
 
 
-def _model_self_packs_for_cp(model: Any) -> bool:
-    """Whether the model packs sequences + CP-shards inside its own forward.
-
-    Such models (mbridge VLM wrappers) call ``preprocess_packed_seqs`` in their
-    forward, so NeMo-RL must hand them an unpacked ``[B, S]`` batch instead of
-    pre-packing + CP-sharding itself. New wrappers advertise the capability
-    through ``model_owns_packing``. The Qwen3VL type check remains as a
-    compatibility fallback until that upstream model exposes the capability.
-    """
+def _resolve_model_layout_ownership(model: Any) -> tuple[bool, bool, bool]:
+    """Resolve one exact, dependency-consistent layout contract across chunks."""
     from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     from megatron.core.utils import unwrap_model
 
     unwrapped = unwrap_model(model)
     chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-    return any(
-        bool(getattr(chunk, "model_owns_packing", False))
-        or isinstance(chunk, Qwen3VLModel)
-        for chunk in chunks
-    )
+    if not chunks:
+        raise RuntimeError("Megatron model did not expose any model chunks")
+
+    ownership_by_chunk: list[tuple[bool, bool, bool]] = []
+    for chunk_index, chunk in enumerate(chunks):
+        values: list[bool] = []
+        for attribute, fallback in (
+            ("model_owns_packing", isinstance(chunk, Qwen3VLModel)),
+            ("model_owns_mtp_loss_mask_packing", False),
+            ("model_slices_context_parallel_inputs", False),
+        ):
+            value = getattr(chunk, attribute) if hasattr(chunk, attribute) else fallback
+            if type(value) is not bool:
+                raise TypeError(
+                    f"model chunk {chunk_index} must expose {attribute} as an exact "
+                    f"bool, got {value!r}"
+                )
+            values.append(value)
+        ownership_by_chunk.append((values[0], values[1], values[2]))
+
+    ownership = ownership_by_chunk[0]
+    if any(chunk_ownership != ownership for chunk_ownership in ownership_by_chunk[1:]):
+        raise RuntimeError(
+            "all Megatron model chunks must advertise the same layout ownership "
+            f"tuple; got {ownership_by_chunk!r}"
+        )
+
+    owns_packing, owns_mtp_loss_mask, slices_context_parallel_inputs = ownership
+    if owns_mtp_loss_mask and not owns_packing:
+        raise RuntimeError(
+            "a model cannot own MTP loss-mask packing without owning sequence packing"
+        )
+    if owns_packing and slices_context_parallel_inputs:
+        raise RuntimeError(
+            "a model cannot both own sequence packing and consume caller-packed "
+            "full THD inputs"
+        )
+    return ownership
+
+
+def _model_self_packs_for_cp(model: Any) -> bool:
+    """Whether the model packs sequences + CP-shards inside its own forward."""
+    return _resolve_model_layout_ownership(model)[0]
 
 
 def _model_self_packs_mtp_loss_mask(model: Any) -> bool:
     """Whether a self-packing model also aligns and CP-shards MTP masks."""
-    from megatron.core.utils import unwrap_model
-
-    unwrapped = unwrap_model(model)
-    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-    return any(
-        bool(getattr(chunk, "model_owns_mtp_loss_mask_packing", False))
-        for chunk in chunks
-    )
+    return _resolve_model_layout_ownership(model)[1]
 
 
 def _model_slices_context_parallel_inputs(model: Any) -> bool:
     """Whether the model consumes full THD input and slices CP after embedding."""
-    from megatron.core.utils import unwrap_model
-
-    unwrapped = unwrap_model(model)
-    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-    return any(
-        bool(getattr(chunk, "model_slices_context_parallel_inputs", False))
-        for chunk in chunks
-    )
+    return _resolve_model_layout_ownership(model)[2]
 
 
 def _unwrapped_chunks(model: Any) -> list[Any]:
@@ -788,16 +860,11 @@ class MegatronPolicyWorkerImpl(
         # Whether the model packs sequences + CP-shards inside its own forward
         # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
         # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
-        self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
-        self.delegate_mtp_loss_mask_to_model = _model_self_packs_mtp_loss_mask(
-            self.model
-        )
-        assert (
-            not self.delegate_mtp_loss_mask_to_model or self.delegate_pack_to_model
-        ), "A model cannot own MTP-mask packing without owning sequence packing"
-        self.model_slices_context_parallel_inputs = (
-            _model_slices_context_parallel_inputs(self.model)
-        )
+        (
+            self.delegate_pack_to_model,
+            self.delegate_mtp_loss_mask_to_model,
+            self.model_slices_context_parallel_inputs,
+        ) = _resolve_model_layout_ownership(self.model)
         # A media placeholder is an ordinary vocabulary entry, so text that
         # legitimately contains it must not be read as an anchor demanding a
         # projected feature. Only models that accept the mask are sent one.
@@ -807,11 +874,6 @@ class MegatronPolicyWorkerImpl(
             else None
         )
         if self.model_slices_context_parallel_inputs:
-            if self.delegate_pack_to_model:
-                raise RuntimeError(
-                    "A model cannot both own sequence packing and consume caller-packed "
-                    "full THD inputs."
-                )
             # MTP is supported here: the caller packs the MTP loss mask onto the
             # same full THD row as input_ids and leaves it unsharded, so the
             # model's own post-embedding CP slice applies to both alike. See the
@@ -930,6 +992,8 @@ class MegatronPolicyWorkerImpl(
             unsupported.append("fused linear logprobs")
         if self.delegate_pack_to_model:
             unsupported.append("model-owned sequence packing")
+        if self.delegate_mtp_loss_mask_to_model:
+            unsupported.append("model-owned MTP loss-mask packing")
         if self.model_slices_context_parallel_inputs:
             unsupported.append("model-owned context-parallel slicing")
         if self.media_placeholder_token_id is not None:
@@ -943,9 +1007,92 @@ class MegatronPolicyWorkerImpl(
             raise RuntimeError(
                 "shared-prefix train mode could not resolve the MCore model config"
             )
-        mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
-        if mtp_num_layers is not None and mtp_num_layers > 0:
-            unsupported.append("MTP")
+        resolved_mtp_values = {
+            name: getattr(model_config, name, None)
+            for name, _expected_value in (
+                SHARED_PREFIX_MTP_TARGET_VALUES
+                + SHARED_PREFIX_MTP_TARGET_TOPOLOGY_VALUES
+                + SHARED_PREFIX_MTP_TARGET_PROVIDER_VALUES
+            )
+        }
+        mtp_num_layers = resolved_mtp_values["mtp_num_layers"]
+        mtp_disabled = mtp_num_layers is None or (
+            type(mtp_num_layers) is int and mtp_num_layers == 0
+        )
+        if mtp_disabled:
+            resolved_mtp_values["hybrid_layer_pattern"] = None
+        else:
+            runtime_patterns = [
+                getattr(chunk, "hybrid_layer_pattern", None)
+                for chunk in _unwrapped_chunks(self.model)
+            ]
+            resolved_mtp_values["hybrid_layer_pattern"] = (
+                runtime_patterns[0]
+                if runtime_patterns
+                and all(pattern == runtime_patterns[0] for pattern in runtime_patterns)
+                else tuple(runtime_patterns)
+            )
+        mtp_mismatch = get_shared_prefix_mtp_target_mismatch(
+            resolved_mtp_values,
+            require_provider_pattern=True,
+            resolved_world_size=(
+                None if mtp_disabled else torch.distributed.get_world_size()
+            ),
+        )
+        if mtp_mismatch is not None:
+            name, expected_value, actual_value = mtp_mismatch
+            unsupported.append(
+                "MTP target drift "
+                f"(model_config.{name} must be {expected_value!r}, "
+                f"got {actual_value!r})"
+            )
+        mtp_enabled = type(mtp_num_layers) is int and mtp_num_layers == 5
+        if mtp_enabled:
+            runtime_mtp_views = [
+                (
+                    getattr(chunk, "mtp_pattern", None),
+                    getattr(chunk, "mtp_num_depths", None),
+                    getattr(chunk, "mtp_process", None),
+                )
+                for chunk in _unwrapped_chunks(self.model)
+            ]
+            expected_runtime_mtp_view = ("*E", 5, True)
+            if not runtime_mtp_views or any(
+                type(mtp_pattern) is not str
+                or mtp_pattern != expected_runtime_mtp_view[0]
+                or type(mtp_num_depths) is not int
+                or mtp_num_depths != expected_runtime_mtp_view[1]
+                or type(mtp_process) is not bool
+                or mtp_process is not expected_runtime_mtp_view[2]
+                for mtp_pattern, mtp_num_depths, mtp_process in runtime_mtp_views
+            ):
+                unsupported.append(
+                    "runtime Hybrid MTP parser drift "
+                    f"(each chunk must expose {expected_runtime_mtp_view!r}, got "
+                    f"{runtime_mtp_views!r})"
+                )
+            capabilities = _normalize_shared_prefix_training_capabilities(
+                _get_mcore_shared_prefix_training_capability()
+            )
+            try:
+                mtp_capabilities = _attest_mcore_shared_prefix_mtp_capabilities()
+            except NotImplementedError as error:
+                unsupported.append(f"MCore MTP capability attestation failed ({error})")
+            else:
+                if capabilities != mtp_capabilities:
+                    unsupported.append(
+                        "MCore topology/MTP capability-view mismatch "
+                        f"({sorted(capabilities)!r} != "
+                        f"{sorted(mtp_capabilities)!r})"
+                    )
+                missing_capabilities = {
+                    SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY
+                } - mtp_capabilities
+                if missing_capabilities:
+                    unsupported.append(
+                        "MTP without required MCore capabilities "
+                        f"{sorted(missing_capabilities)!r}"
+                    )
         tp_size = int(getattr(model_config, "tensor_model_parallel_size", 1))
         sequence_parallel = bool(getattr(model_config, "sequence_parallel", False))
         if tp_size == 1 and sequence_parallel:
@@ -967,6 +1114,18 @@ class MegatronPolicyWorkerImpl(
             raise NotImplementedError(
                 "shared-prefix train mode currently supports only losses with "
                 f"input_type=LOGPROB, got {loss_fn.input_type!r}"
+            )
+        model_config = self._get_model_config()
+        mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+        if (
+            mtp_num_layers is not None
+            and mtp_num_layers > 0
+            and loss_fn.loss_type is not LossType.TOKEN_LEVEL
+        ):
+            raise NotImplementedError(
+                "shared-prefix MTP5 requires a TOKEN_LEVEL policy loss because "
+                "MCore normalizes MTP gradients by the global valid-token count; "
+                f"got loss_type={loss_fn.loss_type!r}"
             )
 
     def _shared_prefix_bin_capacity(
@@ -1096,7 +1255,17 @@ class MegatronPolicyWorkerImpl(
                 model_config = self._get_model_config()
                 mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
                 mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
-                if mtp_enabled and "token_mask" in batch and "sample_mask" in batch:
+                if mtp_enabled:
+                    missing_mask_fields = {
+                        "token_mask",
+                        "sample_mask",
+                    } - batch.keys()
+                    if missing_mask_fields:
+                        raise ValueError(
+                            "MTP training requires token_mask and sample_mask on "
+                            "every global batch; missing "
+                            f"{sorted(missing_mask_fields)!r}"
+                        )
                     mtp_loss_mask = batch["token_mask"] * batch[
                         "sample_mask"
                     ].unsqueeze(-1)
@@ -1163,7 +1332,13 @@ class MegatronPolicyWorkerImpl(
                     )
                     # Set mtp_grad_scale_func for MTP loss scaling (scales by valid tokens)
                     mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
-                    self._set_mtp_grad_scale_func(lambda: mtp_scale)
+                    self._set_mtp_grad_scale_func(
+                        partial(
+                            _compose_mtp_grad_scale,
+                            getattr(model_config, "grad_scale_func", None),
+                            mtp_scale,
+                        )
+                    )
 
                     # Forward pass.
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
@@ -1570,6 +1745,15 @@ class MegatronPolicyWorkerImpl(
                 "a train step is already open; "
                 "call finish_train_step or abort_train_step before begin"
             )
+        # MCore's MTP tracker is process-global and setup/dummy forwards can
+        # populate it before the first streamed optimizer step. Establish the
+        # split-step boundary here; the collector clears after successful finish,
+        # while this reset also drops metrics from a failed or aborted step.
+        self._clear_mtp_metrics_tracker()
+        # ``None`` makes MCore's MTP scaler inherit the main mixed-precision
+        # grad-scale function. The split path applies its separate 1/N token
+        # normalization to all model gradient buffers exactly once at finish.
+        self._set_mtp_grad_scale_func(None)
         # Match sync train() inference-state reset (line 332-340).
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -1677,7 +1861,8 @@ class MegatronPolicyWorkerImpl(
         # Inlined from process_global_batch (data.py:319-332) — we can't
         # call process_global_batch directly because it eagerly all_reduces
         # the local sums, which is exactly what we're trying to defer.
-        assert "sample_mask" in data, "sample_mask required on microbatch data"
+        if "sample_mask" not in data:
+            raise ValueError("sample_mask required on streamed microbatch data")
         sample_mask = data["sample_mask"]
         call_local_seqs = torch.sum(sample_mask).to(torch.float64)
         if "token_mask" in data:
@@ -1690,6 +1875,18 @@ class MegatronPolicyWorkerImpl(
 
         state["local_valid_seqs"] = state["local_valid_seqs"] + call_local_seqs
         state["local_valid_toks"] = state["local_valid_toks"] + call_local_toks
+
+        # Match synchronous train(): streamed data bypasses process_global_batch,
+        # so attach the completion-only MTP mask before the shared-prefix planner
+        # materializes tensors in physical star order and applies the CP shard.
+        model_config = self._get_model_config()
+        mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+        if mtp_num_layers is not None and mtp_num_layers > 0:
+            if "token_mask" not in data:
+                raise ValueError(
+                    "MTP training requires token_mask on every streamed microbatch"
+                )
+            data["mtp_loss_mask"] = data["token_mask"] * sample_mask.unsqueeze(-1)
 
         # The number of chunks per optimizer step is a first-class property of
         # this path — it decides how many times gradients are accumulated before
@@ -1726,6 +1923,9 @@ class MegatronPolicyWorkerImpl(
             self.cfg,
             state["mbs"],
             straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             shared_prefix_bin_capacity=self._shared_prefix_bin_capacity(
                 "train_mb_tokens"
             ),
@@ -1832,6 +2032,8 @@ class MegatronPolicyWorkerImpl(
                     "failed to restore mcore hooks after finish_train_step error"
                 )
             raise
+        finally:
+            self._set_mtp_grad_scale_func(None)
 
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -1912,6 +2114,7 @@ class MegatronPolicyWorkerImpl(
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        mtp_grad_norm = self.optimizer.grad_norms_by_group.get("mtp")
 
         pg_collection = get_pg_collection(self.model)
         update_successful = logical_and_across_model_parallel_group(
@@ -1922,6 +2125,9 @@ class MegatronPolicyWorkerImpl(
         )
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, mp_group=pg_collection.mp
+        )
+        mtp_grad_norm = reduce_max_stat_across_model_parallel_group(
+            mtp_grad_norm, mp_group=pg_collection.mp
         )
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
@@ -2058,6 +2264,12 @@ class MegatronPolicyWorkerImpl(
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
 
+        self._collect_mtp_metrics(
+            metrics,
+            state["total_num_microbatches"],
+            mtp_grad_norm,
+        )
+
         self._train_step_state = None
         return metrics
 
@@ -2071,6 +2283,8 @@ class MegatronPolicyWorkerImpl(
         self._restore_saved_mcore_hooks(state)
         self.model.zero_grad_buffer()
         self.optimizer.zero_grad()
+        self._set_mtp_grad_scale_func(None)
+        self._clear_mtp_metrics_tracker()
         self._train_step_state = None
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -2466,6 +2680,19 @@ class MegatronPolicyWorkerImpl(
                 mtp_metrics["grad_norm"] = float(mtp_grad_norm)
             if mtp_metrics:
                 metrics["mtp_metrics"] = mtp_metrics
+
+    def _clear_mtp_metrics_tracker(self) -> None:
+        """Clear process-global MTP logging state at a split-step boundary."""
+        model_config = self._get_model_config()
+        mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+        if mtp_num_layers is not None and mtp_num_layers > 0:
+            # Imported lazily for the same cloudpickle isolation reason as
+            # get_mtp_metrics in _collect_mtp_metrics.
+            from megatron.core.transformer.multi_token_prediction import (
+                MTPLossLoggingHelper,
+            )
+
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
 
     def _set_mtp_grad_scale_func(self, func):
         """Set mtp_grad_scale_func on the model config for MTP loss scaling."""

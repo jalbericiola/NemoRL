@@ -718,6 +718,49 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_token_dispatcher_type == "alltoall"
         assert model_cfg.moe_shared_expert_overlap is True
 
+    @pytest.mark.parametrize(
+        ("field_name", "provider_default", "recipe_value"),
+        [
+            ("moe_aux_loss_coeff", 0.01, 0.0),
+            ("moe_z_loss_coeff", 0.01, None),
+            ("moe_input_jitter_eps", 0.01, None),
+        ],
+    )
+    def test_router_regularizer_explicit_value_overrides_provider_default(
+        self,
+        field_name: str,
+        provider_default: float,
+        recipe_value: float | None,
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = SimpleNamespace(**{field_name: provider_default})
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg[field_name] = recipe_value
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+        assert getattr(model_cfg, field_name) is recipe_value
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["moe_aux_loss_coeff", "moe_z_loss_coeff", "moe_input_jitter_eps"],
+    )
+    def test_router_regularizer_absence_preserves_provider_default(
+        self,
+        field_name: str,
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = SimpleNamespace(**{field_name: 0.01})
+
+        _apply_moe_config(
+            model_cfg,
+            {"megatron_cfg": self._base_moe_megatron_cfg()},
+        )
+
+        assert getattr(model_cfg, field_name) == 0.01
+
     @staticmethod
     def _base_moe_megatron_cfg() -> dict:
         return {
@@ -1982,6 +2025,160 @@ class TestValidateSharedPrefixModelCapability:
     """Tests for the late shared-prefix provider and MCore capability gate."""
 
     @staticmethod
+    def _install_mtp_capability_views(monkeypatch):
+        from megatron.core.models.hybrid import hybrid_model, shared_prefix
+
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+        )
+
+        capabilities = frozenset(
+            {
+                SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+                "hybrid_star_cp_tp_sp_v1",
+            }
+        )
+        views = {"shared_prefix": shared_prefix, "HybridModel": hybrid_model}
+        for module in views.values():
+            monkeypatch.setattr(
+                module,
+                "SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY",
+                SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+                raising=False,
+            )
+            monkeypatch.setattr(
+                module,
+                "SHARED_PREFIX_TRAINING_CAPABILITIES",
+                capabilities,
+                raising=False,
+            )
+        return views, SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY, capabilities
+
+    def test_mtp_capability_attestation_accepts_exact_matching_views(
+        self, monkeypatch
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _attest_mcore_shared_prefix_mtp_capabilities,
+        )
+
+        _views, _scalar, capabilities = self._install_mtp_capability_views(monkeypatch)
+
+        assert _attest_mcore_shared_prefix_mtp_capabilities() == capabilities
+
+    @pytest.mark.parametrize("view_name", ["shared_prefix", "HybridModel"])
+    @pytest.mark.parametrize("case", ["missing", "wrong", "str-subclass"])
+    def test_mtp_capability_attestation_rejects_nonexact_scalar(
+        self,
+        monkeypatch,
+        view_name: str,
+        case: str,
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _attest_mcore_shared_prefix_mtp_capabilities,
+        )
+
+        views, scalar, _capabilities = self._install_mtp_capability_views(monkeypatch)
+        module = views[view_name]
+        if case == "missing":
+            monkeypatch.delattr(
+                module,
+                "SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY",
+            )
+        elif case == "wrong":
+            monkeypatch.setattr(
+                module,
+                "SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY",
+                "hybrid_star_mtp_other_v1",
+            )
+        else:
+
+            class EqualStringSubclass(str):
+                pass
+
+            monkeypatch.setattr(
+                module,
+                "SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY",
+                EqualStringSubclass(scalar),
+            )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY",
+        ):
+            _attest_mcore_shared_prefix_mtp_capabilities()
+
+    @pytest.mark.parametrize("view_name", ["shared_prefix", "HybridModel"])
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "missing",
+            "bare-string",
+            "missing-scalar",
+            "noniterable",
+            "nonstring-member",
+        ],
+    )
+    def test_mtp_capability_attestation_rejects_invalid_aggregate(
+        self,
+        monkeypatch,
+        view_name: str,
+        case: str,
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _attest_mcore_shared_prefix_mtp_capabilities,
+        )
+
+        views, scalar, capabilities = self._install_mtp_capability_views(monkeypatch)
+        module = views[view_name]
+        if case == "missing":
+            monkeypatch.delattr(module, "SHARED_PREFIX_TRAINING_CAPABILITIES")
+            expected_error = "plural shared-prefix capability collection"
+        elif case == "bare-string":
+            monkeypatch.setattr(
+                module,
+                "SHARED_PREFIX_TRAINING_CAPABILITIES",
+                scalar,
+            )
+            expected_error = "plural shared-prefix capability collection"
+        elif case == "missing-scalar":
+            monkeypatch.setattr(
+                module,
+                "SHARED_PREFIX_TRAINING_CAPABILITIES",
+                capabilities - {scalar},
+            )
+            expected_error = "does not include"
+        elif case == "noniterable":
+            monkeypatch.setattr(module, "SHARED_PREFIX_TRAINING_CAPABILITIES", 7)
+            expected_error = "malformed shared-prefix capability set"
+        else:
+            monkeypatch.setattr(
+                module,
+                "SHARED_PREFIX_TRAINING_CAPABILITIES",
+                (scalar, 7),
+            )
+            expected_error = "malformed shared-prefix capability set"
+
+        with pytest.raises(NotImplementedError, match=expected_error):
+            _attest_mcore_shared_prefix_mtp_capabilities()
+
+    def test_mtp_capability_attestation_rejects_view_disagreement(
+        self, monkeypatch
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _attest_mcore_shared_prefix_mtp_capabilities,
+        )
+
+        views, _scalar, capabilities = self._install_mtp_capability_views(monkeypatch)
+        monkeypatch.setattr(
+            views["HybridModel"],
+            "SHARED_PREFIX_TRAINING_CAPABILITIES",
+            capabilities | {"hybrid_star_extra_v1"},
+        )
+
+        with pytest.raises(NotImplementedError, match="same MCore capability set"):
+            _attest_mcore_shared_prefix_mtp_capabilities()
+
+    @staticmethod
     def _supported_model_cfg() -> Any:
         from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
 
@@ -2023,6 +2220,30 @@ class TestValidateSharedPrefixModelCapability:
         model_cfg.moe_router_force_biased = None
         return model_cfg
 
+    @classmethod
+    def _supported_mtp5_model_cfg(cls) -> Any:
+        """Resolve the exact Nano MTP5 provider and model-parallel contract."""
+        model_cfg = cls._supported_model_cfg()
+        model_cfg.mtp_num_layers = 5
+        model_cfg.mtp_loss_scaling_factor = 0.3
+        model_cfg.mtp_use_repeated_layer = True
+        model_cfg.mtp_detach_heads = True
+        model_cfg.mtp_hybrid_override_pattern = "*E"
+        model_cfg.hybrid_layer_pattern = "M/*E/*E/*E/*E/*E"
+        model_cfg.position_embedding_type = "none"
+        model_cfg.tensor_model_parallel_size = 2
+        model_cfg.context_parallel_size = 2
+        model_cfg.sequence_parallel = True
+        model_cfg.pipeline_model_parallel_size = 1
+        model_cfg.expert_model_parallel_size = 4
+        model_cfg.expert_tensor_parallel_size = 1
+        model_cfg.num_moe_experts = 128
+        model_cfg.moe_router_enable_expert_bias = True
+        model_cfg.recompute_granularity = "full"
+        model_cfg.recompute_method = "uniform"
+        model_cfg.recompute_num_layers = 1
+        return model_cfg
+
     @staticmethod
     def _supported_capabilities(*additional: str) -> set[str]:
         from nemo_rl.models.megatron.setup import (
@@ -2035,6 +2256,24 @@ class TestValidateSharedPrefixModelCapability:
             SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY,
             *additional,
         }
+
+    @classmethod
+    def _supported_mtp5_capabilities(cls) -> set[str]:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_TP_CP_SP_TRAINING_CAPABILITY,
+        )
+
+        return cls._supported_capabilities(
+            SUPPORTED_SHARED_PREFIX_TP_CP_SP_TRAINING_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY,
+        )
 
     def test_observe_does_not_require_a_hybrid_provider(self):
         from nemo_rl.models.megatron.setup import (
@@ -2304,6 +2543,190 @@ class TestValidateSharedPrefixModelCapability:
         ):
             _validate_shared_prefix_model_capability(config, model_cfg)
 
+    def test_train_accepts_exact_mtp5_provider_with_dense_heads_capability(
+        self,
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_mtp5_model_cfg()
+        capabilities = self._supported_mtp5_capabilities()
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=capabilities,
+            ),
+            patch(
+                "nemo_rl.models.megatron.setup."
+                "_attest_mcore_shared_prefix_mtp_capabilities",
+                return_value=capabilities,
+            ),
+            patch("torch.distributed.get_world_size", return_value=4),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_rejects_exact_mtp5_provider_without_dense_heads_capability(
+        self,
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_TP_CP_SP_TRAINING_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_mtp5_model_cfg()
+        capabilities = self._supported_capabilities(
+            SUPPORTED_SHARED_PREFIX_TP_CP_SP_TRAINING_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY,
+            SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY,
+        )
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=capabilities,
+            ),
+            patch(
+                "nemo_rl.models.megatron.setup."
+                "_attest_mcore_shared_prefix_mtp_capabilities",
+                side_effect=NotImplementedError(
+                    f"missing {SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY}"
+                ),
+            ),
+            patch("torch.distributed.get_world_size", return_value=4),
+            pytest.raises(
+                NotImplementedError,
+                match=SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY,
+            ),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    @pytest.mark.parametrize(
+        ("attribute", "value", "expected_error"),
+        [
+            ("mtp_num_layers", 5.0, "model_cfg.mtp_num_layers=5"),
+            (
+                "mtp_loss_scaling_factor",
+                None,
+                "model_cfg.mtp_loss_scaling_factor=0.3",
+            ),
+            ("mtp_use_repeated_layer", 1, "model_cfg.mtp_use_repeated_layer=True"),
+            ("mtp_detach_heads", False, "model_cfg.mtp_detach_heads=True"),
+            (
+                "mtp_hybrid_override_pattern",
+                "*A",
+                r"model_cfg.mtp_hybrid_override_pattern='\*E'",
+            ),
+            (
+                "hybrid_layer_pattern",
+                "M/*E/*E/*E/*E",
+                "model_cfg.hybrid_layer_pattern=",
+            ),
+            (
+                "position_embedding_type",
+                "rope",
+                "model_cfg.position_embedding_type='none'",
+            ),
+            ("bf16", False, "model_cfg.bf16=True"),
+            ("fp16", True, "model_cfg.fp16=False"),
+            (
+                "tensor_model_parallel_size",
+                4,
+                "model_cfg.tensor_model_parallel_size=2",
+            ),
+            (
+                "context_parallel_size",
+                4,
+                "model_cfg.context_parallel_size=2",
+            ),
+            ("sequence_parallel", False, "sequence_parallel=false"),
+            ("pipeline_model_parallel_size", 2, "resolved PP1"),
+            (
+                "expert_model_parallel_size",
+                2,
+                "model_cfg.expert_model_parallel_size=4",
+            ),
+            (
+                "expert_tensor_parallel_size",
+                2,
+                "model_cfg.expert_tensor_parallel_size=1",
+            ),
+        ],
+    )
+    def test_train_rejects_exact_mtp5_resolved_provider_drift(
+        self,
+        attribute: str,
+        value: object,
+        expected_error: str,
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_mtp5_model_cfg()
+        setattr(model_cfg, attribute, value)
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=self._supported_mtp5_capabilities(),
+            ),
+            patch("torch.distributed.get_world_size", return_value=4),
+            pytest.raises(NotImplementedError, match=expected_error),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_rejects_exact_mtp5_world_size_drift(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_mtp5_model_cfg()
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=self._supported_mtp5_capabilities(),
+            ),
+            patch("torch.distributed.get_world_size", return_value=8),
+            pytest.raises(NotImplementedError, match="model_cfg.world_size=4"),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_rejects_mtp_capability_view_disagreement(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_mtp5_model_cfg()
+        capabilities = self._supported_mtp5_capabilities()
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=capabilities,
+            ),
+            patch(
+                "nemo_rl.models.megatron.setup."
+                "_attest_mcore_shared_prefix_mtp_capabilities",
+                side_effect=NotImplementedError("bound import capability mismatch"),
+            ),
+            patch("torch.distributed.get_world_size", return_value=4),
+            pytest.raises(NotImplementedError, match="bound import"),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
     def test_tp_train_requires_sequence_parallelism(self) -> None:
         from nemo_rl.models.megatron.setup import (
             _validate_shared_prefix_model_capability,
@@ -2325,14 +2748,18 @@ class TestValidateSharedPrefixModelCapability:
                 "full",
                 "hybrid_star_full_uniform_recompute_v1",
             ),
-            ("mtp_num_layers", 1, "policy.megatron_cfg.mtp_num_layers"),
+            ("mtp_num_layers", 1, "model_cfg.mtp_num_layers=5"),
             ("cuda_graph_impl", "local", "policy.megatron_cfg.cuda_graph_impl"),
             ("fp8", "e4m3", "policy.megatron_cfg.fp8_cfg.enabled"),
             ("fp4", "e2m1", "policy.quant_cfg=null"),
             ("attention_dropout", 0.1, "model_cfg.attention_dropout=0.0"),
             ("hidden_dropout", 0.1, "model_cfg.hidden_dropout=0.0"),
             ("window_size", (1023, 0), "sliding-window attention"),
-            ("position_embedding_type", "yarn", "requires standard RoPE"),
+            (
+                "position_embedding_type",
+                "yarn",
+                "supports only standard RoPE",
+            ),
             ("multi_latent_attention", True, "multi_latent_attention=true"),
             ("softmax_type", "off-by-one", "softmax_type='vanilla'"),
             (
@@ -2447,6 +2874,28 @@ class TestValidateSharedPrefixModelCapability:
         with patch(
             "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
             return_value=self._supported_capabilities(),
+        ):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
+    def test_train_rejects_positionless_attention_without_capability(self) -> None:
+        from nemo_rl.models.megatron.setup import (
+            SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        model_cfg.position_embedding_type = "none"
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup._get_mcore_shared_prefix_training_capability",
+                return_value=self._supported_capabilities(),
+            ),
+            pytest.raises(
+                NotImplementedError,
+                match=SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY,
+            ),
         ):
             _validate_shared_prefix_model_capability(config, model_cfg)
 
@@ -3106,6 +3555,57 @@ class TestSetupModelConfig:
             "nested": {"old": 2, "new": 3},
         }
         assert model_cfg.masked_softmax_fusion is True
+
+    def test_shared_prefix_mtp_refinalizes_checkpoint_provider_after_overrides(
+        self,
+        tmp_path,
+        request,
+    ) -> None:
+        """MTP5 rebuilds a stale serialized one-head Hybrid pattern."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        mocks = self._apply_patches(request)
+        iteration_dir = tmp_path / "iter_0000000"
+        iteration_dir.mkdir()
+        (iteration_dir / "run_config.yaml").touch()
+        model_cfg = self._make_model_cfg_mock()
+        model_cfg.mtp_num_layers = 1
+        model_cfg.hybrid_layer_pattern = "M/*E"
+
+        def apply_mtp_target(provider, _config) -> None:
+            provider.mtp_num_layers = 5
+
+        def rebuild_derived_pattern() -> None:
+            main_pattern = model_cfg.hybrid_layer_pattern.split("/")[0]
+            model_cfg.hybrid_layer_pattern = main_pattern + "/*E" * 5
+
+        mocks["_apply_mtp_config"].side_effect = apply_mtp_target
+        model_cfg.finalize.side_effect = rebuild_derived_pattern
+        config = {
+            "pretrained_checkpoint": None,
+            "shared_prefix_training": {"mode": "train"},
+            "megatron_cfg": {},
+        }
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.setup.load_model_config",
+                return_value=(model_cfg, None),
+            ),
+            patch(
+                "nemo_rl.models.megatron.setup._validate_shared_prefix_model_capability"
+            ),
+        ):
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path=str(tmp_path),
+            )
+
+        model_cfg.finalize.assert_called_once_with()
+        assert model_cfg.hybrid_layer_pattern == "M/*E/*E/*E/*E/*E"
 
     def test_megatron_lm_no_overrides_calls_autoconfig_without_extra_kwargs(
         self, request
