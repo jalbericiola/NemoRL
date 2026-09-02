@@ -691,8 +691,8 @@ def validate_shared_prefix_training_config(
     unless MCore exports the exact topology and physical-layout capabilities.
     """
     shared_prefix_config = get_shared_prefix_training_config(config)
-    deterministic_execution_required = (
-        shared_prefix_deterministic_execution_required(config)
+    deterministic_execution_required = shared_prefix_deterministic_execution_required(
+        config
     )
     if not deterministic_execution_required:
         return shared_prefix_config
@@ -750,9 +750,7 @@ def validate_shared_prefix_training_config(
             "deterministic execution requires policy.megatron_cfg.model_overrides "
             "to contain the deterministic execution contract."
         )
-    for name, expected_value in (
-        SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES.items()
-    ):
+    for name, expected_value in SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES.items():
         actual_value = model_overrides.get(name)
         if actual_value is not expected_value:
             raise ValueError(

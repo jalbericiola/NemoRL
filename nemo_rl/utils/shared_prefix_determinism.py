@@ -26,18 +26,14 @@ SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES: Mapping[str, str] = MappingProxyType(
         "NCCL_ALGO": "Ring",
     }
 )
-SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES: Mapping[str, bool] = (
-    MappingProxyType(
-        {
-            "deterministic_mode": True,
-            "cross_entropy_loss_fusion": False,
-            "tp_comm_overlap": False,
-        }
-    )
+SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES: Mapping[str, bool] = MappingProxyType(
+    {
+        "deterministic_mode": True,
+        "cross_entropy_loss_fusion": False,
+        "tp_comm_overlap": False,
+    }
 )
 SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES = frozenset(
     {"TRITON_CACHE_AUTOTUNING"}
 )
-SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES = (
-    "TRITON_AUTOTUNE_BLOCK",
-)
+SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES = ("TRITON_AUTOTUNE_BLOCK",)

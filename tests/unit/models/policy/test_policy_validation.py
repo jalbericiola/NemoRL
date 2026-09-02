@@ -257,7 +257,9 @@ def test_shared_prefix_strict_observe_requires_megatron() -> None:
         validate_shared_prefix_training_config(config)
 
 
-def test_shared_prefix_strict_observe_accepts_exact_contract_without_train_gates() -> None:
+def test_shared_prefix_strict_observe_accepts_exact_contract_without_train_gates() -> (
+    None
+):
     config = _add_shared_prefix_determinism_contract(
         create_megatron_config("test-model", tp=1, pp=2, cp=2)
     )

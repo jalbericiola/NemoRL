@@ -86,11 +86,7 @@ def _get_initializer_env_vars(
     import_env_var_names = _INITIALIZER_IMPORT_ENV_VAR_NAMES
     if require_deterministic_execution:
         import_env_var_names += _DETERMINISTIC_INITIALIZER_IMPORT_ENV_VAR_NAMES
-    return {
-        name: env_vars[name]
-        for name in import_env_var_names
-        if name in env_vars
-    }
+    return {name: env_vars[name] for name in import_env_var_names if name in env_vars}
 
 
 @dataclass

@@ -50,9 +50,12 @@ def _set_deterministic_worker_environment(monkeypatch):
     from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
 
     for name in list(os.environ):
-        if name in worker_module.SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES or any(
-            name.startswith(prefix)
-            for prefix in worker_module.SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES
+        if (
+            name in worker_module.SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES
+            or any(
+                name.startswith(prefix)
+                for prefix in worker_module.SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES
+            )
         ):
             monkeypatch.delenv(name)
     for name, value in worker_module.SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES.items():
@@ -98,8 +101,7 @@ def test_worker_constructor_attests_determinism_before_any_other_action() -> Non
     worker_class = next(
         node
         for node in module_ast.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "MegatronPolicyWorkerImpl"
+        if isinstance(node, ast.ClassDef) and node.name == "MegatronPolicyWorkerImpl"
     )
     constructor = next(
         node

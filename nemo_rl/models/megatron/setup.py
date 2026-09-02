@@ -518,9 +518,7 @@ def _validate_shared_prefix_model_capability(
             f"{type(model_cfg).__name__}."
         )
 
-    for name, expected_value in (
-        SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES.items()
-    ):
+    for name, expected_value in SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES.items():
         actual_value = getattr(model_cfg, name, None)
         if actual_value is not expected_value:
             raise NotImplementedError(

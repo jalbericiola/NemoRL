@@ -269,9 +269,7 @@ def test_initializer_cold_import_receives_determinism_env_only_when_strict(
             or name.startswith("TRITON_AUTOTUNE_BLOCK")
         ):
             monkeypatch.delenv(name)
-    configured_mamba = (
-        "1" if require_deterministic_execution else "plain-config-only"
-    )
+    configured_mamba = "1" if require_deterministic_execution else "plain-config-only"
     deterministic_environment = {
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "MAMBA_DETERMINISTIC": configured_mamba,
