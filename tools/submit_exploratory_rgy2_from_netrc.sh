@@ -10,8 +10,22 @@ if (( $# != 2 )) || [[ "$1" != "--submit" ]]; then
 fi
 readonly launcher="$2"
 readonly netrc_path="/home/jalbericiola/.netrc"
-[[ "${launcher}" == /* && -f "${launcher}" && ! -L "${launcher}" ]]
+readonly self_path="$(/usr/bin/readlink -f -- "$0")"
+readonly bundle_dir="$(/usr/bin/dirname -- "${self_path}")"
+readonly expected_launcher="${bundle_dir}/launch_exploratory_rgy2_pair.sh"
+[[ "$0" == /* && "${self_path}" == "$0" && -f "${self_path}" && ! -L "${self_path}" ]]
+[[ "${launcher}" == "${expected_launcher}" && -f "${launcher}" && ! -L "${launcher}" ]]
 [[ -f "${netrc_path}" && ! -L "${netrc_path}" ]]
+sha256_file() {
+  /usr/bin/sha256sum -- "$1" | /usr/bin/awk '{print $1}'
+}
+readonly launcher_sha256="$(sha256_file "${launcher}")"
+readonly self_sha256="$(sha256_file "${self_path}")"
+readonly expected_bundle_name="EXPLORATORY_RGY2_MTP_RUNTIME_NON_ACCEPTANCE_${launcher_sha256}_${self_sha256}"
+[[ "$(/usr/bin/basename -- "${bundle_dir}")" == "${expected_bundle_name}" ]]
+[[ "$(/usr/bin/stat -c '%a' -- "${bundle_dir}")" == "555" ]]
+[[ "$(/usr/bin/stat -c '%a' -- "${launcher}")" == "555" ]]
+[[ "$(/usr/bin/stat -c '%a' -- "${self_path}")" == "555" ]]
 
 wandb_key="$(
   /cm/local/apps/python3/bin/python3 -I -B - "${netrc_path}" <<'PY'
