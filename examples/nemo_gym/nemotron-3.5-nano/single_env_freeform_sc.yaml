@@ -1,0 +1,10 @@
+# =============================================================================
+# Nemotron 3.5 Nano — strict live freeform-format shared-prefix A/B overlay
+# =============================================================================
+defaults: single_env_reasoning_gym_sc.yaml
+
+env:
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/format_verification/configs/freeform_formatting.yaml
