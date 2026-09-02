@@ -26,6 +26,8 @@ readonly MCORE_ROOT="${SOURCE_RUNNABLE}/Megatron-LM"
 readonly GYM_ROOT="${BASE_RUNNABLE}/NemoRL/3rdparty/Gym-workspace/Gym"
 readonly AUTOMODEL_ROOT="${BASE_RUNNABLE}/NemoRL/3rdparty/Automodel-workspace/Automodel"
 readonly CONFIG_PATH="examples/nemo_gym/nemotron-3.5-nano/single_env_reasoning_gym_sc.yaml"
+readonly POLICY_GYM_CONFIG_REL="responses_api_models/vllm_model/configs/vllm_model_for_training.yaml"
+readonly REASONING_GYM_CONFIG_REL="resources_servers/reasoning_gym/configs/reasoning_gym.yaml"
 readonly TRAIN_ENTRYPOINT="./examples/run_grpo_single_controller.py"
 readonly NANO_LAUNCHER="${NEMO_ROOT}/examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh"
 readonly RAY_SUB_PATH="${NEMO_ROOT}/ray.sub"
@@ -65,6 +67,85 @@ sha256_file() {
   /usr/bin/sha256sum -- "$1" | /usr/bin/awk '{print $1}'
 }
 
+assert_exact_reasoning_gym_services() {
+  local recipe_path="$1"
+  local config_paths
+  local embedded_services
+  local resolved_services
+  local forbidden_service
+
+  /usr/bin/awk '
+    /^env:$/ { in_env = 1; next }
+    in_env && /^[^[:space:]#]/ { exit }
+    in_env && /^  _override_: true[[:space:]]*$/ { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "${recipe_path}" || {
+    printf 'ERROR: Reasoning-Gym recipe must replace the inherited env map\n' >&2
+    return 2
+  }
+
+  for forbidden_service in policy_model_reasoning_off safety_judge_model \
+    nl2bash_judge_model genrm_model; do
+    if /usr/bin/awk -v key="${forbidden_service}" \
+      '$0 == "    " key ":" { found = 1 } END { exit(found ? 0 : 1) }' \
+      "${recipe_path}"; then
+      printf 'ERROR: Reasoning-Gym recipe embeds forbidden service: %s\n' \
+        "${forbidden_service}" >&2
+      return 2
+    fi
+  done
+
+  config_paths="$(/usr/bin/awk '
+    /^    config_paths:$/ { in_paths = 1; next }
+    in_paths && /^      - / {
+      path = $0
+      sub(/^      - /, "", path)
+      print path
+      next
+    }
+    in_paths { exit }
+  ' "${recipe_path}")"
+  [[ "${config_paths}" == "$(printf '%s\n%s' \
+    "${POLICY_GYM_CONFIG_REL}" "${REASONING_GYM_CONFIG_REL}")" ]] || {
+    printf 'ERROR: Reasoning-Gym recipe has unexpected config_paths\n' >&2
+    return 2
+  }
+
+  embedded_services="$(/usr/bin/awk '
+    /^  nemo_gym:$/ { in_nemo_gym = 1; next }
+    in_nemo_gym && /^[^[:space:]#]/ { exit }
+    in_nemo_gym && /^    [A-Za-z_][A-Za-z0-9_]*:/ {
+      current = $0
+      sub(/^    /, "", current)
+      sub(/:.*/, "", current)
+      next
+    }
+    in_nemo_gym && /^      (responses_api_models|responses_api_agents|resources_servers):/ {
+      print current
+    }
+  ' "${recipe_path}")"
+  resolved_services="$({
+    printf '%s\n' "${embedded_services}"
+    while IFS= read -r config_path; do
+      /usr/bin/awk '
+        /^[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*$/ {
+          service = $0
+          sub(/:.*/, "", service)
+          print service
+        }
+      ' "${GYM_ROOT}/${config_path}"
+    done <<< "${config_paths}"
+  } | /usr/bin/sort -u)"
+  [[ "${resolved_services}" == "$(printf '%s\n%s\n%s' \
+    policy_model reasoning_gym reasoning_gym_simple_agent)" ]] || {
+    printf 'ERROR: unexpected Reasoning-Gym service set:\n%s\n' \
+      "${resolved_services}" >&2
+    return 2
+  }
+
+  printf 'EXPLORATORY_RGY2_GYM_SERVICES_GREEN services=policy_model,reasoning_gym,reasoning_gym_simple_agent\n'
+}
+
 for required_dir in "${BASE_DEPLOYMENT}" "${SOURCE_DEPLOYMENT}" \
   "${NEMO_ROOT}" "${BRIDGE_ROOT}" "${MCORE_ROOT}" "${GYM_ROOT}" \
   "${AUTOMODEL_ROOT}" "${MODEL_PATH}"; do
@@ -80,6 +161,8 @@ for required_file in "${BASE_DEPLOYMENT}/READY" "${SOURCE_DEPLOYMENT}/READY" \
   "${SOURCE_DEPLOYMENT}/Megatron-LM.runnable.sha256" \
   "${NANO_LAUNCHER}" "${NEMO_ROOT}/${CONFIG_PATH}" \
   "${NEMO_ROOT}/examples/run_grpo_single_controller.py" "${RAY_SUB_PATH}" \
+  "${GYM_ROOT}/${POLICY_GYM_CONFIG_REL}" \
+  "${GYM_ROOT}/${REASONING_GYM_CONFIG_REL}" \
   "${FIXTURE_PATH}" "${CONTAINER}" "${SANDBOX_CONTAINER}"; do
   [[ -f "${required_file}" && ! -L "${required_file}" ]] || {
     printf 'ERROR: required file is missing or aliased: %s\n' "${required_file}" >&2
@@ -103,6 +186,7 @@ unset required_dir required_file
 [[ "$(sha256_file "${RAY_SUB_PATH}")" == "${EXPECTED_RAY_SUB_SHA256}" ]]
 [[ "$(sha256_file "${FIXTURE_PATH}")" == "${EXPECTED_FIXTURE_SHA256}" ]]
 [[ "$(wc -l < "${FIXTURE_PATH}" | tr -d '[:space:]')" == 5 ]]
+assert_exact_reasoning_gym_services "${NEMO_ROOT}/${CONFIG_PATH}"
 
 printf 'EXPLORATORY_RGY2_133D_PRECHECK_GREEN acceptance=false source_ready=%s nemo=%s fixture=%s nodes_per_arm=1 gpus_per_arm=4 steps=2\n' \
   "${SOURCE_READY}" "${EXPECTED_NEMO_HEAD}" "${EXPECTED_FIXTURE_SHA256}"
