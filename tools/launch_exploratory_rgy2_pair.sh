@@ -192,12 +192,15 @@ launch_arm() {
   export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.ignoreSubmodules GIT_CONFIG_VALUE_0=all
   export SLURM_COMMENT='{"purpose":"EXPLORATORY_NON_ACCEPTANCE_RGY2_133D","owner":"jalbericiola"}'
 
+  # nano35_launch.sh concatenates overrides into a shell command. Preserve
+  # the YAML quotes through that second shell parse so Hydra receives a
+  # string (the Megatron env_vars schema rejects an integer).
   exec /bin/bash "${NANO_LAUNCHER}" swe \
     "policy.shared_prefix_training.mode=${shared_prefix_mode}" \
     policy.shared_prefix_training.require_deterministic_execution=true \
     "policy.megatron_cfg.env_vars.RESULTS_DIR=${arm_root}" \
     "policy.megatron_cfg.env_vars.NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR=${receipt_root}" \
-    '++policy.megatron_cfg.env_vars.NEMORL_SHARED_PREFIX_RUNTIME_TRACE="1"' \
+    '++policy.megatron_cfg.env_vars.NEMORL_SHARED_PREFIX_RUNTIME_TRACE=\"1\"' \
     ++policy.generation.vllm_cfg.enforce_eager=true \
     ++policy.generation.vllm_cfg.enable_prefix_caching=false \
     '~policy.generation.vllm_kwargs.compilation_config' \
