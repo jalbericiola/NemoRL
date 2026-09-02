@@ -2133,6 +2133,9 @@ def setup_model_and_optimizer(
         cfg=megatron_cfg,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
+        # NeMo-RL supplies externally materialized batches and never constructs
+        # MCore indexed datasets, so its native helper extension is unnecessary.
+        compile_dataset_helpers=False,
     )
 
     if megatron_cfg.ft and megatron_cfg.ft.enable_ft_package:

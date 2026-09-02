@@ -3945,6 +3945,13 @@ class TestSetupModelAndOptimizer:
             load_optimizer=True,
         )
 
+        mock_init_megatron.assert_called_once_with(
+            cfg=mock_megatron_cfg,
+            get_embedding_ranks=None,
+            get_position_embedding_ranks=None,
+            compile_dataset_helpers=False,
+        )
+
         # Verify get_model was called (the mixed_precision_wrapper should be CustomFloat16Module)
         mock_get_model.assert_called_once()
         call_kwargs = mock_get_model.call_args[1]
