@@ -1,9 +1,9 @@
 #!/bin/bash
 # Submit a bounded one-node-per-arm Reasoning-Gym OFF/ON GPU smoke from one
-# complete immutable NeMo-RL 4c313 source overlay, with the unquantized MoE
-# backend pinned to Triton.  This calibration bypasses the independently
-# diagnosed FlashInfer/TRTLLM post-load-layout refit failure; it is not
-# evidence that the production FlashInfer path is fixed.
+# complete immutable NeMo-RL 45783907 source overlay, with the unquantized MoE
+# backend left at vLLM's production auto selection. For this model/image that
+# must resolve to FlashInfer TRTLLM, exercising the routed-expert reload fix,
+# shared-prefix training, and first-step optimizer headroom together.
 #
 # This launcher is deliberately NON-ACCEPTANCE evidence.  It exists to expose
 # integration, generation, reward, MTP, and backward failures before the
@@ -14,17 +14,17 @@ readonly HOST_PATH="/cm/local/apps/python3/bin:/cm/local/apps/slurm/current/bin:
 readonly SLURM_CONF_PATH="/cm/shared/apps/slurm/etc/oci-hsg-cs-001/slurm.conf"
 readonly BASE_DEPLOYMENT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/deployments/validated_shared_prefix_20260830q"
 readonly BASE_READY="441548f85b9779788d458a0d4deeefcca789ed8b46810a1f6a929492cd27d4cf"
-readonly NEMO_DEPLOYMENT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/non_acceptance_overlays/NON_ACCEPTANCE_full_nemorl_4c313164_ebad1b2b_4ab5167b"
-readonly NEMO_READY="7c0652490ebf4e32216af517be703a6c1894a869dfababa400c500267f8d9c9e"
-readonly NEMO_READY_FILE_SHA256="6a392d71626cde227fd5a1a55bab3517edfa71a4f9f19c31b9fd010784c7a264"
-readonly NEMO_DEPLOYMENT_MANIFEST_SHA256="7c0652490ebf4e32216af517be703a6c1894a869dfababa400c500267f8d9c9e"
-readonly NEMO_RUNNABLE_MANIFEST_SHA256="fd60377b7dad85ece7d4d5e8261756340d42ba5c13bfb4179f9961230469aa06"
-readonly COMPONENT_DEPLOYMENT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/non_acceptance_overlays/NON_ACCEPTANCE_fast_mtp_runtime_4ab5167b_ebad1b2b_8ca0abaa"
-readonly COMPONENT_READY="0406f4fcf57f37de7fb9506a9218df5b3488230d58e531eb68ce8d057d3e5cb1"
-readonly COMPONENT_READY_FILE_SHA256="05fec7c7dc9a0fcf59220634d4031c456f1d27bfd99f19fa86da69806be996f4"
-readonly COMPONENT_DEPLOYMENT_MANIFEST_SHA256="0406f4fcf57f37de7fb9506a9218df5b3488230d58e531eb68ce8d057d3e5cb1"
-readonly BRIDGE_RUNNABLE_MANIFEST_SHA256="1fd648336ce71a5cca0efd2bad3b7bc0621543020f76963d36bc029df72616d7"
-readonly MCORE_RUNNABLE_MANIFEST_SHA256="3cc6c2d88434f02c3d9eda571beabdd73032ee3ed6dae073f4452c12cacc8cfb"
+readonly NEMO_DEPLOYMENT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/non_acceptance_overlays/NON_ACCEPTANCE_full_nemorl_45783907_ebad1b2b_4ab5167b"
+readonly NEMO_READY="8f3b4ff5f34fddf29afadc0cfe3a8ef00371ec789d5495f2d3c98805c9a6360d"
+readonly NEMO_READY_FILE_SHA256="5b53af0c0066ce9526430b6b3ab2f706418141468f83577767b07850774a324f"
+readonly NEMO_DEPLOYMENT_MANIFEST_SHA256="8f3b4ff5f34fddf29afadc0cfe3a8ef00371ec789d5495f2d3c98805c9a6360d"
+readonly NEMO_RUNNABLE_MANIFEST_SHA256="f76235b62c04324c5a2f5930c7b175d78a41b6eb2107b0ac59f7619a54159bbd"
+readonly COMPONENT_DEPLOYMENT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/non_acceptance_overlays/NON_ACCEPTANCE_component_bridge166164da_mcore8b8870ad"
+readonly COMPONENT_READY="46a203f315040e3f6e2127f86a9437c3cdb2916a84f41eeb3e38b8de56acfedd"
+readonly COMPONENT_READY_FILE_SHA256="fc54e1592a8b7548a7c7efbf692fe630b259f3bb8346a20f5086df50ee567827"
+readonly COMPONENT_DEPLOYMENT_MANIFEST_SHA256="46a203f315040e3f6e2127f86a9437c3cdb2916a84f41eeb3e38b8de56acfedd"
+readonly BRIDGE_RUNNABLE_MANIFEST_SHA256="9229a620edee832ea653aa3187c717de3990e6e44ea8317c8aa759c8062c5ea8"
+readonly MCORE_RUNNABLE_MANIFEST_SHA256="a840c79dc124b248e56572c256e21b99fa4b4e23941e92000d22be04c29f5720"
 
 readonly BASE_RUNNABLE="${BASE_DEPLOYMENT}/runnable"
 readonly NEMO_RUNNABLE="${NEMO_DEPLOYMENT}/runnable"
@@ -46,17 +46,18 @@ readonly FIXTURE_PATH="${BASE_RUNNABLE}/single_env_ab/data/reasoning_gym_example
 readonly MODEL_PATH="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/venkats/nemo-evaluator-rundirs/nano_v35_sft/conversions/upsampled-iter6000/hf"
 readonly CONTAINER="/lustre/fs1/portfolios/llmservice/projects/llmservice_nemotron_ultra/users/sauramishra/containers/rl-gym.63635108.sqsh"
 readonly SANDBOX_CONTAINER="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/geshen/mopd_nano_fast/images/nemo-skills-sandbox-no-sync.sqsh"
-readonly STATE_ROOT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/exploratory_rgy2_triton_moe_4c313_NON_ACCEPTANCE"
+readonly STATE_ROOT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/exploratory_rgy2_flashinfer_45783907_qfix_NON_ACCEPTANCE"
 
-readonly EXPECTED_NEMO_HEAD="4c313164da396f775a6d09eaa2d8823a9ac05172"
-readonly EXPECTED_NEMO_TREE="0628c81bad84b73b956d73578e9a66e2e7280c71"
-readonly EXPECTED_BRIDGE_HEAD="ebad1b2bf676710bc810a6a4e5daf9d899bd4e79"
-readonly EXPECTED_BRIDGE_TREE="72cd9c29ebb3d13ffa5c4368dfc1568b13c0ea6a"
-readonly EXPECTED_MCORE_HEAD="4ab5167b321d4d2a35a708faec59ef4c47b15736"
-readonly EXPECTED_MCORE_TREE="0558bcca7f98085c5a399a7e8331065fe57d3f53"
+readonly EXPECTED_NEMO_HEAD="45783907244256fce0ed8c8f7512c3fd6ed51acd"
+readonly EXPECTED_NEMO_TREE="5e446d1ba1e5b544f09b6459526a8d77263d4ab6"
+readonly EXPECTED_NEMO_BRIDGE_GITLINK="ebad1b2bf676710bc810a6a4e5daf9d899bd4e79"
+readonly EXPECTED_BRIDGE_HEAD="166164da6de0ee9bbe2906175b9e7c41411d084b"
+readonly EXPECTED_BRIDGE_TREE="e6dc1beb26dac683877b19d9422f2a2fa96037d1"
+readonly EXPECTED_MCORE_HEAD="8b8870ad4a54f24a7177f8c70e0403933d3f6dce"
+readonly EXPECTED_MCORE_TREE="4452be0376d785ce7e2e0303e813c3173b8f0a3c"
 readonly EXPECTED_FUSED_KERNEL_SHA256="73c55784840efdcfbc1b6e305bdc8a553f08b503e554719c0fb5b2947e3aa0b8"
-readonly EXPECTED_VLLM_BACKEND_BLOB="851eb450f19e7558b18493dedc825bde77b2a13a"
-readonly EXPECTED_VLLM_BACKEND_SHA256="4bae14a7c405605998d54b096032c6e3bc719ab7f5f6bbf1835be058bf936c01"
+readonly EXPECTED_VLLM_BACKEND_BLOB="09efa7276c020517faca2396d1b8032fef6f0be3"
+readonly EXPECTED_VLLM_BACKEND_SHA256="df4420b5aec847a19dd049798109b271461ff85e9b126709aa5134bcd7902502"
 readonly EXPECTED_NANO_LAUNCHER_SHA256="85625d987601a6fae3d61513cc01577e6ad33e4211b5cade92a59d4316804f3d"
 readonly EXPECTED_CONFIG_SHA256="b2d618c7be9458b4f141913323351aa03a540564a161fbf453a20c0c7a82fc6f"
 readonly EXPECTED_ENTRYPOINT_SHA256="45f99fbcde57b6265648c3197e767cdcebf20e67d28c08f43128a8d79570dedb"
@@ -66,7 +67,10 @@ readonly ACCOUNT="nemotron_sw_post"
 readonly PARTITION="batch"
 readonly QOS="short"
 readonly WALLTIME="02:00:00"
-readonly VLLM_GPU_MEMORY_UTILIZATION="0.6"
+# The 0.6 calibration left only 3.56 MiB free when fused Adam lazily
+# materialized its first-step state. Four 2k-token eager rollouts need far less
+# KV capacity, so reserve deterministic optimizer headroom for this canary.
+readonly VLLM_GPU_MEMORY_UTILIZATION="0.4"
 
 usage() {
   printf 'Usage: %s <--check|--submit>\n' "${0##*/}" >&2
@@ -96,7 +100,7 @@ readonly helper_path="${self_dir}/submit_exploratory_rgy2_from_netrc.sh"
 [[ -f "${helper_path}" && ! -L "${helper_path}" ]]
 readonly self_sha256="$(sha256_file "${self_path}")"
 readonly helper_sha256="$(sha256_file "${helper_path}")"
-readonly expected_bundle_name="EXPLORATORY_RGY2_FULL_NEMO_4C313_NON_ACCEPTANCE_${self_sha256}_${helper_sha256}"
+readonly expected_bundle_name="EXPLORATORY_RGY2_TOPOLOGY_RETRY_NON_ACCEPTANCE_${self_sha256}_${helper_sha256}"
 [[ "$(/usr/bin/basename -- "${self_dir}")" == "${expected_bundle_name}" ]]
 [[ "$(/usr/bin/stat -c '%a' -- "${self_dir}")" == "555" ]]
 [[ "$(/usr/bin/stat -c '%a' -- "${self_path}")" == "555" ]]
@@ -231,7 +235,7 @@ unset required_dir required_file
 [[ "$(git -C "${BRIDGE_ROOT}" rev-parse HEAD^{tree})" == "${EXPECTED_BRIDGE_TREE}" ]]
 [[ "$(git -C "${MCORE_ROOT}" rev-parse HEAD^{commit})" == "${EXPECTED_MCORE_HEAD}" ]]
 [[ "$(git -C "${MCORE_ROOT}" rev-parse HEAD^{tree})" == "${EXPECTED_MCORE_TREE}" ]]
-[[ "$(git -C "${NEMO_ROOT}" ls-tree HEAD 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge | /usr/bin/awk '{print $3}')" == "${EXPECTED_BRIDGE_HEAD}" ]]
+[[ "$(git -C "${NEMO_ROOT}" ls-tree HEAD 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge | /usr/bin/awk '{print $3}')" == "${EXPECTED_NEMO_BRIDGE_GITLINK}" ]]
 [[ "$(git -C "${BRIDGE_ROOT}" ls-tree HEAD 3rdparty/Megatron-LM | /usr/bin/awk '{print $3}')" == "${EXPECTED_MCORE_HEAD}" ]]
 for repository_root in "${NEMO_ROOT}" "${BRIDGE_ROOT}" "${MCORE_ROOT}"; do
   ! git -C "${repository_root}" symbolic-ref -q HEAD >/dev/null
@@ -266,7 +270,7 @@ for immutable_nemo_file in "${NEMO_ROOT}/${CONFIG_PATH}" \
 done
 unset immutable_nemo_file
 
-printf 'EXPLORATORY_RGY2_TRITON_MOE_PRECHECK_GREEN acceptance=false inventory_rehash=false moe_backend=triton nemo_ready=%s component_ready=%s nemo=%s backend=%s bridge=%s mcore=%s fixture=%s nodes_per_arm=1 gpus_per_arm=4 steps=2 vllm_gpu_memory_utilization=%s\n' \
+printf 'EXPLORATORY_RGY2_FLASHINFER_PRECHECK_GREEN acceptance=false inventory_rehash=false moe_backend=auto_expected_flashinfer_trtllm nemo_ready=%s component_ready=%s nemo=%s backend=%s bridge=%s mcore=%s fixture=%s nodes_per_arm=1 gpus_per_arm=4 steps=2 vllm_gpu_memory_utilization=%s\n' \
   "${NEMO_READY}" "${COMPONENT_READY}" "${EXPECTED_NEMO_HEAD}" \
   "${EXPECTED_VLLM_BACKEND_SHA256}" \
   "${EXPECTED_BRIDGE_HEAD}" "${EXPECTED_MCORE_HEAD}" \
@@ -282,14 +286,14 @@ fi
 }
 umask 077
 readonly pair_nonce="$(/cm/local/apps/python3/bin/python3 -I -B -c 'import secrets; print(secrets.token_hex(8))')"
-readonly pair_id="exploratory-rgy2-triton-moe-4c313-mem60-NON-ACCEPTANCE-$(date -u +%Y%m%dT%H%M%SZ)-${pair_nonce}"
+readonly pair_id="exploratory-rgy2-flashinfer-45783907-qfix-mem40-NON-ACCEPTANCE-$(date -u +%Y%m%dT%H%M%SZ)-${pair_nonce}"
 readonly pair_root="${STATE_ROOT}/${pair_id}"
 mkdir -p -- "${pair_root}/off" "${pair_root}/on"
 
 {
   printf 'status=EXPLORATORY_NON_ACCEPTANCE\nscientific_acceptance=false\n'
-  printf 'purpose=surface_runtime_generation_reward_mtp_backward_after_bypassing_flashinfer_moe_layout_refit_failure\n'
-  printf 'moe_backend=triton\nproduction_flashinfer_refit_fixed=false\n'
+  printf 'purpose=verify_production_flashinfer_refit_shared_prefix_topology_and_optimizer_headroom\n'
+  printf 'moe_backend=auto_expected_flashinfer_trtllm\nproduction_flashinfer_refit=exercised\n'
   printf 'pair_id=%s\nnemo_deployment=%s\nnemo_ready=%s\ncomponent_deployment=%s\ncomponent_ready=%s\n' \
     "${pair_id}" "${NEMO_DEPLOYMENT}" "${NEMO_READY}" \
     "${COMPONENT_DEPLOYMENT}" "${COMPONENT_READY}"
@@ -327,7 +331,7 @@ launch_arm() {
   local receipt_root="${arm_root}/runtime_receipts"
   local extra_mounts
   mkdir -p -- "${cache_root}" "${receipt_root}"
-  # USE_SNAPSHOT=0 makes the immutable 4c313 nano launcher mount its own
+  # USE_SNAPSHOT=0 makes the immutable 45783907 nano launcher mount its own
   # nemo_rl package, configs, Nano recipe, and SingleController entrypoint.
   # Those automatic mounts omit an OCI `ro` flag, so this NON_ACCEPTANCE run
   # relies on the fail-closed publication modes checked above (dirs and tracked
@@ -384,7 +388,7 @@ launch_arm() {
   export UV_CACHE_DIR_OVERRIDE= MOUNTS="${arm_root}:${arm_root}"
   export EXTRA_MOUNTS="${extra_mounts}"
   export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.ignoreSubmodules GIT_CONFIG_VALUE_0=all
-  export SLURM_COMMENT='{"purpose":"EXPLORATORY_NON_ACCEPTANCE_RGY2_TRITON_MOE_4C313","owner":"jalbericiola"}'
+  export SLURM_COMMENT='{"purpose":"EXPLORATORY_NON_ACCEPTANCE_RGY2_FLASHINFER_457_QFIX","owner":"jalbericiola"}'
 
   # nano35_launch.sh concatenates overrides into a shell command. Preserve
   # the YAML quotes through that second shell parse so Hydra receives a
@@ -397,7 +401,6 @@ launch_arm() {
     '++policy.megatron_cfg.env_vars.NEMORL_SHARED_PREFIX_RUNTIME_TRACE=\"1\"' \
     ++policy.generation.vllm_cfg.enforce_eager=true \
     ++policy.generation.vllm_cfg.enable_prefix_caching=false \
-    ++policy.generation.vllm_kwargs.moe_backend=triton \
     "policy.generation.vllm_cfg.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION}" \
     '~policy.generation.vllm_kwargs.compilation_config' \
     logger.wandb_enabled=true logger.tensorboard_enabled=false \
@@ -426,5 +429,5 @@ readonly on_job_id="$(sed -n 's/^Submitted batch job \([1-9][0-9]*\)$/\1/p' "${p
   printf 'ERROR: could not parse both candidate job IDs; pair_root=%s\n' "${pair_root}" >&2
   exit 1
 }
-printf 'EXPLORATORY_RGY2_TRITON_MOE_PAIR_SUBMITTED acceptance=false moe_backend=triton pair_id=%s off_candidate_job=%s on_candidate_job=%s pair_root=%s wandb_group=%s\n' \
+printf 'EXPLORATORY_RGY2_FLASHINFER_PAIR_SUBMITTED acceptance=false moe_backend=auto_expected_flashinfer_trtllm pair_id=%s off_candidate_job=%s on_candidate_job=%s pair_root=%s wandb_group=%s\n' \
   "${pair_id}" "${off_job_id}" "${on_job_id}" "${pair_root}" "${pair_id}"

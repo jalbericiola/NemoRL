@@ -21,7 +21,7 @@ sha256_file() {
 }
 readonly launcher_sha256="$(sha256_file "${launcher}")"
 readonly self_sha256="$(sha256_file "${self_path}")"
-readonly expected_bundle_name="EXPLORATORY_RGY2_FULL_NEMO_4C313_NON_ACCEPTANCE_${launcher_sha256}_${self_sha256}"
+readonly expected_bundle_name="EXPLORATORY_RGY2_TOPOLOGY_RETRY_NON_ACCEPTANCE_${launcher_sha256}_${self_sha256}"
 [[ "$(/usr/bin/basename -- "${bundle_dir}")" == "${expected_bundle_name}" ]]
 [[ "$(/usr/bin/stat -c '%a' -- "${bundle_dir}")" == "555" ]]
 [[ "$(/usr/bin/stat -c '%a' -- "${launcher}")" == "555" ]]
