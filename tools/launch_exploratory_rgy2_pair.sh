@@ -52,8 +52,9 @@ readonly EXPECTED_RAY_SUB_SHA256="f26b378656450c9fc6f498c4b0083981693572f2a9b1e7
 readonly EXPECTED_FIXTURE_SHA256="da8ebd2b43d002ba9a6946fe458db7df8bf7e1b3068be3e2f9f014bfdd5229ce"
 readonly ACCOUNT="nemotron_sw_post"
 readonly PARTITION="batch"
-readonly QOS="normal"
-readonly WALLTIME="04:00:00"
+readonly QOS="short"
+readonly WALLTIME="02:00:00"
+readonly VLLM_GPU_MEMORY_UTILIZATION="0.6"
 
 usage() {
   printf 'Usage: %s <--check|--submit>\n' "${0##*/}" >&2
@@ -236,9 +237,10 @@ assert_exact_reasoning_gym_services "${NEMO_ROOT}/${CONFIG_PATH}"
 [[ "$(/usr/bin/stat -c '%a' -- "${BRIDGE_ROOT}")" == "555" ]]
 [[ "$(/usr/bin/stat -c '%a' -- "${MCORE_ROOT}")" == "555" ]]
 
-printf 'EXPLORATORY_RGY2_MTP_RUNTIME_PRECHECK_GREEN acceptance=false inventory_rehash=false source_ready=%s nemo=%s bridge=%s mcore=%s fixture=%s nodes_per_arm=1 gpus_per_arm=4 steps=2\n' \
+printf 'EXPLORATORY_RGY2_MTP_RUNTIME_PRECHECK_GREEN acceptance=false inventory_rehash=false source_ready=%s nemo=%s bridge=%s mcore=%s fixture=%s nodes_per_arm=1 gpus_per_arm=4 steps=2 vllm_gpu_memory_utilization=%s\n' \
   "${SOURCE_READY}" "${EXPECTED_NEMO_HEAD}" "${EXPECTED_BRIDGE_HEAD}" \
-  "${EXPECTED_MCORE_HEAD}" "${EXPECTED_FIXTURE_SHA256}"
+  "${EXPECTED_MCORE_HEAD}" "${EXPECTED_FIXTURE_SHA256}" \
+  "${VLLM_GPU_MEMORY_UTILIZATION}"
 if [[ "${launch_mode}" == "--check" ]]; then
   exit 0
 fi
@@ -249,7 +251,7 @@ fi
 }
 umask 077
 readonly pair_nonce="$(/cm/local/apps/python3/bin/python3 -I -B -c 'import secrets; print(secrets.token_hex(8))')"
-readonly pair_id="exploratory-rgy2-mtp-runtime-NON-ACCEPTANCE-$(date -u +%Y%m%dT%H%M%SZ)-${pair_nonce}"
+readonly pair_id="exploratory-rgy2-mtp-runtime-mem60-NON-ACCEPTANCE-$(date -u +%Y%m%dT%H%M%SZ)-${pair_nonce}"
 readonly pair_root="${STATE_ROOT}/${pair_id}"
 mkdir -p -- "${pair_root}/off" "${pair_root}/on"
 
@@ -265,7 +267,8 @@ mkdir -p -- "${pair_root}/off" "${pair_root}/on"
     "${self_path}" "${self_sha256}" "${helper_sha256}" \
     "${EXPECTED_NANO_LAUNCHER_SHA256}" "${EXPECTED_CONFIG_SHA256}"
   printf 'fixture=%s\nfixture_sha256=%s\n' "${FIXTURE_PATH}" "${EXPECTED_FIXTURE_SHA256}"
-  printf 'arms=off:observe,on:train\nresources=per_arm_nodes:1,per_arm_gpus:4,colocated:true\n'
+  printf 'arms=off:observe,on:train\nresources=per_arm_nodes:1,per_arm_gpus:4,colocated:true,vllm_gpu_memory_utilization:%s\n' \
+    "${VLLM_GPU_MEMORY_UTILIZATION}"
   printf 'schedule=max_steps:2,max_epochs:20,prompts_per_step:1,generations_per_prompt:4\n'
   printf 'topology=TP2/CP2/PP1/EP4/ETP1/SP/MTP5/full-recompute\n'
   printf 'wandb=online,entity:nvidia,project:nano35-rlvr-convergence,group:%s\n' "${pair_id}"
@@ -339,6 +342,7 @@ launch_arm() {
     '++policy.megatron_cfg.env_vars.NEMORL_SHARED_PREFIX_RUNTIME_TRACE=\"1\"' \
     ++policy.generation.vllm_cfg.enforce_eager=true \
     ++policy.generation.vllm_cfg.enable_prefix_caching=false \
+    "policy.generation.vllm_cfg.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION}" \
     '~policy.generation.vllm_kwargs.compilation_config' \
     logger.wandb_enabled=true logger.tensorboard_enabled=false \
     ++logger.wandb.entity=nvidia logger.wandb.project=nano35-rlvr-convergence \
