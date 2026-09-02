@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import enum
+import hashlib
 import json
 import math
 import statistics
@@ -89,6 +90,49 @@ _PENALTY_COUNT_TO_RATE = {
     "unwanted_token": "unwanted_token_rate",
     "malformed_think_tag": "malformed_think_tag_rate",
 }
+
+
+def _derive_nemo_gym_request_seed(
+    *, base_seed: object, sample_idx: object, rollout_index: object
+) -> int:
+    """Derive one stable signed-int64 vLLM request seed.
+
+    The attempt UUID is deliberately absent: infrastructure retries receive a
+    new Gym task identity but must replay the same sampling request. Dataset
+    sample identity keeps different prompts from sharing the same K seeds.
+
+    Args:
+        base_seed: Experiment seed configured for deterministic Gym requests.
+        sample_idx: Stable dataset index from the source ``DatumSpec``.
+        rollout_index: Zero-based generation index within the prompt cohort.
+
+    Returns:
+        A deterministic nonnegative integer accepted by vLLM.
+
+    Raises:
+        ValueError: If any identity component is not a nonnegative integer.
+    """
+    components = {
+        "policy.generation.nemo_gym_per_rollout_seed_base": base_seed,
+        "DatumSpec.idx": sample_idx,
+        NEMO_GYM_ROLLOUT_INDEX_KEY: rollout_index,
+    }
+    invalid = [
+        f"{name}={value!r}"
+        for name, value in components.items()
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0
+    ]
+    if invalid:
+        raise ValueError(
+            "NeMo-Gym deterministic request seed identity requires nonnegative "
+            f"integers; invalid: {', '.join(invalid)}"
+        )
+
+    canonical_identity = json.dumps(
+        [base_seed, sample_idx, rollout_index], separators=(",", ":")
+    ).encode("ascii")
+    digest_prefix = hashlib.sha256(canonical_identity).digest()[:8]
+    return int.from_bytes(digest_prefix, byteorder="big") & _NEMO_GYM_TASK_INDEX_MASK
 
 
 def _require_datum_loss_multiplier(input_sample: DatumSpec) -> float:
@@ -1076,12 +1120,87 @@ class AsyncNemoGymRolloutImpl:
             else self._generation_config["max_new_tokens"]
         )
 
+        seed_extra_body: dict[str, Any] | None = None
+        seed_base: object = None
+        sample_idx: object = None
+        add_seed_per_rollout = self._generation_config.get(
+            "nemo_gym_add_seed_per_rollout"
+        )
+        if (
+            "nemo_gym_add_seed_per_rollout" in self._generation_config
+            and not isinstance(add_seed_per_rollout, bool)
+        ):
+            raise ValueError(
+                "policy.generation.nemo_gym_add_seed_per_rollout must be a "
+                f"boolean, got {add_seed_per_rollout!r}"
+            )
+        if add_seed_per_rollout:
+            seed_base = self._generation_config.get("nemo_gym_per_rollout_seed_base")
+            sample_idx = input_sample.get("idx")
+            # Validate identity before accepting or rewriting any request body.
+            _derive_nemo_gym_request_seed(
+                base_seed=seed_base,
+                sample_idx=sample_idx,
+                rollout_index=0,
+            )
+
+            metadata = responses_create_params.get("metadata")
+            if metadata is None:
+                metadata = {}
+                responses_create_params["metadata"] = metadata
+            elif not isinstance(metadata, dict):
+                raise ValueError(
+                    "NeMo-Gym responses_create_params.metadata must be an object "
+                    "when nemo_gym_add_seed_per_rollout is enabled"
+                )
+
+            serialized_extra_body = metadata.get("extra_body")
+            if serialized_extra_body is None:
+                parsed_extra_body: object = {}
+            elif not isinstance(serialized_extra_body, str):
+                raise ValueError(
+                    "NeMo-Gym responses_create_params.metadata.extra_body must be "
+                    "a JSON-encoded object string when "
+                    "nemo_gym_add_seed_per_rollout is enabled"
+                )
+            else:
+                try:
+                    parsed_extra_body = json.loads(serialized_extra_body)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        "NeMo-Gym responses_create_params.metadata.extra_body must "
+                        "be valid JSON when nemo_gym_add_seed_per_rollout is enabled"
+                    ) from error
+            if not isinstance(parsed_extra_body, dict):
+                raise ValueError(
+                    "NeMo-Gym responses_create_params.metadata.extra_body must "
+                    "decode to a JSON object when "
+                    "nemo_gym_add_seed_per_rollout is enabled"
+                )
+            if "seed" in parsed_extra_body:
+                raise ValueError(
+                    "NeMo-Gym responses_create_params.metadata.extra_body.seed "
+                    "must be absent when nemo_gym_add_seed_per_rollout is enabled"
+                )
+            seed_extra_body = parsed_extra_body
+
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
         rows = []
         for i in range(self._num_generations_per_prompt):
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
+            if seed_extra_body is not None:
+                row_metadata = row["responses_create_params"].setdefault("metadata", {})
+                row_extra_body = copy.deepcopy(seed_extra_body)
+                row_extra_body["seed"] = _derive_nemo_gym_request_seed(
+                    base_seed=seed_base,
+                    sample_idx=sample_idx,
+                    rollout_index=i,
+                )
+                row_metadata["extra_body"] = json.dumps(
+                    row_extra_body, sort_keys=True, separators=(",", ":")
+                )
             rows.append(row)
         return rows
 

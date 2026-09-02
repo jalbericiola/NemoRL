@@ -209,6 +209,10 @@ class GenerationConfig(TypedDict):
     val_temperature: float
     val_top_p: float
     val_top_k: int | None
+    # NeMo-Gym only: derive a stable vLLM request seed for every rollout row.
+    # Opt-in runs must also set nemo_gym_per_rollout_seed_base explicitly.
+    nemo_gym_add_seed_per_rollout: NotRequired[bool]
+    nemo_gym_per_rollout_seed_base: NotRequired[int]
     model_name: NotRequired[str]  # Not Required b/c GRPO writes this
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None

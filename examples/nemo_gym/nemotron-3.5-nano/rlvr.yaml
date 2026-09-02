@@ -304,6 +304,10 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    # Opt in for controlled A/B runs. The request seed is a stable hash of this
+    # base, the dataset sample index, and the rollout index.
+    nemo_gym_add_seed_per_rollout: false
+    nemo_gym_per_rollout_seed_base: 42
     stop_token_ids: null
     stop_strings: null
     vllm_cfg:

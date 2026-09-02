@@ -81,6 +81,8 @@ from tests.unit.experience.test_rollouts import (
 )
 from tests.unit.test_envs import MultiStepCalcMetadata
 
+_UNSET = object()
+
 
 def _run(coro):
     return asyncio.run(coro)
@@ -729,22 +731,31 @@ def test_rollout_manager_forwards_resolved_penalties_to_nemo_gym_impl():
 
 
 def _nemo_gym_impl(
-    mask_env_flagged_samples: bool, num_generations_per_prompt: int = 1
+    mask_env_flagged_samples: bool,
+    num_generations_per_prompt: int = 1,
+    *,
+    add_seed_per_rollout: object = _UNSET,
+    seed_base: object = _UNSET,
 ) -> AsyncNemoGymRolloutImpl:
+    generation_config = {
+        "stop_strings": None,
+        "stop_token_ids": None,
+        "top_k": None,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "max_new_tokens": 64,
+    }
+    if add_seed_per_rollout is not _UNSET:
+        generation_config["nemo_gym_add_seed_per_rollout"] = add_seed_per_rollout
+    if seed_base is not _UNSET:
+        generation_config["nemo_gym_per_rollout_seed_base"] = seed_base
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
         task_to_env={},
         num_generations_per_prompt=num_generations_per_prompt,
         max_seq_len=100,
         max_rollout_turns=1,
-        generation_config={
-            "stop_strings": None,
-            "stop_token_ids": None,
-            "top_k": None,
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "max_new_tokens": 64,
-        },
+        generation_config=generation_config,
         mask_env_flagged_samples=mask_env_flagged_samples,
     )
 
@@ -974,6 +985,325 @@ def test_nemo_gym_inputs_isolate_repeated_attempts():
     )
 
     assert first[0][NEMO_GYM_TASK_INDEX_KEY] != second[0][NEMO_GYM_TASK_INDEX_KEY]
+
+
+def _nemo_gym_request_seeds(rows: list[dict]) -> list[int]:
+    return [
+        json.loads(row["responses_create_params"]["metadata"]["extra_body"])["seed"]
+        for row in rows
+    ]
+
+
+def test_nemo_gym_inputs_add_stable_per_rollout_seeds_and_preserve_extra_body():
+    input_sample = cast(
+        DatumSpec,
+        {
+            "idx": 7,
+            "extra_env_info": {
+                "responses_create_params": {
+                    "metadata": {
+                        "request_label": "kept",
+                        "extra_body": json.dumps(
+                            {"guided_decoding": {"choice": ["A", "B"]}}
+                        ),
+                    }
+                }
+            },
+        },
+    )
+    original = deepcopy(input_sample)
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        num_generations_per_prompt=4,
+        add_seed_per_rollout=True,
+        seed_base=42,
+    )
+
+    rows = impl._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000001",
+    )
+
+    assert input_sample == original
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2, 3]
+    assert _nemo_gym_request_seeds(rows) == [
+        8268443954876357215,
+        178608576629793298,
+        1550254623586035897,
+        127339396338969742,
+    ]
+    assert len(set(_nemo_gym_request_seeds(rows))) == 4
+    for row in rows:
+        metadata = row["responses_create_params"]["metadata"]
+        assert metadata["request_label"] == "kept"
+        assert json.loads(metadata["extra_body"])["guided_decoding"] == {
+            "choice": ["A", "B"]
+        }
+
+
+def test_nemo_gym_inputs_keep_seeds_stable_across_attempt_retries():
+    input_sample = cast(
+        DatumSpec,
+        {"idx": 7, "extra_env_info": {"responses_create_params": {}}},
+    )
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        num_generations_per_prompt=3,
+        add_seed_per_rollout=True,
+        seed_base=42,
+    )
+
+    first = impl._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000001",
+    )
+    retry = impl._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000002",
+    )
+
+    assert first[0][NEMO_GYM_TASK_INDEX_KEY] != retry[0][NEMO_GYM_TASK_INDEX_KEY]
+    assert _nemo_gym_request_seeds(first) == _nemo_gym_request_seeds(retry)
+
+
+def test_nemo_gym_inputs_use_same_seed_identity_for_independent_ab_arms():
+    input_sample = cast(
+        DatumSpec,
+        {"idx": 7, "extra_env_info": {"responses_create_params": {}}},
+    )
+    off_arm = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        num_generations_per_prompt=3,
+        add_seed_per_rollout=True,
+        seed_base=42,
+    )
+    on_arm = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        num_generations_per_prompt=3,
+        add_seed_per_rollout=True,
+        seed_base=42,
+    )
+
+    off_rows = off_arm._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000001",
+    )
+    on_rows = on_arm._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000001",
+    )
+
+    assert _nemo_gym_request_seeds(off_rows) == _nemo_gym_request_seeds(on_rows)
+
+
+def test_nemo_gym_inputs_use_sample_identity_in_request_seed():
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        add_seed_per_rollout=True,
+        seed_base=42,
+    )
+    group_id = "00000000-0000-4000-8000-000000000001"
+
+    first = impl._build_inputs(
+        cast(
+            DatumSpec,
+            {"idx": 7, "extra_env_info": {"responses_create_params": {}}},
+        ),
+        rollout_group_id=group_id,
+    )
+    second = impl._build_inputs(
+        cast(
+            DatumSpec,
+            {"idx": 8, "extra_env_info": {"responses_create_params": {}}},
+        ),
+        rollout_group_id=group_id,
+    )
+
+    assert _nemo_gym_request_seeds(first) != _nemo_gym_request_seeds(second)
+
+
+@pytest.mark.parametrize("add_seed_per_rollout", [_UNSET, False])
+def test_nemo_gym_inputs_leave_caller_seed_unchanged_when_disabled(
+    add_seed_per_rollout: object,
+) -> None:
+    input_sample = cast(
+        DatumSpec,
+        {
+            "extra_env_info": {
+                "responses_create_params": {
+                    "metadata": {"extra_body": json.dumps({"seed": 91})}
+                }
+            }
+        },
+    )
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        num_generations_per_prompt=2,
+        add_seed_per_rollout=add_seed_per_rollout,
+    )
+
+    rows = impl._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000001",
+    )
+
+    assert _nemo_gym_request_seeds(rows) == [91, 91]
+
+
+def test_nemo_gym_inputs_create_seed_metadata_when_caller_metadata_is_null():
+    input_sample = cast(
+        DatumSpec,
+        {
+            "idx": 7,
+            "extra_env_info": {"responses_create_params": {"metadata": None}},
+        },
+    )
+    original = deepcopy(input_sample)
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        add_seed_per_rollout=True,
+        seed_base=42,
+    )
+
+    rows = impl._build_inputs(
+        input_sample,
+        rollout_group_id="00000000-0000-4000-8000-000000000001",
+    )
+
+    assert _nemo_gym_request_seeds(rows) == [8268443954876357215]
+    assert input_sample == original
+
+
+@pytest.mark.parametrize("flag", [None, 0, 1, "false", "true"])
+def test_nemo_gym_inputs_reject_non_boolean_seed_opt_in(flag: object) -> None:
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        add_seed_per_rollout=flag,
+        seed_base=42,
+    )
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        impl._build_inputs(
+            cast(
+                DatumSpec,
+                {"idx": 7, "extra_env_info": {"responses_create_params": {}}},
+            ),
+            rollout_group_id="00000000-0000-4000-8000-000000000001",
+        )
+
+
+@pytest.mark.parametrize(
+    ("seed_base", "sample_idx", "error_match"),
+    [
+        (_UNSET, 7, "nemo_gym_per_rollout_seed_base=None"),
+        (None, 7, "nemo_gym_per_rollout_seed_base=None"),
+        (True, 7, "nemo_gym_per_rollout_seed_base=True"),
+        ("42", 7, "nemo_gym_per_rollout_seed_base='42'"),
+        (-1, 7, "nemo_gym_per_rollout_seed_base=-1"),
+        (42, None, "DatumSpec.idx=None"),
+        (42, True, "DatumSpec.idx=True"),
+        (42, "7", "DatumSpec.idx='7'"),
+        (42, -1, "DatumSpec.idx=-1"),
+    ],
+)
+def test_nemo_gym_inputs_reject_missing_or_malformed_seed_identity(
+    seed_base: object, sample_idx: object, error_match: str
+) -> None:
+    input_sample = cast(
+        DatumSpec,
+        {"idx": sample_idx, "extra_env_info": {"responses_create_params": {}}},
+    )
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        add_seed_per_rollout=True,
+        seed_base=seed_base,
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        impl._build_inputs(
+            input_sample,
+            rollout_group_id="00000000-0000-4000-8000-000000000001",
+        )
+
+
+@pytest.mark.parametrize(
+    ("extra_body", "error_match"),
+    [
+        ("{not-json", "must be valid JSON"),
+        ("[]", "must decode to a JSON object"),
+        ("null", "must decode to a JSON object"),
+        ({"guided_decoding": {}}, "must be a JSON-encoded object string"),
+    ],
+)
+def test_nemo_gym_inputs_reject_malformed_seed_extra_body(
+    extra_body: object, error_match: str
+) -> None:
+    input_sample = cast(
+        DatumSpec,
+        {
+            "idx": 7,
+            "extra_env_info": {
+                "responses_create_params": {"metadata": {"extra_body": extra_body}}
+            },
+        },
+    )
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        add_seed_per_rollout=True,
+        seed_base=42,
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        impl._build_inputs(
+            input_sample,
+            rollout_group_id="00000000-0000-4000-8000-000000000001",
+        )
+
+
+def test_nemo_gym_inputs_reject_non_object_seed_metadata():
+    input_sample = cast(
+        DatumSpec,
+        {
+            "idx": 7,
+            "extra_env_info": {"responses_create_params": {"metadata": []}},
+        },
+    )
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        add_seed_per_rollout=True,
+        seed_base=42,
+    )
+
+    with pytest.raises(ValueError, match="metadata must be an object"):
+        impl._build_inputs(
+            input_sample,
+            rollout_group_id="00000000-0000-4000-8000-000000000001",
+        )
+
+
+def test_nemo_gym_inputs_reject_caller_seed_collision_when_enabled():
+    input_sample = cast(
+        DatumSpec,
+        {
+            "idx": 7,
+            "extra_env_info": {
+                "responses_create_params": {
+                    "metadata": {"extra_body": json.dumps({"seed": 91})}
+                }
+            },
+        },
+    )
+    impl = _nemo_gym_impl(
+        mask_env_flagged_samples=True,
+        add_seed_per_rollout=True,
+        seed_base=42,
+    )
+
+    with pytest.raises(ValueError, match="extra_body.seed must be absent"):
+        impl._build_inputs(
+            input_sample,
+            rollout_group_id="00000000-0000-4000-8000-000000000001",
+        )
 
 
 def _mask_gate_result():
