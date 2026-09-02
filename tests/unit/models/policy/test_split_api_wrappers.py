@@ -37,6 +37,7 @@ import torch
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+from nemo_rl.models.policy import validate_shared_prefix_training_config
 from nemo_rl.models.policy.tq_policy import TQPolicy, _aggregate_train_results
 
 
@@ -171,6 +172,7 @@ def _make_tq_policy(
         },
         "draft": {"enabled": draft_enabled},
     }
+    p.shared_prefix_training_config = validate_shared_prefix_training_config(p.cfg)
     p._router_replay_enabled = False
     p.flops_tracker = None
     wg = MagicMock()
@@ -197,6 +199,7 @@ class TestTQPolicySplitFanout:
 
     def test_train_microbatches_from_meta_dispatches_and_returns_none(self):
         p, wg = _make_tq_policy()
+        assert p.shared_prefix_training_config.mode == "disabled"
         meta = _meta()
         with (
             patch.object(TQPolicy, "_stamp_pad_seqlen"),
