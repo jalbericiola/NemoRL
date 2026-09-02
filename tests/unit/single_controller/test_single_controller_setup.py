@@ -25,7 +25,10 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
     SamplerConfig,
 )
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    build_rollout_reward_semantics_fingerprint,
+)
+from nemo_rl.algorithms.grpo import GRPOConfig, RewardPenaltyConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
@@ -340,6 +343,11 @@ class TestSetup:
         assert actor_args.tq_buffer._partition_id == "rollout_data"
         assert actor_args.tq_buffer._require_routed_experts is False
         assert actor_args.tq_buffer._include_shared_prefix_metadata is False
+        assert actor_args.tq_buffer._include_reward_processing_metadata is False
+        assert actor_args.tq_buffer._include_message_advantage_metadata is False
+        assert actor_args.tq_buffer._rollout_reward_semantics_fingerprint.startswith(
+            "sha256:"
+        )
 
     def test_observe_mode_enables_replay_payload_metadata(self, patched_factories):
         mc = _make_master_config(colocated=True)
@@ -469,6 +477,16 @@ class TestSetup:
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
         mc.policy["generation"]["top_k"] = None
+        mc.env["should_use_nemo_gym"] = True
+        mc.env["nemo_gym"] = {
+            "effort_levels": {
+                "low_string": "efficient",
+                "low_weight": 0.1,
+                "low_penalty": 1.0,
+                "low_ub": 15000,
+            }
+        }
+        mc.reward_penalties = RewardPenaltyConfig(penalize_empty_final_answer=True)
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -498,6 +516,56 @@ class TestSetup:
             rollout_fan_in=mc.async_rl.max_inflight_prompts,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+        assert actor_args.rollout_manager._impl._reward_penalty_config == {
+            "penalize_duplicated_reasoning": False,
+            "penalize_empty_final_answer": True,
+            "penalize_unwanted_tokens": False,
+            "penalize_malformed_think_tag": False,
+        }
+        assert actor_args.rollout_manager._impl._effort_config.model_dump() == {
+            "low_string": "efficient",
+            "low_weight": 0.1,
+            "low_penalty": 1.0,
+            "low_ub": 15000,
+        }
+        rollout_impl = actor_args.rollout_manager._impl
+        assert actor_args.tq_buffer._rollout_reward_semantics_fingerprint == (
+            build_rollout_reward_semantics_fingerprint(
+                use_nemo_gym=True,
+                effort_config=rollout_impl._effort_config.model_dump(mode="json"),
+                reward_penalty_config=rollout_impl._reward_penalty_config or {},
+                mask_env_flagged_samples=rollout_impl._mask_env_flagged_samples,
+                thinking_tags=sc_setup_mod.get_nemo_gym_thinking_tags(mc.env),
+                invalid_tool_call_advantage=mc.grpo.invalid_tool_call_advantage,
+                malformed_thinking_advantage=mc.grpo.malformed_thinking_advantage,
+            )
+        )
+
+    def test_reward_processing_payload_columns_are_config_gated(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.grpo.reward_shaping.enabled = True
+        mc.grpo.invalid_tool_call_advantage = -5.0
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        mc.env["should_use_nemo_gym"] = True
+        mc.env["nemo_gym"] = {}
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.tq_buffer._include_reward_processing_metadata is True
+        assert actor_args.tq_buffer._include_message_advantage_metadata is True
 
     def test_setup_timing_populated_for_colocated_vllm(self, patched_factories):
         """Colocated vLLM records gen+policy+collective+total+worker fields."""

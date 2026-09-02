@@ -28,11 +28,13 @@ import asyncio
 import json
 import tempfile
 import uuid
+from collections import UserDict
 from copy import deepcopy
 from typing import cast
 
 import pytest
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
@@ -51,11 +53,14 @@ from nemo_rl.experience.rollout_manager import (
     RolloutManager,
     RolloutRetryPolicy,
     RolloutStats,
+    _add_cohort_rollout_metrics,
 )
 from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (
@@ -77,6 +82,51 @@ from tests.unit.test_envs import MultiStepCalcMetadata
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def test_cohort_generated_tokens_exclude_prompt_history_assistants() -> None:
+    metrics: dict = {}
+    completion = Completion(
+        message_log=[
+            {"role": "user", "token_ids": torch.tensor([1])},
+            {"role": "assistant", "token_ids": torch.tensor([2, 3])},
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([4, 5, 6]),
+                "generation_logprobs": torch.zeros(3),
+            },
+        ],
+        env_extras=None,
+        truncated=False,
+        reward=1.0,
+    )
+
+    _add_cohort_rollout_metrics(metrics, [completion])
+
+    assert metrics["cohort/generated_tokens"] == 3
+    assert metrics["cohort/total_tokens"] == 6
+
+
+def test_cohort_env_mask_count_uses_resolved_provenance_only() -> None:
+    metrics: dict = {}
+    raw_only = Completion(
+        message_log=[{"role": "user", "token_ids": torch.tensor([1])}],
+        env_extras={"instance_config": {"mask_sample": True}},
+        truncated=False,
+        reward=1.0,
+        env_masked=False,
+    )
+    resolved = Completion(
+        message_log=[{"role": "user", "token_ids": torch.tensor([2])}],
+        env_extras={"instance_config": {"mask_sample": False}},
+        truncated=False,
+        reward=1.0,
+        env_masked=True,
+    )
+
+    _add_cohort_rollout_metrics(metrics, [raw_only, resolved])
+
+    assert metrics["cohort/env_masked_sample_count"] == 1
 
 
 class _FakeBuffer:
@@ -129,9 +179,7 @@ class _FakeImpl:
         self._on_run = on_run
         self.rollout_group_ids: list[str | None] = []
 
-    async def run_rollout(
-        self, input_sample, *, rollout_group_id: str | None = None
-    ):
+    async def run_rollout(self, input_sample, *, rollout_group_id: str | None = None):
         self.rollout_group_ids.append(rollout_group_id)
         if self._on_run is not None:
             await self._on_run(input_sample)
@@ -282,6 +330,55 @@ class TestGenerateAndPushFlow:
         assert buf.remove_calls == [impl.rollout_group_ids[0]]
         assert [call[0] for call in buf.commit_calls] == [impl.rollout_group_ids[1]]
 
+    def test_success_receipt_covers_failed_attempt_work_and_backoff(self, monkeypatch):
+        attempts = 0
+
+        async def _fail_first_attempt(_sample):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise GenerationUnavailable("injected first-attempt failure")
+
+        record = PromptGroupRecord(
+            prompt_idx=0,
+            prompt=[],
+            extra_env_info=None,
+            metadata={},
+            completions=[],
+            # These attempt-local values must be replaced by the prompt lifecycle.
+            rollout_metrics={
+                "cohort/rollout_started_at_s": 8.0,
+                "cohort/rollout_finished_at_s": 9.0,
+                "timing/rollout/total": 1.0,
+            },
+        )
+        buf = _FakeBuffer()
+        impl = _FakeImpl(record=record, on_run=_fail_first_attempt)
+        policy = RolloutRetryPolicy.single_attempt(
+            max_infra_attempts=2,
+            backoff_base_s=0.0,
+        )
+        mgr = _make_manager(buf, impl, retry_policy=policy)
+        wall_timestamps = iter((100.0, 115.0))
+        work_timestamps = iter((1.0, 4.0, 5.0, 10.0))
+        monkeypatch.setattr(
+            "nemo_rl.experience.rollout_manager.time.time",
+            lambda: next(wall_timestamps),
+        )
+        monkeypatch.setattr(
+            "nemo_rl.experience.rollout_manager.time.perf_counter",
+            lambda: next(work_timestamps),
+        )
+
+        _run(mgr.generate_and_push({"prompt": "p"}))
+
+        _, committed, _, _ = buf.commit_calls[0]
+        assert committed.rollout_metrics["cohort/rollout_started_at_s"] == 100.0
+        assert committed.rollout_metrics["cohort/rollout_finished_at_s"] == 115.0
+        # Two attempts took 3s and 5s.  The 7s between them is lifecycle/backoff,
+        # represented by the wall interval but excluded from attempt work.
+        assert committed.rollout_metrics["timing/rollout/total"] == 8.0
+
     def test_start_weight_version_pinned_at_reserve_time(self):
         """If set_weight_version is called mid-rollout, start != end."""
         buf = _FakeBuffer()
@@ -416,6 +513,66 @@ def test_rollout_manager_forwards_mask_env_flagged_samples():
     assert manager._impl._mask_env_flagged_samples is False
 
 
+def test_rollout_manager_rejects_enabled_penalties_on_native_path():
+    with pytest.raises(ValueError, match="reward_penalties require use_nemo_gym=true"):
+        RolloutManager(
+            tokenizer=None,
+            task_to_env={},
+            num_generations_per_prompt=1,
+            max_seq_len=1,
+            policy_generation=object(),
+            use_nemo_gym=False,
+            reward_penalty_config={"penalize_empty_final_answer": True},
+        )
+
+
+def test_rollout_manager_rejects_unknown_enabled_penalty_flag():
+    with pytest.raises(ValueError, match="unsupported enabled reward penalty"):
+        RolloutManager(
+            tokenizer=None,
+            task_to_env={},
+            num_generations_per_prompt=1,
+            max_seq_len=1,
+            policy_generation=object(),
+            use_nemo_gym=False,
+            reward_penalty_config={"penalize_empty_final_answers": True},
+        )
+
+
+def test_rollout_manager_rejects_unknown_enabled_penalty_on_base_model():
+    class LoosePenaltyConfig(BaseModel, extra="allow"):
+        pass
+
+    with pytest.raises(ValueError, match="unsupported enabled reward penalty"):
+        RolloutManager(
+            tokenizer=None,
+            task_to_env={},
+            num_generations_per_prompt=1,
+            max_seq_len=1,
+            policy_generation=object(),
+            use_nemo_gym=False,
+            reward_penalty_config=LoosePenaltyConfig(penalize_empty_final_answers=True),
+        )
+
+
+def test_rollout_manager_forwards_resolved_penalties_to_nemo_gym_impl():
+    manager = RolloutManager(
+        tokenizer=None,
+        task_to_env={},
+        num_generations_per_prompt=1,
+        max_seq_len=1,
+        generation_config={
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        use_nemo_gym=True,
+        reward_penalty_config=UserDict({"penalize_empty_final_answer": True}),
+    )
+
+    assert manager._impl._reward_penalty_config == {"penalize_empty_final_answer": True}
+
+
 def _nemo_gym_impl(
     mask_env_flagged_samples: bool, num_generations_per_prompt: int = 1
 ) -> AsyncNemoGymRolloutImpl:
@@ -455,9 +612,7 @@ def test_nemo_gym_inputs_use_attempt_identity_without_mutating_source():
         },
     )
     original = deepcopy(input_sample)
-    impl = _nemo_gym_impl(
-        mask_env_flagged_samples=True, num_generations_per_prompt=3
-    )
+    impl = _nemo_gym_impl(mask_env_flagged_samples=True, num_generations_per_prompt=3)
 
     rows = impl._build_inputs(input_sample, rollout_group_id=rollout_group_id)
 
@@ -469,6 +624,152 @@ def test_nemo_gym_inputs_use_attempt_identity_without_mutating_source():
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2]
     assert input_sample == original
+
+
+def test_nemo_gym_run_rollout_records_exact_wall_interval(monkeypatch):
+    impl = _nemo_gym_impl(mask_env_flagged_samples=True)
+    input_sample = cast(
+        DatumSpec,
+        {
+            "message_log": [],
+            "extra_env_info": {
+                "agent_ref": {"name": "test_agent"},
+                "responses_create_params": {"max_output_tokens": 100},
+            },
+            "task_name": "nemo_gym",
+            "idx": 0,
+            "loss_multiplier": 1.0,
+        },
+    )
+
+    async def _run_rollouts(_inputs, _timer, _timer_prefix):
+        return [], [], {}
+
+    impl._run_rollouts = _run_rollouts
+    timestamps = iter((10.0, 13.0))
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollout_manager.time.time", lambda: next(timestamps)
+    )
+
+    record = _run(impl.run_rollout(input_sample))
+
+    assert record.rollout_metrics["cohort/rollout_started_at_s"] == 10.0
+    assert record.rollout_metrics["cohort/rollout_finished_at_s"] == 13.0
+
+
+def test_nemo_gym_run_rollouts_applies_penalty_and_preserves_reward_boundary():
+    result = {
+        "input_message_log": [{"role": "user", "token_ids": [1]}],
+        "message_log": [
+            {"role": "user", "token_ids": [1]},
+            {
+                "role": "assistant",
+                "token_ids": [2, 3],
+                "generation_logprobs": [0.0, 0.0],
+            },
+        ],
+        "full_result": {
+            "reward": 1.0,
+            "response": {
+                "output": [
+                    {"type": "reasoning", "summary": [{"text": "same"}]},
+                    {"type": "message", "content": [{"text": "same"}]},
+                ]
+            },
+        },
+    }
+    impl = _nemo_gym_impl(mask_env_flagged_samples=True)
+    impl._effort_config = EffortLevelsConfig(
+        low_string="efficient",
+        low_weight=1.0,
+        low_penalty=1.0,
+        low_ub=20,
+    )
+    impl._reward_penalty_config = {"penalize_duplicated_reasoning": True}
+
+    async def _stream_rows(_env, _pending, results, _total_rows, _timer_prefix):
+        results[0] = deepcopy(result)
+        return {}
+
+    impl._stream_rows = _stream_rows
+    impl._task_to_env = {"nemo_gym": object()}
+    completions, _, metrics = _run(
+        impl._run_rollouts(
+            [
+                {
+                    "_rowidx": 0,
+                    "agent_ref": {"name": "agent"},
+                    "responses_create_params": {
+                        "input": [{"role": "user", "content": "be efficient"}]
+                    },
+                }
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert completions[0].reward == 0.0
+    assert metrics["cohort/raw_environment_reward_sum"] == 1.0
+    assert metrics["cohort/pre_penalty_reward_sum"] == pytest.approx(1.9)
+    assert metrics["cohort/post_penalty_reward_sum"] == 0.0
+    assert metrics["cohort/effort_low_sample_count"] == 1
+    assert metrics["cohort/effort_reward_delta_sum"] == pytest.approx(0.9)
+    assert metrics["mean_length_reward_low"] == pytest.approx(0.9)
+    assert metrics["mean_reward_low"] == pytest.approx(1.9)
+    assert metrics["mean_length_low"] == 2
+    assert metrics["median_length_low"] == 2
+    assert metrics["cohort/duplicated_reasoning_count"] == 1
+    assert metrics["reasoning_equal_to_final_answer_rate"] == 1.0
+    assert metrics["cohort/samples"] == 1
+    assert metrics["cohort/generated_tokens"] == 2
+    assert metrics["cohort/total_tokens"] == 3
+    for count_key, rate_key in (
+        ("empty_final_answer", "empty_final_answer_rate"),
+        ("unwanted_token", "unwanted_token_rate"),
+        ("malformed_think_tag", "malformed_think_tag_rate"),
+    ):
+        assert metrics[f"cohort/{count_key}_count"] == 0
+        assert metrics[rate_key] == 0.0
+
+
+def test_nemo_gym_penalties_tensorize_token_ids_before_malformed_check():
+    result = {
+        "input_message_log": [{"role": "user", "token_ids": [12, 7]}],
+        "message_log": [
+            {"role": "user", "token_ids": [12, 7]},
+            {
+                "role": "assistant",
+                "token_ids": [8],
+                "generation_logprobs": [0.0],
+            },
+        ],
+        "full_result": {"reward": 1.0},
+    }
+    impl = _nemo_gym_impl(mask_env_flagged_samples=True)
+    impl._reward_penalty_config = {
+        "penalize_malformed_think_tag": True,
+        "token_ids": {"think_open": 12, "think_close": 13},
+    }
+
+    async def _stream_rows(_env, _pending, results, _total_rows, _timer_prefix):
+        results[0] = deepcopy(result)
+        return {}
+
+    impl._stream_rows = _stream_rows
+    impl._task_to_env = {"nemo_gym": object()}
+    completions, _, metrics = _run(
+        impl._run_rollouts(
+            [{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert isinstance(completions[0].message_log[0]["token_ids"], torch.Tensor)
+    assert completions[0].reward == 0.0
+    assert metrics["cohort/malformed_think_tag_count"] == 1
+    assert metrics["malformed_think_tag_rate"] == 1.0
 
 
 def test_nemo_gym_inputs_reject_invalid_attempt_identity():
@@ -525,12 +826,23 @@ def _mask_gate_result():
 def test_result_to_completion_keeps_mask_flag_when_gate_on():
     completion = _nemo_gym_impl(True)._result_to_completion(_mask_gate_result())
     assert completion.env_extras["instance_config"]["mask_sample"] is True
+    assert completion.env_masked is True
 
 
-def test_result_to_completion_drops_mask_flag_when_gate_off():
+def test_result_to_completion_preserves_raw_mask_flag_when_gate_off():
     completion = _nemo_gym_impl(False)._result_to_completion(_mask_gate_result())
-    assert "mask_sample" not in completion.env_extras["instance_config"]
+    assert completion.env_extras["instance_config"]["mask_sample"] is True
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
+    assert completion.env_masked is False
+
+
+@pytest.mark.parametrize("value", [1, "true", torch.tensor(True)])
+def test_result_to_completion_rejects_non_bool_mask_flag(value):
+    result = _mask_gate_result()
+    result["full_result"]["instance_config"]["mask_sample"] = value
+
+    with pytest.raises(TypeError, match="mask_sample must be a bool"):
+        _nemo_gym_impl(True)._result_to_completion(result)
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +901,7 @@ def single_multi_step_calculator_input_sample(rollout_tokenizer):  # noqa: F811
         "task_name": "multi_step_calculator_game",
         "stop_strings": ["<call: calculator>"],
         "idx": 0,
+        "loss_multiplier": 1.0,
     }
 
 

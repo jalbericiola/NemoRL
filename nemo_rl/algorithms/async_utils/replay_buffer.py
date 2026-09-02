@@ -14,6 +14,9 @@
 
 import asyncio
 import gc
+import hashlib
+import json
+import math
 import statistics
 import threading as _threading
 import uuid
@@ -23,6 +26,7 @@ from typing import Any, Iterable, Optional
 
 import ray
 import torch
+from tensordict import TensorDictBase
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data.packing.shared_prefix_metadata import (
@@ -32,12 +36,313 @@ from nemo_rl.data.packing.shared_prefix_metadata import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.experience.interfaces import (
+    GENERATED_ASSISTANT_MESSAGE_COUNT,
+    INVALID_AND_MALFORMED_MESSAGE_COUNT,
+    INVALID_TOOL_CALL_MESSAGE_COUNT,
+    INVALID_TOOL_CALL_TOKEN_MASK,
+    MALFORMED_THINKING_MESSAGE_COUNT,
+    MALFORMED_THINKING_TOKEN_MASK,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
+    RESPONSE_TOKEN_LENGTHS,
+    ROLLOUT_TRUNCATED,
     PromptGroupRecord,
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.r3_trace import trace_rollout_payload
+
+
+RolloutScalarMetrics = dict[str, int | float]
+# Bump this domain whenever the code-level meaning or ordering of the hashed
+# effort, penalty, mask, or message-advantage stages changes.
+_ROLLOUT_REWARD_SEMANTICS_DOMAIN = "single-controller-rollout-reward-v1"
+_SHA256_FINGERPRINT_PREFIX = "sha256:"
+_REQUIRED_ROLLOUT_RECEIPT_KEYS = {
+    "cohort/samples",
+    "cohort/generated_tokens",
+    "cohort/total_tokens",
+    "cohort/raw_environment_reward_sum",
+    "cohort/pre_penalty_reward_sum",
+    "cohort/effort_low_sample_count",
+    "cohort/effort_reward_delta_sum",
+    "cohort/env_masked_sample_count",
+    "cohort/post_penalty_reward_sum",
+    "cohort/duplicated_reasoning_count",
+    "cohort/empty_final_answer_count",
+    "cohort/unwanted_token_count",
+    "cohort/malformed_think_tag_count",
+    "cohort/rollout_started_at_s",
+    "cohort/rollout_finished_at_s",
+    "timing/rollout/total",
+}
+
+
+def build_rollout_reward_semantics_fingerprint(
+    *,
+    use_nemo_gym: bool,
+    effort_config: Mapping[str, Any] | None,
+    reward_penalty_config: Mapping[str, Any],
+    mask_env_flagged_samples: bool,
+    thinking_tags: Iterable[str],
+    invalid_tool_call_advantage: float | None,
+    malformed_thinking_advantage: float | None,
+) -> str:
+    """Return a canonical fingerprint for semantics embodied by replay rows.
+
+    Buffered rewards and masks are computed before the group enters replay. A
+    resumed run must therefore use the same rollout-time configuration as the
+    run that wrote the checkpoint; otherwise restored and newly generated rows
+    in one optimizer step can carry different semantics.
+
+    Args:
+        use_nemo_gym: Whether rewards come from the NeMo-Gym rollout path.
+        effort_config: Normalized NeMo-Gym effort-shaping configuration, or None.
+        reward_penalty_config: Normalized rollout reward-penalty configuration.
+        mask_env_flagged_samples: Whether environment flags zero sample masks.
+        thinking_tags: Tags used for malformed-thinking detection.
+        invalid_tool_call_advantage: Invalid-tool message advantage override.
+        malformed_thinking_advantage: Malformed-thinking advantage override.
+
+    Returns:
+        A domain-separated SHA-256 fingerprint.
+
+    Raises:
+        TypeError: If the supplied configuration cannot be encoded as canonical
+            JSON.
+        ValueError: If a float is non-finite.
+    """
+    payload = {
+        "domain": _ROLLOUT_REWARD_SEMANTICS_DOMAIN,
+        "use_nemo_gym": use_nemo_gym,
+        "effort_config": effort_config,
+        "reward_penalty_config": reward_penalty_config,
+        "mask_env_flagged_samples": mask_env_flagged_samples,
+        "thinking_tags": list(thinking_tags),
+        "message_advantage_config": {
+            "invalid_tool_call_advantage": invalid_tool_call_advantage,
+            "malformed_thinking_advantage": malformed_thinking_advantage,
+        },
+    }
+    try:
+        encoded = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise type(error)(
+            "rollout reward-semantics configuration must be canonical-JSON "
+            f"serializable: {error}"
+        ) from error
+    return _SHA256_FINGERPRINT_PREFIX + hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_rollout_reward_semantics_fingerprint(fingerprint: str) -> None:
+    """Reject absent or malformed fingerprints before replay is usable."""
+    if not isinstance(fingerprint, str):
+        raise TypeError(
+            "rollout_reward_semantics_fingerprint must be a string, got "
+            f"{type(fingerprint).__name__}"
+        )
+    if not fingerprint.startswith(_SHA256_FINGERPRINT_PREFIX):
+        raise ValueError(
+            "rollout_reward_semantics_fingerprint must use the 'sha256:' prefix"
+        )
+    digest = fingerprint.removeprefix(_SHA256_FINGERPRINT_PREFIX)
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError(
+            "rollout_reward_semantics_fingerprint must contain a 64-character "
+            "lowercase hexadecimal SHA-256 digest"
+        )
+
+
+def _validate_checkpoint_meta_fields(
+    *,
+    meta: KVBatchMeta,
+    group_id: str,
+) -> list[str]:
+    """Validate and return a checkpoint group's declared field names."""
+    if not isinstance(meta, KVBatchMeta):
+        raise ValueError(
+            f"Replay buffer checkpoint group {group_id!r} meta must be "
+            f"KVBatchMeta, got {type(meta).__name__}"
+        )
+    if meta.fields is None:
+        raise ValueError(
+            f"Replay buffer checkpoint group {group_id!r} has meta.fields=None"
+        )
+    if not isinstance(meta.fields, list):
+        raise ValueError(
+            f"Replay buffer checkpoint group {group_id!r} meta.fields must be a list"
+        )
+    meta_fields = list(meta.fields)
+    if any(not isinstance(field, str) for field in meta_fields):
+        raise ValueError(
+            f"Replay buffer checkpoint group {group_id!r} has non-string meta.fields"
+        )
+    if len(meta_fields) != len(set(meta_fields)):
+        raise ValueError(
+            f"Replay buffer checkpoint group {group_id!r} has duplicate meta.fields"
+        )
+    return meta_fields
+
+
+def _validate_checkpoint_group_fields(
+    *,
+    meta: KVBatchMeta,
+    fields_data: Any,
+    group_id: str,
+) -> None:
+    """Require checkpoint payload keys and batch size to match its metadata."""
+    meta_fields = _validate_checkpoint_meta_fields(meta=meta, group_id=group_id)
+
+    if not isinstance(fields_data, TensorDictBase):
+        raise ValueError(
+            f"Replay buffer checkpoint group {group_id!r} fields_data must be a "
+            f"TensorDict, got {type(fields_data).__name__}"
+        )
+    expected_batch_size = (len(meta.sample_ids),)
+    if tuple(fields_data.batch_size) != expected_batch_size:
+        raise ValueError(
+            f"Replay buffer checkpoint group {group_id!r} fields_data batch_size "
+            f"mismatch: checkpoint={tuple(fields_data.batch_size)}, "
+            f"expected={expected_batch_size}"
+        )
+    # Top-level iteration intentionally includes NonTensorData / NonTensorStack
+    # leaves, unlike keys(include_nested=True, leaves_only=True).
+    payload_fields = list(fields_data.keys())
+    if any(not isinstance(field, str) for field in payload_fields):
+        raise ValueError(
+            f"Replay buffer checkpoint group {group_id!r} has non-string "
+            "fields_data keys"
+        )
+    if len(payload_fields) != len(set(payload_fields)):
+        raise ValueError(
+            f"Replay buffer checkpoint group {group_id!r} has duplicate "
+            "fields_data keys"
+        )
+
+    declared = set(meta_fields)
+    materialized = set(payload_fields)
+    if declared != materialized:
+        raise ValueError(
+            f"Replay buffer checkpoint group {group_id!r} field mismatch: "
+            f"missing_from_fields_data={sorted(declared - materialized)}, "
+            f"unexpected_in_fields_data={sorted(materialized - declared)}"
+        )
+
+
+def _scalar_rollout_metrics(metrics: Mapping[str, Any]) -> RolloutScalarMetrics:
+    """Copy finite scalar rollout metrics suitable for checkpointing and W&B."""
+    scalars: RolloutScalarMetrics = {}
+    for key, value in metrics.items():
+        if not isinstance(key, str):
+            raise TypeError(
+                "PromptGroupRecord.rollout_metrics keys must be strings; "
+                f"got {type(key).__name__}"
+            )
+        # Tables and histograms remain rollout-local. The exact scalar summary is
+        # what an optimizer step can reduce without serializing large result tables
+        # into replay-buffer checkpoints.
+        if isinstance(value, bool):
+            scalars[key] = int(value)
+        elif isinstance(value, (int, float)):
+            if not math.isfinite(float(value)):
+                if key in _REQUIRED_ROLLOUT_RECEIPT_KEYS:
+                    raise ValueError(
+                        f"required rollout metric {key!r} must be finite, got {value!r}"
+                    )
+                continue
+            scalars[key] = value
+    return scalars
+
+
+def _validate_rollout_metric_receipt(
+    metrics: RolloutScalarMetrics,
+    *,
+    expected_samples: Optional[int] = None,
+) -> None:
+    """Require the exact counters needed for a comparable optimizer-step history."""
+    missing = _REQUIRED_ROLLOUT_RECEIPT_KEYS - set(metrics)
+    if missing:
+        raise ValueError(
+            "rollout metric receipt is incomplete; missing exact cohort keys "
+            f"{sorted(missing)}"
+        )
+    integer_keys = {
+        "cohort/samples",
+        "cohort/generated_tokens",
+        "cohort/total_tokens",
+        "cohort/effort_low_sample_count",
+        "cohort/env_masked_sample_count",
+        "cohort/duplicated_reasoning_count",
+        "cohort/empty_final_answer_count",
+        "cohort/unwanted_token_count",
+        "cohort/malformed_think_tag_count",
+    }
+    for key in integer_keys:
+        value = float(metrics[key])
+        if value < 0 or not value.is_integer():
+            raise ValueError(
+                f"rollout metric {key!r} must be a nonnegative integer, got {value}"
+            )
+    samples = int(metrics["cohort/samples"])
+    if samples < 1:
+        raise ValueError("rollout metric 'cohort/samples' must be positive")
+    if expected_samples is not None and samples != expected_samples:
+        raise ValueError(
+            "rollout metric receipt sample count does not match its payload: "
+            f"metrics={samples}, payload={expected_samples}"
+        )
+    if metrics["cohort/total_tokens"] < metrics["cohort/generated_tokens"]:
+        raise ValueError(
+            "rollout metric 'cohort/total_tokens' cannot be smaller than "
+            "'cohort/generated_tokens'"
+        )
+    if metrics["cohort/effort_low_sample_count"] > samples:
+        raise ValueError(
+            "rollout effort low-sample count exceeds cohort/samples: "
+            f"{metrics['cohort/effort_low_sample_count']} > {samples}"
+        )
+    if metrics["cohort/env_masked_sample_count"] > samples:
+        raise ValueError(
+            "rollout env-masked sample count exceeds cohort/samples: "
+            f"{metrics['cohort/env_masked_sample_count']} > {samples}"
+        )
+    observed_effort_delta = float(metrics["cohort/pre_penalty_reward_sum"]) - float(
+        metrics["cohort/raw_environment_reward_sum"]
+    )
+    if not math.isclose(
+        observed_effort_delta,
+        float(metrics["cohort/effort_reward_delta_sum"]),
+        rel_tol=1e-7,
+        abs_tol=1e-7,
+    ):
+        raise ValueError(
+            "rollout effort delta does not match raw/pre-penalty reward boundaries"
+        )
+    for key in (
+        "cohort/duplicated_reasoning_count",
+        "cohort/empty_final_answer_count",
+        "cohort/unwanted_token_count",
+        "cohort/malformed_think_tag_count",
+    ):
+        if metrics[key] > samples:
+            raise ValueError(
+                f"rollout penalty metric {key!r} exceeds cohort/samples: "
+                f"{metrics[key]} > {samples}"
+            )
+    if metrics["timing/rollout/total"] < 0:
+        raise ValueError("rollout metric 'timing/rollout/total' must be nonnegative")
+    started_at_s = metrics["cohort/rollout_started_at_s"]
+    finished_at_s = metrics["cohort/rollout_finished_at_s"]
+    if started_at_s < 0 or finished_at_s < started_at_s:
+        raise ValueError(
+            "rollout interval must satisfy 0 <= cohort/rollout_started_at_s <= "
+            "cohort/rollout_finished_at_s"
+        )
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -718,8 +1023,8 @@ class ReplayBuffer(ReplayBufferImpl):
 class TQReplayBuffer:
     """Meta cache + TQ writer with reserve-then-commit slot semantics.
 
-    meta_list, weight_list, ready_list, _group_ids are parallel; a slot stays
-    ready=False until commit fills it.
+    meta_list, weight lists, rollout_metrics_list, ready_list, and _group_ids are
+    parallel; a slot stays ready=False until commit fills it.
     """
 
     def __init__(
@@ -730,18 +1035,30 @@ class TQReplayBuffer:
         pad_value_dict: Mapping[str, int],
         require_routed_experts: bool = False,
         include_shared_prefix_metadata: bool = False,
+        include_reward_processing_metadata: bool = False,
+        include_message_advantage_metadata: bool = False,
+        rollout_reward_semantics_fingerprint: str,
     ):
         """Create the replay buffer and configure its opt-in payload schema."""
+        _validate_rollout_reward_semantics_fingerprint(
+            rollout_reward_semantics_fingerprint
+        )
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
         self._require_routed_experts = require_routed_experts
         self._include_shared_prefix_metadata = include_shared_prefix_metadata
+        self._include_reward_processing_metadata = include_reward_processing_metadata
+        self._include_message_advantage_metadata = include_message_advantage_metadata
+        self._rollout_reward_semantics_fingerprint = (
+            rollout_reward_semantics_fingerprint
+        )
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
         # Per-slot target training step (set when force_in_order=True, else None).
         self.target_step_list: list[Optional[int]] = []
+        self.rollout_metrics_list: list[Optional[RolloutScalarMetrics]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
 
@@ -768,6 +1085,7 @@ class TQReplayBuffer:
         self.start_weight_list.append(weight_version)
         self.end_weight_list.append(-1)
         self.target_step_list.append(target_step)
+        self.rollout_metrics_list.append(None)
         self.ready_list.append(False)
         self._group_ids.append(group_id)
         return group_id
@@ -802,6 +1120,13 @@ class TQReplayBuffer:
                 f"commit called with unknown group_id={group_id!r}; "
                 f"reserve() must precede commit() (or the slot was already removed)"
             )
+        scalar_rollout_metrics = _scalar_rollout_metrics(record.rollout_metrics)
+        _validate_rollout_metric_receipt(scalar_rollout_metrics)
+        record_kwargs: dict[str, bool] = {}
+        if self._include_reward_processing_metadata:
+            record_kwargs["include_reward_processing_metadata"] = True
+        if self._include_message_advantage_metadata:
+            record_kwargs["include_message_advantage_metadata"] = True
         shared_prefix_kwargs = (
             {"include_shared_prefix_metadata": True}
             if self._include_shared_prefix_metadata
@@ -813,6 +1138,7 @@ class TQReplayBuffer:
         train_batch = record_to_train_batch(
             record,
             pad_value_dict=self._pad_value_dict,
+            **record_kwargs,
             **shared_prefix_kwargs,
         )
         sample_ids, fields, tags = pack_payload(
@@ -820,6 +1146,10 @@ class TQReplayBuffer:
             weight_version=start_weight_version,
             group_id=group_id,
             **shared_prefix_kwargs,
+        )
+        _validate_rollout_metric_receipt(
+            scalar_rollout_metrics,
+            expected_samples=len(sample_ids),
         )
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
@@ -852,6 +1182,7 @@ class TQReplayBuffer:
             idx = self._group_ids.index(group_id)
             self.meta_list[idx] = meta
             self.end_weight_list[idx] = end_weight_version
+            self.rollout_metrics_list[idx] = scalar_rollout_metrics
             self.ready_list[idx] = True
             return meta
         except BaseException as commit_error:
@@ -920,6 +1251,7 @@ class TQReplayBuffer:
             del self.start_weight_list[i]
             del self.end_weight_list[i]
             del self.target_step_list[i]
+            del self.rollout_metrics_list[i]
             del self.ready_list[i]
             del self._group_ids[i]
 
@@ -931,6 +1263,42 @@ class TQReplayBuffer:
             )
 
         return len(drop_idxs)
+
+    async def remove_selected(
+        self, idxs: list[int]
+    ) -> tuple[int, list[RolloutScalarMetrics]]:
+        """Remove ready groups locally and return their scalar rollout metrics.
+
+        This is the sampler consumption path. Eviction and failed reservations use
+        :meth:`remove` directly and therefore cannot leak their metrics into a later
+        optimizer step.
+        """
+        if not idxs:
+            return 0, []
+        if len(set(idxs)) != len(idxs):
+            raise ValueError(
+                f"TQReplayBuffer.remove_selected indices must be unique: {idxs}"
+            )
+        selected_metrics: list[RolloutScalarMetrics] = []
+        for idx in idxs:
+            if idx < 0 or idx >= len(self.meta_list):
+                raise IndexError(
+                    f"TQReplayBuffer.remove_selected index out of range: {idx}; "
+                    f"size={len(self.meta_list)}"
+                )
+            if not self.ready_list[idx] or self.meta_list[idx] is None:
+                raise RuntimeError(
+                    f"TQReplayBuffer.remove_selected requires ready group at index {idx}"
+                )
+            metrics = self.rollout_metrics_list[idx]
+            if metrics is None:
+                raise RuntimeError(
+                    f"ready replay group at index {idx} has no rollout metrics"
+                )
+            selected_metrics.append(dict(metrics))
+
+        removed = await self.remove(idxs, remove_in_dp=False)
+        return removed, selected_metrics
 
     async def state_dict(self, *, saved_capacity: int) -> dict[str, Any]:
         """Serialize ready groups (meta + DataPlane payloads) for checkpointing.
@@ -949,15 +1317,27 @@ class TQReplayBuffer:
 
         Returns:
             Envelope: ``{"partition_id": ..., "saved_capacity": ...,
-            "groups": [{"meta", "start_weight", "end_weight", "target_step",
-            "group_id", "fields_data"}, ...]}``.
+            "rollout_reward_semantics_fingerprint": ..., "groups":
+            [{"meta", "start_weight", "end_weight", "target_step", "group_id",
+            "rollout_metrics", "fields_data"}, ...]}``.
         """
-        snapshot: list[tuple[KVBatchMeta, int, int, Optional[int], str]] = []
+        snapshot: list[
+            tuple[
+                KVBatchMeta,
+                int,
+                int,
+                Optional[int],
+                str,
+                RolloutScalarMetrics,
+            ]
+        ] = []
         for i, ready in enumerate(self.ready_list):
             if not ready:
                 continue
             meta = self.meta_list[i]
             assert meta is not None  # commit sets meta before ready=True
+            rollout_metrics = self.rollout_metrics_list[i]
+            assert rollout_metrics is not None  # commit sets metrics before ready=True
             snapshot.append(
                 (
                     meta,
@@ -965,16 +1345,30 @@ class TQReplayBuffer:
                     self.end_weight_list[i],
                     self.target_step_list[i],
                     self._group_ids[i],
+                    dict(rollout_metrics),
                 )
             )
 
         groups: list[dict[str, Any]] = []
-        for meta, start_weight, end_weight, target_step, group_id in snapshot:
+        for (
+            meta,
+            start_weight,
+            end_weight,
+            target_step,
+            group_id,
+            rollout_metrics,
+        ) in snapshot:
+            _validate_checkpoint_meta_fields(meta=meta, group_id=group_id)
             fields_data = await self._call_dp(
                 "get_samples",
                 sample_ids=meta.sample_ids,
                 partition_id=self._partition_id,
                 select_fields=meta.fields,
+            )
+            _validate_checkpoint_group_fields(
+                meta=meta,
+                fields_data=fields_data,
+                group_id=group_id,
             )
             groups.append(
                 {
@@ -983,12 +1377,16 @@ class TQReplayBuffer:
                     "end_weight": end_weight,
                     "target_step": target_step,
                     "group_id": group_id,
+                    "rollout_metrics": rollout_metrics,
                     "fields_data": fields_data,
                 }
             )
         return {
             "partition_id": self._partition_id,
             "saved_capacity": saved_capacity,
+            "rollout_reward_semantics_fingerprint": (
+                self._rollout_reward_semantics_fingerprint
+            ),
             "groups": groups,
         }
 
@@ -1033,7 +1431,12 @@ class TQReplayBuffer:
                 mismatch, misaligned or wrongly sized groups, duplicate
                 sample_ids), or if target-stamped groups exceed ``max_groups``.
         """
-        required_keys = {"partition_id", "saved_capacity", "groups"}
+        required_keys = {
+            "partition_id",
+            "saved_capacity",
+            "rollout_reward_semantics_fingerprint",
+            "groups",
+        }
         missing_keys = required_keys - set(state)
         if missing_keys:
             raise ValueError(
@@ -1045,6 +1448,19 @@ class TQReplayBuffer:
                 f"checkpoint={state['partition_id']!r}, "
                 f"expected={expected_partition_id!r}"
             )
+        checkpoint_fingerprint = state["rollout_reward_semantics_fingerprint"]
+        _validate_rollout_reward_semantics_fingerprint(checkpoint_fingerprint)
+        if checkpoint_fingerprint != self._rollout_reward_semantics_fingerprint:
+            raise ValueError(
+                "Replay buffer checkpoint rollout reward-semantics fingerprint "
+                "mismatch: "
+                f"checkpoint={checkpoint_fingerprint!r}, "
+                f"expected={self._rollout_reward_semantics_fingerprint!r}. "
+                "Resume with the same rollout path, effort, reward-penalty, "
+                "environment-mask, thinking-tag, and message-advantage "
+                "configuration, or delete replay_buffer.pt to start with an "
+                "empty buffer."
+            )
 
         groups = list(state["groups"])
         group_keys = {
@@ -1053,6 +1469,7 @@ class TQReplayBuffer:
             "end_weight",
             "target_step",
             "group_id",
+            "rollout_metrics",
             "fields_data",
         }
         seen_sample_ids: set[str] = set()
@@ -1066,7 +1483,21 @@ class TQReplayBuffer:
                 raise ValueError(
                     f"Replay buffer checkpoint group missing keys: {missing_group_keys}"
                 )
+            restored_rollout_metrics = _scalar_rollout_metrics(group["rollout_metrics"])
+            try:
+                _validate_rollout_metric_receipt(restored_rollout_metrics)
+            except ValueError as error:
+                raise ValueError(
+                    "Replay buffer checkpoint has no complete rollout metric "
+                    "receipt. It predates exact SingleController rollout logging; "
+                    "start with an empty replay buffer instead."
+                ) from error
             meta = group["meta"]
+            _validate_checkpoint_group_fields(
+                meta=meta,
+                fields_data=group["fields_data"],
+                group_id=group["group_id"],
+            )
             num_tags = len(meta.tags) if meta.tags is not None else -1
             num_lengths = (
                 len(meta.sequence_lengths) if meta.sequence_lengths is not None else -1
@@ -1080,6 +1511,10 @@ class TQReplayBuffer:
                     f"sequence_lengths={num_lengths}, "
                     f"expected_group_size={expected_group_size}"
                 )
+            _validate_rollout_metric_receipt(
+                restored_rollout_metrics,
+                expected_samples=len(meta.sample_ids),
+            )
             present_shared_prefix_fields = shared_prefix_fields.intersection(
                 meta.fields or ()
             )
@@ -1094,6 +1529,40 @@ class TQReplayBuffer:
                     "Resume with the same policy.shared_prefix_training.mode or "
                     "delete replay_buffer.pt to start with an empty buffer."
                 )
+            reward_processing_fields = {
+                ROLLOUT_TRUNCATED,
+                RESPONSE_TOKEN_LENGTHS,
+            }
+            message_advantage_fields = {
+                INVALID_TOOL_CALL_TOKEN_MASK,
+                MALFORMED_THINKING_TOKEN_MASK,
+                GENERATED_ASSISTANT_MESSAGE_COUNT,
+                INVALID_TOOL_CALL_MESSAGE_COUNT,
+                MALFORMED_THINKING_MESSAGE_COUNT,
+                INVALID_AND_MALFORMED_MESSAGE_COUNT,
+            }
+            for schema_name, schema_fields, enabled in (
+                (
+                    "reward-processing",
+                    reward_processing_fields,
+                    self._include_reward_processing_metadata,
+                ),
+                (
+                    "message-advantage",
+                    message_advantage_fields,
+                    self._include_message_advantage_metadata,
+                ),
+            ):
+                present_fields = schema_fields.intersection(meta.fields or ())
+                expected_fields = schema_fields if enabled else set()
+                if present_fields != expected_fields:
+                    raise ValueError(
+                        f"Replay buffer checkpoint {schema_name} schema mismatch: "
+                        f"checkpoint_fields={sorted(present_fields)}, "
+                        f"expected_fields={sorted(expected_fields)}. Resume with "
+                        "the same reward-processing configuration or delete "
+                        "replay_buffer.pt to start with an empty buffer."
+                    )
             for sid in meta.sample_ids:
                 if sid in seen_sample_ids:
                     raise ValueError(
@@ -1142,6 +1611,9 @@ class TQReplayBuffer:
             self.start_weight_list.append(group["start_weight"])
             self.end_weight_list.append(group["end_weight"])
             self.target_step_list.append(group["target_step"])
+            self.rollout_metrics_list.append(
+                _scalar_rollout_metrics(group["rollout_metrics"])
+            )
             self.ready_list.append(True)
             self._group_ids.append(group["group_id"])
 

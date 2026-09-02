@@ -53,7 +53,10 @@ from typing import (
 
 from pydantic import BaseModel, Field, NonNegativeInt
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    RolloutScalarMetrics,
+    TQReplayBuffer,
+)
 from nemo_rl.data_plane import KVBatchMeta
 
 # Poll interval for the rollout-pump admission gate.
@@ -87,8 +90,8 @@ class PromptGroupSampler(Protocol):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
-        """Pick up to ``max_prompt_groups`` eligible groups; drop them locally."""
+    ) -> tuple[Optional[KVBatchMeta], int, list[RolloutScalarMetrics]]:
+        """Pick eligible groups and return meta, count, and scalar metric receipts."""
         ...
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -163,7 +166,7 @@ class BaseSampler(abc.ABC):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]: ...
+    ) -> tuple[Optional[KVBatchMeta], int, list[RolloutScalarMetrics]]: ...
 
     async def evict(self, *, current_train_weight: int) -> int:
         """Default: drop *ready* groups below the weight window.
@@ -219,22 +222,29 @@ class BaseSampler(abc.ABC):
         valid_idxs: list[int],
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> tuple[Optional[KVBatchMeta], int, list[RolloutScalarMetrics]]:
         """Cap, drop from the buffer, and concat the chosen groups.
 
         Greedy without waiting: returns all currently-eligible groups up to
         ``max_prompt_groups`` (never fewer on purpose, never waits to fill it),
-        or ``(None, 0)`` below ``min_prompt_groups``.
+        or ``(None, 0, [])`` below ``min_prompt_groups``.
         """
         if len(valid_idxs) < min_prompt_groups:
-            return None, 0
+            return None, 0, []
         requested_groups = min(len(valid_idxs), max_prompt_groups)
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
-        await self._buffer.remove(selected_idxs, remove_in_dp=False)
+        removed, rollout_metrics = await self._buffer.remove_selected(selected_idxs)
+        if removed != len(selected_idxs) or len(rollout_metrics) != len(selected_idxs):
+            raise RuntimeError(
+                "replay buffer selection receipt does not match selected groups: "
+                f"selected={len(selected_idxs)}, removed={removed}, "
+                f"metrics={len(rollout_metrics)}"
+            )
         return (
             selected_metas[0].concat(*selected_metas[1:]),  # type: ignore
             len(selected_idxs),
+            rollout_metrics,
         )
 
 
@@ -288,7 +298,7 @@ class WindowedSampler(BaseSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> tuple[Optional[KVBatchMeta], int, list[RolloutScalarMetrics]]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         valid_idxs = [
@@ -377,7 +387,7 @@ class ReadyFirstSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> tuple[Optional[KVBatchMeta], int, list[RolloutScalarMetrics]]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         valid_idxs = [
             i
@@ -410,7 +420,7 @@ class WeightFifoSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> tuple[Optional[KVBatchMeta], int, list[RolloutScalarMetrics]]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         in_window = [
@@ -419,7 +429,7 @@ class WeightFifoSampler(_GatedSampler):
             if min_valid_version <= weight <= current_train_weight
         ]
         if not in_window:
-            return None, 0
+            return None, 0, []
         target_version = min(in_window)
         valid_idxs = [
             i
@@ -454,7 +464,7 @@ class InOrderSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[Optional[KVBatchMeta], int]:
+    ) -> tuple[Optional[KVBatchMeta], int, list[RolloutScalarMetrics]]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         valid_idxs = [
             i

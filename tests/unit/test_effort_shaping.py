@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pytest
+from pydantic import ValidationError
 
 from nemo_rl.experience.rollouts import EffortLevelsConfig, _apply_effort_shaping
 
@@ -54,6 +55,25 @@ def test_effort_levels_config_defaults():
     assert cfg.low_penalty == 1.0
     assert cfg.low_ub == 64000
     assert cfg.low_string == ""
+
+
+@pytest.mark.parametrize(
+    ("override", "field"),
+    [
+        ({"low_weigth": 1.0}, "low_weigth"),
+        ({"low_weight": -0.1}, "low_weight"),
+        ({"low_weight": float("nan")}, "low_weight"),
+        ({"low_weight": float("inf")}, "low_weight"),
+        ({"low_penalty": -0.1}, "low_penalty"),
+        ({"low_penalty": float("nan")}, "low_penalty"),
+        ({"low_ub": 0}, "low_ub"),
+        ({"low_ub": -1}, "low_ub"),
+        ({"low_ub": "100"}, "low_ub"),
+    ],
+)
+def test_effort_levels_config_rejects_invalid_or_unknown_values(override, field):
+    with pytest.raises(ValidationError, match=field):
+        EffortLevelsConfig(**override)
 
 
 # ---------------------------------------------------------------------------

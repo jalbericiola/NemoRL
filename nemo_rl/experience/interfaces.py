@@ -25,6 +25,17 @@ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 
+# Slim DataPlane columns used to preserve message-level Gym detector semantics
+# without shipping the full Python message log through TransferQueue.
+INVALID_TOOL_CALL_TOKEN_MASK = "invalid_tool_call_token_mask"
+MALFORMED_THINKING_TOKEN_MASK = "malformed_thinking_token_mask"
+GENERATED_ASSISTANT_MESSAGE_COUNT = "generated_assistant_message_count"
+INVALID_TOOL_CALL_MESSAGE_COUNT = "invalid_tool_call_message_count"
+MALFORMED_THINKING_MESSAGE_COUNT = "malformed_thinking_message_count"
+INVALID_AND_MALFORMED_MESSAGE_COUNT = "invalid_and_malformed_message_count"
+ROLLOUT_TRUNCATED = "truncated"
+RESPONSE_TOKEN_LENGTHS = "response_token_lengths"
+
 
 @dataclass
 class Completion:
@@ -34,6 +45,9 @@ class Completion:
     env_extras: Optional[dict[str, Any]]
     truncated: bool
     reward: float
+    # Resolved, provenance-preserving Gym loss gate. Native environments leave
+    # this false; payload consumers must never infer it from arbitrary env_extras.
+    env_masked: bool = False
 
 
 @dataclass

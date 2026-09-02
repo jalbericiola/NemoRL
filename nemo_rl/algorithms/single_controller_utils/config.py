@@ -34,7 +34,11 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     SamplerConfig,
     required_buffer_capacity_for_config,
 )
-from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    GRPOLoggerConfig,
+    RewardPenaltyConfig,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -550,6 +554,7 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
 
 
 def validate_sampler_buffer_capacity(
@@ -750,6 +755,20 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     )
     validate_gym_actor_concurrency(master_config)
 
+    if master_config.grpo.use_dynamic_sampling:
+        raise ValueError(
+            "SingleController does not support grpo.use_dynamic_sampling=true; "
+            "its streaming sampler does not implement the synchronous DAPO "
+            "nonzero-variance cohort cache. Disable dynamic sampling or use the "
+            "synchronous GRPO path."
+        )
+    if master_config.grpo.adv_estimator.name == "gdpo":
+        raise ValueError(
+            "SingleController does not support the GDPO multi-reward estimator; "
+            "RolloutManager does not retain reward/* component columns. Use GRPO/"
+            "Reinforce++ or the synchronous path."
+        )
+
     if isinstance(async_config.sampler, ReadyFirstSamplerConfig):
         if not master_config.loss_fn.use_importance_sampling_correction:
             raise ValueError(
@@ -815,6 +834,30 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     env_config = getattr(master_config, "env", None)
     if env_config is not None:
         use_nemo_gym = bool(env_config.get("should_use_nemo_gym"))
+        if not use_nemo_gym and any(
+            getattr(master_config.reward_penalties, flag)
+            for flag in (
+                "penalize_duplicated_reasoning",
+                "penalize_empty_final_answer",
+                "penalize_unwanted_tokens",
+                "penalize_malformed_think_tag",
+            )
+        ):
+            raise ValueError(
+                "reward_penalties require the NeMo-Gym path "
+                "(env.should_use_nemo_gym=true); the SingleController native "
+                "rollout path cannot apply them."
+            )
+        if not use_nemo_gym and (
+            master_config.grpo.invalid_tool_call_advantage is not None
+            or master_config.grpo.malformed_thinking_advantage is not None
+        ):
+            raise ValueError(
+                "grpo.invalid_tool_call_advantage / "
+                "grpo.malformed_thinking_advantage require the NeMo-Gym path "
+                "(env.should_use_nemo_gym=true); the SingleController native "
+                "rollout path cannot produce their detector masks."
+            )
         unused_name = "native" if use_nemo_gym else "nemo_gym"
         unused_block = getattr(async_config.rollout_failure, unused_name)
         unused_defaults = type(unused_block)()

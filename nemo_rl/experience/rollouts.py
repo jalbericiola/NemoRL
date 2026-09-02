@@ -27,7 +27,7 @@ from typing import Any, Optional
 
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
@@ -367,7 +367,7 @@ def backfill_missing_routed_experts(
             )
 
 
-class EffortLevelsConfig(BaseModel, extra="allow"):
+class EffortLevelsConfig(BaseModel):
     """Controls length-based reward shaping for low-effort prompts.
 
     When a prompt contains ``low_string``, the final reward is adjusted by a
@@ -383,13 +383,15 @@ class EffortLevelsConfig(BaseModel, extra="allow"):
     shaping entirely.
     """
 
-    low_weight: float = 0.0
+    model_config = ConfigDict(extra="forbid")
+
+    low_weight: float = Field(default=0.0, ge=0.0, allow_inf_nan=False, strict=True)
     """Weight applied to the length-reward term.  Set to 0 to disable."""
-    low_penalty: float = 1.0
+    low_penalty: float = Field(default=1.0, ge=0.0, allow_inf_nan=False, strict=True)
     """Coefficient for the negative length-reward penalty."""
-    low_ub: int = 64000
+    low_ub: int = Field(default=64000, gt=0, strict=True)
     """Response-length upper bound (in tokens) used to normalise the term."""
-    low_string: str = ""
+    low_string: str = Field(default="", strict=True)
     """Substring that must appear in the user prompt to trigger shaping."""
 
 
@@ -1167,7 +1169,9 @@ async def async_generate_response_for_sample_turn(
 
     # Extract results for the single sample
     updated_message_log = updated_batch["message_log"][0]
-    generated_tokens = generated_ids[0] if generated_ids else torch.empty(0)
+    generated_tokens = (
+        generated_ids[0] if generated_ids else torch.empty(0, dtype=torch.long)
+    )
 
     return updated_message_log, generated_tokens, input_lengths, gen_metrics
 
@@ -1697,12 +1701,21 @@ async def run_async_multi_turn_rollout_groups(
         )
 
 
-def _tensorize_by_key(message_logs: list, key: str):
-    if not message_logs or key not in message_logs[0]:
-        return
-
+def _tensorize_by_key(message_logs: list, key: str) -> None:
+    """Tensorize a sparse message field with its wire-contract dtype."""
+    dtype = {
+        "token_ids": torch.long,
+        "generation_logprobs": torch.float32,
+    }.get(key)
     for m in message_logs:
-        m[key] = torch.tensor(m[key])
+        if key not in m:
+            continue
+        value = m[key]
+        if isinstance(value, torch.Tensor):
+            if dtype is not None and value.dtype != dtype:
+                m[key] = value.to(dtype=dtype)
+            continue
+        m[key] = torch.tensor(value, dtype=dtype)
 
 
 @dataclass
@@ -1835,19 +1848,19 @@ def should_mask_flagged_samples(env_config: dict[str, Any]) -> bool:
 
 
 def _get_reward_penalty_config_value(
-    reward_penalty_config: dict[str, Any] | BaseModel | None,
+    reward_penalty_config: Mapping[str, Any] | BaseModel | None,
     key: str,
 ) -> Any:
     if reward_penalty_config is None:
         return None
-    if isinstance(reward_penalty_config, dict):
+    if isinstance(reward_penalty_config, Mapping):
         return reward_penalty_config.get(key)
 
     return getattr(reward_penalty_config, key, None)
 
 
 def _get_reward_penalty_token_id(
-    reward_penalty_config: dict[str, Any] | BaseModel,
+    reward_penalty_config: Mapping[str, Any] | BaseModel,
     key: str,
 ) -> int | None:
     token_ids = _get_reward_penalty_config_value(reward_penalty_config, "token_ids")
@@ -1858,7 +1871,7 @@ def _get_reward_penalty_token_id(
 
 
 def _get_required_reward_penalty_token_id(
-    reward_penalty_config: dict[str, Any] | BaseModel,
+    reward_penalty_config: Mapping[str, Any] | BaseModel,
     key: str,
 ) -> int:
     value = _get_reward_penalty_token_id(reward_penalty_config, key)
@@ -1868,7 +1881,7 @@ def _get_required_reward_penalty_token_id(
 
 
 def _get_reward_penalty_token_ids(
-    reward_penalty_config: dict[str, Any] | BaseModel,
+    reward_penalty_config: Mapping[str, Any] | BaseModel,
     key: str,
 ) -> list[int] | None:
     token_ids = _get_reward_penalty_config_value(reward_penalty_config, "token_ids")
@@ -1881,7 +1894,7 @@ def _get_reward_penalty_token_ids(
 
 
 def _get_required_reward_penalty_token_ids(
-    reward_penalty_config: dict[str, Any] | BaseModel,
+    reward_penalty_config: Mapping[str, Any] | BaseModel,
     key: str,
 ) -> list[int]:
     values = _get_reward_penalty_token_ids(reward_penalty_config, key)
@@ -1898,7 +1911,7 @@ def _infer_single_token_id(tokenizer: Any, text: str) -> int | None:
 
 
 def resolve_reward_penalty_config(
-    reward_penalty_config: dict[str, Any] | BaseModel | None,
+    reward_penalty_config: Mapping[str, Any] | BaseModel | None,
     tokenizer: Any,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any] | None:
@@ -1974,7 +1987,7 @@ def resolve_reward_penalty_config(
 
 
 def apply_reward_penalties(
-    results: list[dict], reward_penalty_config: dict[str, Any] | BaseModel | None
+    results: list[dict], reward_penalty_config: Mapping[str, Any] | BaseModel | None
 ) -> dict[str, int]:
     """Apply reward penalties to results, setting reward to 0.0 when triggered.
 

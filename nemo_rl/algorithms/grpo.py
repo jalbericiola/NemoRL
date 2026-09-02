@@ -215,6 +215,14 @@ class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
     think_close: int | None = None
 
 
+_REWARD_PENALTY_FLAGS = (
+    "penalize_duplicated_reasoning",
+    "penalize_empty_final_answer",
+    "penalize_unwanted_tokens",
+    "penalize_malformed_think_tag",
+)
+
+
 class RewardPenaltyConfig(BaseModel, extra="allow"):
     """Reward-zeroing penalties applied to NeMo-Gym rollout results."""
 
@@ -228,7 +236,18 @@ class RewardPenaltyConfig(BaseModel, extra="allow"):
     token_ids: Optional[RewardPenaltyTokenIdsConfig] = None
 
     @model_validator(mode="after")
-    def _require_unwanted_token_ids_when_penalized(self) -> "RewardPenaltyConfig":
+    def _validate_reward_penalty_config(self) -> "RewardPenaltyConfig":
+        unknown_enabled_flags = sorted(
+            key
+            for key, value in (self.__pydantic_extra__ or {}).items()
+            if key.startswith("penalize_") and bool(value)
+        )
+        if unknown_enabled_flags:
+            raise ValueError(
+                "unsupported enabled reward penalty flag(s): "
+                f"{unknown_enabled_flags}. Supported flags are "
+                f"{sorted(_REWARD_PENALTY_FLAGS)}"
+            )
         if self.penalize_unwanted_tokens and (
             self.token_ids is None or not self.token_ids.unwanted
         ):
@@ -237,14 +256,6 @@ class RewardPenaltyConfig(BaseModel, extra="allow"):
                 "reward_penalties.penalize_unwanted_tokens is true"
             )
         return self
-
-
-_REWARD_PENALTY_FLAGS = (
-    "penalize_duplicated_reasoning",
-    "penalize_empty_final_answer",
-    "penalize_unwanted_tokens",
-    "penalize_malformed_think_tag",
-)
 
 
 class GRPOConfig(BaseModel, extra="allow"):

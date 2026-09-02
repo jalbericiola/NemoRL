@@ -26,7 +26,10 @@ import ray
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    TQReplayBuffer,
+    build_rollout_reward_semantics_fingerprint,
+)
 from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -61,6 +64,15 @@ _REGISTERED_FIELDS = [
     "total_reward",
     "prompt_ids_for_adv",
 ]
+_TEST_ROLLOUT_REWARD_SEMANTICS_FINGERPRINT = build_rollout_reward_semantics_fingerprint(
+    use_nemo_gym=False,
+    effort_config=None,
+    reward_penalty_config={},
+    mask_env_flagged_samples=True,
+    thinking_tags=["<think>", "</think>"],
+    invalid_tool_call_advantage=None,
+    malformed_thinking_advantage=None,
+)
 
 
 def _simple_tq_cfg() -> dict:
@@ -133,6 +145,27 @@ def _prepopulate_buffer(
     buffer.start_weight_list.append(int(weight_version))
     buffer.end_weight_list.append(int(weight_version))
     buffer.target_step_list.append(None)
+    num_samples = len(meta.sample_ids)
+    buffer.rollout_metrics_list.append(
+        {
+            "cohort/samples": num_samples,
+            "cohort/generated_tokens": 0,
+            "cohort/total_tokens": sum(meta.sequence_lengths or []),
+            "cohort/pre_penalty_reward_sum": 0.0,
+            "cohort/raw_environment_reward_sum": 0.0,
+            "cohort/effort_low_sample_count": 0,
+            "cohort/effort_reward_delta_sum": 0.0,
+            "cohort/env_masked_sample_count": 0,
+            "cohort/post_penalty_reward_sum": 0.0,
+            "cohort/duplicated_reasoning_count": 0,
+            "cohort/empty_final_answer_count": 0,
+            "cohort/unwanted_token_count": 0,
+            "cohort/malformed_think_tag_count": 0,
+            "cohort/rollout_started_at_s": 10.0,
+            "cohort/rollout_finished_at_s": 10.0,
+            "timing/rollout/total": 0.0,
+        }
+    )
     buffer.ready_list.append(True)
     # Group id follows pack_payload's "{group_uuid}_g{i}" convention.
     group_id = meta.sample_ids[0].rpartition("_g")[0]
@@ -275,6 +308,9 @@ def test_train_pump_drives_mcore_training_step(
             dp_client,
             partition_id=_PARTITION_ID,
             pad_value_dict={"input_ids": int(tokenizer.pad_token_id or 0)},
+            rollout_reward_semantics_fingerprint=(
+                _TEST_ROLLOUT_REWARD_SEMANTICS_FINGERPRINT
+            ),
         )
         for step in range(train_steps):
             for g in range(num_prompts):

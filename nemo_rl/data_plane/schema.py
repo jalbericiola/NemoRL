@@ -18,6 +18,14 @@ from typing import Literal, Sequence
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_PROMPT_LENGTHS,
 )
+from nemo_rl.experience.interfaces import (
+    GENERATED_ASSISTANT_MESSAGE_COUNT,
+    INVALID_AND_MALFORMED_MESSAGE_COUNT,
+    INVALID_TOOL_CALL_MESSAGE_COUNT,
+    MALFORMED_THINKING_MESSAGE_COUNT,
+    RESPONSE_TOKEN_LENGTHS,
+    ROLLOUT_TRUNCATED,
+)
 
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
 Layout = Literal["padded", "jagged"]
@@ -84,6 +92,12 @@ PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
         SHARED_PREFIX_PROMPT_LENGTHS,
         "total_reward",
         SAMPLE_MASK,
+        ROLLOUT_TRUNCATED,
+        RESPONSE_TOKEN_LENGTHS,
+        GENERATED_ASSISTANT_MESSAGE_COUNT,
+        INVALID_TOOL_CALL_MESSAGE_COUNT,
+        MALFORMED_THINKING_MESSAGE_COUNT,
+        INVALID_AND_MALFORMED_MESSAGE_COUNT,
     }
 )
 

@@ -51,10 +51,14 @@ from tensordict import NonTensorData, NonTensorStack, TensorDict
 from nemo_rl.algorithms.async_utils.staleness_sampler import create_sampler
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
+    _clip_grpo_advantages,
     _write_latest_checkpoint_status,
+    aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
+    scale_rewards,
 )
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.shared_prefix_metrics import (
     SharedPrefixOpportunity,
     combine_shared_prefix_opportunities,
@@ -85,6 +89,16 @@ from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.interfaces import (
+    GENERATED_ASSISTANT_MESSAGE_COUNT,
+    INVALID_AND_MALFORMED_MESSAGE_COUNT,
+    INVALID_TOOL_CALL_MESSAGE_COUNT,
+    INVALID_TOOL_CALL_TOKEN_MASK,
+    MALFORMED_THINKING_MESSAGE_COUNT,
+    MALFORMED_THINKING_TOKEN_MASK,
+    RESPONSE_TOKEN_LENGTHS,
+    ROLLOUT_TRUNCATED,
+)
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -99,6 +113,91 @@ Generation = Union[VllmGeneration, SGLangGeneration]
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
 log = logging.getLogger(__name__)
+
+
+_MESSAGE_COUNT_DTYPES = frozenset(
+    {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }
+)
+
+
+def _validated_message_token_mask(
+    value: torch.Tensor,
+    *,
+    field_name: str,
+    expected_shape: torch.Size,
+    response_token_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Validate a producer-supplied message detector mask without coercion."""
+    if value.dtype != torch.bool:
+        raise RuntimeError(
+            f"message-level advantage token mask {field_name!r} must have "
+            f"dtype torch.bool, got {value.dtype}"
+        )
+    if value.shape != expected_shape:
+        raise RuntimeError(
+            f"message-level advantage token mask {field_name!r} shape does not "
+            f"match advantages: {tuple(value.shape)} != {tuple(expected_shape)}"
+        )
+    outside_response = value & ~response_token_mask.bool()
+    if outside_response.any():
+        rows = torch.nonzero(outside_response.any(dim=1), as_tuple=False).flatten()
+        raise RuntimeError(
+            f"message-level advantage token mask {field_name!r} contains tokens "
+            f"outside the generated response token_mask in rows {rows.tolist()}"
+        )
+    return value
+
+
+def _validated_message_counts(
+    value: torch.Tensor,
+    *,
+    field_name: str,
+    batch_size: int,
+) -> torch.Tensor:
+    """Return a one-dimensional int64 count vector after fail-closed checks."""
+    if value.dtype not in _MESSAGE_COUNT_DTYPES:
+        raise RuntimeError(
+            f"message-level advantage count {field_name!r} must have an integral, "
+            f"non-bool dtype, got {value.dtype}"
+        )
+    counts = squeeze_trailing_unit_dim(value)
+    if counts.dim() != 1 or counts.shape[0] != batch_size:
+        raise RuntimeError(
+            f"message-level advantage count {field_name!r} must have shape "
+            f"({batch_size},) or ({batch_size}, 1), got {tuple(value.shape)}"
+        )
+    if (counts < 0).any():
+        rows = torch.nonzero(counts < 0, as_tuple=False).flatten()
+        raise RuntimeError(
+            f"message-level advantage count {field_name!r} must be nonnegative; "
+            f"negative values found in rows {rows.tolist()}"
+        )
+    return counts.to(dtype=torch.int64)
+
+
+def _validate_count_mask_presence(
+    *,
+    counts: torch.Tensor,
+    token_mask: torch.Tensor,
+    receipt_name: str,
+) -> None:
+    """Require each row's detector count and token mask to agree on presence."""
+    mask_present = token_mask.any(dim=1)
+    count_present = counts > 0
+    mismatch = mask_present != count_present
+    if mismatch.any():
+        rows = torch.nonzero(mismatch, as_tuple=False).flatten()
+        raise RuntimeError(
+            f"message-level advantage {receipt_name} count/mask presence mismatch "
+            f"in rows {rows.tolist()}; zero count requires an empty mask and a "
+            "non-empty mask requires a positive count"
+        )
 
 
 def _resolve_train_dispatch_group_multiple(
@@ -165,6 +264,77 @@ def _train_selection_group_bounds(
     return exact_groups, exact_groups
 
 
+def _unpack_sampler_selection(
+    selection: object,
+) -> tuple[Optional[KVBatchMeta], int, list[dict[str, float | int]]]:
+    """Fail closed when a custom sampler returns an inconsistent selection.
+
+    Exact selected-cohort reward and timing metrics are carried alongside each
+    replay group.  Silently accepting the former ``(meta, count)`` return shape
+    would train successfully while dropping the only receipt that makes OFF/ON
+    runtime comparisons auditable.  The empty selection is exactly
+    ``(None, 0, [])``; every non-empty selection must carry metadata, a positive
+    group count, and one receipt per selected group.  Checking that relationship
+    here is important because the train pump branches on ``meta is None``.
+    """
+    if not isinstance(selection, tuple) or len(selection) != 3:
+        shape = (
+            len(selection) if isinstance(selection, tuple) else type(selection).__name__
+        )
+        raise RuntimeError(
+            "PromptGroupSampler.select() must return exactly "
+            "(meta, num_groups, rollout_metric_receipts); "
+            f"received {shape!r}. The legacy two-value sampler contract is "
+            "unsupported because it drops exact selected-cohort reward and "
+            "timing provenance."
+        )
+
+    train_meta, num_groups, rollout_metrics = selection
+    if not isinstance(num_groups, int) or isinstance(num_groups, bool):
+        raise RuntimeError(
+            "PromptGroupSampler.select() returned a non-integer num_groups: "
+            f"{type(num_groups).__name__}."
+        )
+    if not isinstance(rollout_metrics, list):
+        raise RuntimeError(
+            "PromptGroupSampler.select() must return rollout_metric_receipts "
+            f"as a list, got {type(rollout_metrics).__name__}."
+        )
+
+    if train_meta is None:
+        if num_groups != 0 or rollout_metrics:
+            raise RuntimeError(
+                "PromptGroupSampler.select() returned no metadata but claimed "
+                f"num_groups={num_groups} and {len(rollout_metrics)} rollout "
+                "metric receipt(s); an empty selection must be exactly "
+                "(None, 0, [])."
+            )
+        return None, 0, []
+
+    if not isinstance(train_meta, KVBatchMeta):
+        raise RuntimeError(
+            "PromptGroupSampler.select() returned non-KVBatchMeta metadata: "
+            f"{type(train_meta).__name__}."
+        )
+    if num_groups <= 0:
+        raise RuntimeError(
+            "PromptGroupSampler.select() returned metadata with non-positive "
+            f"num_groups={num_groups}."
+        )
+    if train_meta.size < num_groups:
+        raise RuntimeError(
+            "PromptGroupSampler.select() returned fewer samples than selected "
+            f"prompt groups: samples={train_meta.size}, groups={num_groups}."
+        )
+    if len(rollout_metrics) != num_groups:
+        raise RuntimeError(
+            "PromptGroupSampler.select() must return exactly one rollout metric "
+            f"receipt per selected prompt group: groups={num_groups}, "
+            f"receipts={len(rollout_metrics)}."
+        )
+    return train_meta, num_groups, rollout_metrics
+
+
 def _validate_train_dispatch_buffer_capacity(
     *,
     num_prompts_per_step: int,
@@ -219,6 +389,271 @@ def _reduce_shared_prefix_step_metrics(
     return metrics
 
 
+_ROLLOUT_COHORT_SUM_KEYS = (
+    "cohort/samples",
+    "cohort/generated_tokens",
+    "cohort/total_tokens",
+    "cohort/raw_environment_reward_sum",
+    "cohort/pre_penalty_reward_sum",
+    "cohort/effort_low_sample_count",
+    "cohort/effort_reward_delta_sum",
+    "cohort/env_masked_sample_count",
+    "cohort/post_penalty_reward_sum",
+    "cohort/duplicated_reasoning_count",
+    "cohort/empty_final_answer_count",
+    "cohort/unwanted_token_count",
+    "cohort/malformed_think_tag_count",
+)
+_ROLLOUT_PENALTY_RATE_KEYS = {
+    "cohort/duplicated_reasoning_count": "reasoning_equal_to_final_answer_rate",
+    "cohort/empty_final_answer_count": "empty_final_answer_rate",
+    "cohort/unwanted_token_count": "unwanted_token_rate",
+    "cohort/malformed_think_tag_count": "malformed_think_tag_rate",
+}
+_ROLLOUT_INTERVAL_KEYS = (
+    "cohort/rollout_started_at_s",
+    "cohort/rollout_finished_at_s",
+)
+_NONCOMPOSABLE_ROLLOUT_METRIC_SUFFIXES = (
+    "/median",
+    "/stddev",
+    "/p95",
+    "/p99",
+)
+_CONDITIONAL_ROLLOUT_MEAN_KEYS = (
+    "mean_length_reward_low",
+    "mean_reward_low",
+    "mean_length_low",
+    "mean_length_high",
+)
+
+
+def _interval_union_seconds(intervals: list[tuple[float, float]]) -> float:
+    """Return wall seconds covered by at least one rollout interval."""
+    if not intervals:
+        return 0.0
+    ordered = sorted(intervals)
+    current_start, current_end = ordered[0]
+    if (
+        not math.isfinite(current_start)
+        or not math.isfinite(current_end)
+        or current_start < 0
+        or current_end < current_start
+    ):
+        raise RuntimeError(f"invalid rollout interval {(current_start, current_end)}")
+    total = 0.0
+    for start, end in ordered[1:]:
+        if (
+            not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0
+            or end < start
+        ):
+            raise RuntimeError(f"invalid rollout interval {(start, end)}")
+        if start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            total += current_end - current_start
+            current_start, current_end = start, end
+    return total + current_end - current_start
+
+
+def _reduce_rollout_step_metrics(
+    per_group_metrics: list[dict[str, int | float]],
+) -> tuple[dict[str, Any], dict[str, float]]:
+    """Reduce the exact selected rollout cohort into train and timing metrics."""
+    if not per_group_metrics:
+        return {}, {}
+
+    required_keys = set(_ROLLOUT_COHORT_SUM_KEYS) | set(_ROLLOUT_INTERVAL_KEYS)
+    missing_by_group = [
+        sorted(required_keys - set(metrics)) for metrics in per_group_metrics
+    ]
+    if any(missing_by_group):
+        raise RuntimeError(
+            "selected rollout group is missing exact cohort metrics: "
+            f"{missing_by_group}"
+        )
+
+    totals = {
+        key: sum(float(metrics[key]) for metrics in per_group_metrics)
+        for key in _ROLLOUT_COHORT_SUM_KEYS
+    }
+    samples = totals["cohort/samples"]
+    if samples <= 0 or not samples.is_integer():
+        raise RuntimeError(
+            f"selected rollout cohort has invalid sample count {samples}"
+        )
+    for key in (
+        "cohort/generated_tokens",
+        "cohort/total_tokens",
+        "cohort/effort_low_sample_count",
+        "cohort/env_masked_sample_count",
+        *_ROLLOUT_PENALTY_RATE_KEYS,
+    ):
+        if not totals[key].is_integer() or totals[key] < 0:
+            raise RuntimeError(
+                f"selected rollout cohort metric {key!r} must be a nonnegative "
+                f"integer, got {totals[key]}"
+            )
+
+    group_sample_counts: list[int] = []
+    for group_idx, metrics in enumerate(per_group_metrics):
+        group_samples = float(metrics["cohort/samples"])
+        if group_samples <= 0 or not group_samples.is_integer():
+            raise RuntimeError(
+                "selected rollout group has invalid sample count: "
+                f"group={group_idx}, samples={group_samples}"
+            )
+        group_sample_counts.append(int(group_samples))
+
+    # Only metrics present in every selected group can describe the selected
+    # optimizer-step cohort.  Group medians, standard deviations, and
+    # percentiles cannot be composed from their summaries, so omit them instead
+    # of publishing a mathematically false average.  Min/max remain composable;
+    # means and rates are recomputed with exact group sample weights below.
+    common_metric_keys = set.intersection(
+        *(
+            {
+                key
+                for key in metrics
+                if not key.startswith("cohort/") and not key.startswith("timing/")
+            }
+            for metrics in per_group_metrics
+        )
+    )
+    composable_metric_keys = {
+        key
+        for key in common_metric_keys
+        if key not in _CONDITIONAL_ROLLOUT_MEAN_KEYS
+        and not key.startswith("median_")
+        and not key.endswith(_NONCOMPOSABLE_ROLLOUT_METRIC_SUFFIXES)
+    }
+    per_metric = {
+        key: [metrics[key] for metrics in per_group_metrics]
+        for key in composable_metric_keys
+    }
+    step_metrics = aggregate_rollout_metrics(per_metric) if per_metric else {}
+    for key in composable_metric_keys:
+        if key.endswith("/mean") or key.endswith("_rate") or key.startswith("mean_"):
+            step_metrics[key] = (
+                sum(
+                    float(metrics[key]) * group_samples
+                    for metrics, group_samples in zip(
+                        per_group_metrics, group_sample_counts
+                    )
+                )
+                / samples
+            )
+
+    low_sample_counts = [
+        int(metrics["cohort/effort_low_sample_count"]) for metrics in per_group_metrics
+    ]
+    conditional_weights = {
+        "mean_length_reward_low": low_sample_counts,
+        "mean_reward_low": low_sample_counts,
+        "mean_length_low": low_sample_counts,
+        "mean_length_high": [
+            group_samples - low_samples
+            for group_samples, low_samples in zip(
+                group_sample_counts, low_sample_counts
+            )
+        ],
+    }
+    for key, weights in conditional_weights.items():
+        denominator = sum(weights)
+        if denominator == 0:
+            continue
+        if any(
+            weight > 0 and key not in metrics
+            for metrics, weight in zip(per_group_metrics, weights)
+        ):
+            # The receipt lacks the sufficient statistic for an exact result.
+            # Omission is safer than treating an unobserved conditional mean as
+            # zero or averaging the subset of groups that happened to emit it.
+            continue
+        step_metrics[key] = (
+            sum(
+                float(metrics[key]) * weight
+                for metrics, weight in zip(per_group_metrics, weights)
+                if weight > 0
+            )
+            / denominator
+        )
+
+    step_metrics.update(
+        {
+            "rollout/samples": int(samples),
+            "rollout/generated_tokens": int(totals["cohort/generated_tokens"]),
+            "rollout/total_tokens": int(totals["cohort/total_tokens"]),
+            "raw_environment_reward": (
+                totals["cohort/raw_environment_reward_sum"] / samples
+            ),
+            "pre_penalty_environment_reward": (
+                totals["cohort/pre_penalty_reward_sum"] / samples
+            ),
+            "effort_low_sample_rate": (
+                totals["cohort/effort_low_sample_count"] / samples
+            ),
+            "effort_low_sample_count": int(totals["cohort/effort_low_sample_count"]),
+            "effort_reward_delta": (totals["cohort/effort_reward_delta_sum"] / samples),
+            "num_mask_sample_filtered": int(totals["cohort/env_masked_sample_count"]),
+            "mask_sample_rate": (totals["cohort/env_masked_sample_count"] / samples),
+            "verifier_reward": totals["cohort/post_penalty_reward_sum"] / samples,
+            "total_reward/mean": (totals["cohort/post_penalty_reward_sum"] / samples),
+        }
+    )
+    observed_effort_delta = (
+        totals["cohort/pre_penalty_reward_sum"]
+        - totals["cohort/raw_environment_reward_sum"]
+    )
+    if not math.isclose(
+        observed_effort_delta,
+        totals["cohort/effort_reward_delta_sum"],
+        rel_tol=1e-7,
+        abs_tol=1e-7,
+    ):
+        raise RuntimeError(
+            "selected rollout cohort effort delta does not match its raw/pre "
+            "reward boundaries"
+        )
+    for count_key, rate_key in _ROLLOUT_PENALTY_RATE_KEYS.items():
+        if totals[count_key] > samples:
+            raise RuntimeError(
+                f"selected rollout penalty count {count_key!r} exceeds samples: "
+                f"{totals[count_key]} > {samples}"
+            )
+        step_metrics[rate_key] = totals[count_key] / samples
+
+    rollout_work_times = [
+        float(metrics["timing/rollout/total"])
+        for metrics in per_group_metrics
+        if "timing/rollout/total" in metrics
+    ]
+    if len(rollout_work_times) != len(per_group_metrics):
+        raise RuntimeError(
+            "selected rollout group is missing timing/rollout/total; cannot "
+            "compute rollout_generation_cohort"
+        )
+    if any(not math.isfinite(value) or value < 0 for value in rollout_work_times):
+        raise RuntimeError("selected rollout group has invalid timing/rollout/total")
+    rollout_intervals = [
+        (
+            float(metrics["cohort/rollout_started_at_s"]),
+            float(metrics["cohort/rollout_finished_at_s"]),
+        )
+        for metrics in per_group_metrics
+    ]
+    rollout_cohort_elapsed = max(end for _, end in rollout_intervals) - min(
+        start for start, _ in rollout_intervals
+    )
+    return step_metrics, {
+        "rollout_generation_cohort": rollout_cohort_elapsed,
+        "rollout_generation_active": _interval_union_seconds(rollout_intervals),
+        "rollout_generation_work": sum(rollout_work_times),
+    }
+
+
 def _string_object_field(data: TensorDict, field_name: str) -> list[str]:
     """Decode a TQ object column and require one non-empty string per row."""
     value: Any = None
@@ -230,7 +665,18 @@ def _string_object_field(data: TensorDict, field_name: str) -> list[str]:
     if isinstance(value, NonTensorStack):
         items = value.tolist()
     elif isinstance(value, NonTensorData):
-        items = [value.data]
+        wrapped = value.data
+        # TensorDict versions differ in how they preserve an object column:
+        # some expose one NonTensorData per row via NonTensorStack, while
+        # others wrap the complete numpy/list column in a single
+        # NonTensorData.  Treat both representations as the same batch rather
+        # than passing the wrapped container to the scalar wire decoder.
+        if isinstance(wrapped, np.ndarray) and wrapped.dtype == object:
+            items = wrapped.tolist()
+        elif isinstance(wrapped, (list, tuple)):
+            items = list(wrapped)
+        else:
+            items = [wrapped]
     elif isinstance(value, np.ndarray) and value.dtype == object:
         items = value.tolist()
     else:
@@ -386,6 +832,17 @@ class SingleControllerActor:
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
 
+        # Checkpoint cutoff handshake.  The admission gate is checked before the
+        # dataloader advances (and before a pooled-reserve step is removed), while
+        # the idle event is set only when no prompt batch is between that read and
+        # dispatch.  Checkpointing closes this gate, waits for the active admission
+        # and every already-dispatched rollout to settle, then snapshots loader,
+        # reserve, and TQ state as one restart boundary.
+        self._rollout_admission_permitted: asyncio.Event = asyncio.Event()
+        self._rollout_admission_permitted.set()
+        self._rollout_admission_idle: asyncio.Event = asyncio.Event()
+        self._rollout_admission_idle.set()
+
         # Set only after _rollout_pump exhausts its configured epochs and all
         # dispatched tasks finish successfully. Rollout failures propagate
         # through run() instead of being reported as normal exhaustion.
@@ -442,6 +899,7 @@ class SingleControllerActor:
             "masked_advantages": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
+            "message_level_penalty_metrics": [],
         }
         self._step_shared_prefix_opportunities: list[SharedPrefixOpportunity] = []
 
@@ -766,35 +1224,54 @@ class SingleControllerActor:
         max_epochs = self._master_config.grpo.max_num_epochs
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
-                for prompt_batch in self._dataloader:
-                    if self._divert_batch_to_reserve(prompt_batch):
-                        continue
+                # The checkpoint gate has to be checked before ``next``.  A
+                # ``for`` loop advances the stateful dataloader before entering
+                # its body, leaving a consumed batch only on this coroutine's
+                # stack if a checkpoint cut happened at the first await below.
+                dataloader_iter = iter(self._dataloader)
+                while True:
+                    await self._rollout_admission_permitted.wait()
+                    # No await between the gate check and this transition: a
+                    # checkpoint either observes idle and owns the cutoff, or
+                    # waits for this whole batch to reach dispatched tasks.
+                    self._rollout_admission_idle.clear()
+                    try:
+                        try:
+                            prompt_batch = next(dataloader_iter)
+                        except StopIteration:
+                            # Keep the epoch counter inside the admission
+                            # transaction so it agrees with loader position.
+                            self._current_epoch += 1
+                            break
 
-                    target_step = await self._sampler.admit(
-                        trainer_version_fn=lambda: self._trainer_version
-                    )
-                    if target_step is not None:
-                        self._sampler_stamps_target_steps = True
+                        if self._divert_batch_to_reserve(prompt_batch):
+                            continue
 
-                    num_prompts = prompt_batch.size
-                    if target_step is not None:
-                        buffered = self._buffer.count_for_target_step(target_step)
-                        if buffered:
-                            num_prompts = max(0, prompt_batch.size - buffered)
-                            print(
-                                f"  target_step={target_step}: {buffered} group(s) "
-                                f"already buffered; dispatching {num_prompts} of "
-                                f"{prompt_batch.size} prompt(s), dropping the rest",
-                                flush=True,
-                            )
+                        target_step = await self._sampler.admit(
+                            trainer_version_fn=lambda: self._trainer_version
+                        )
+                        if target_step is not None:
+                            self._sampler_stamps_target_steps = True
 
-                    for prompt_idx in range(num_prompts):
-                        prompt: DatumSpec = {  # type: ignore
-                            k: v[prompt_idx] for k, v in prompt_batch.items()
-                        }
-                        await _launch(prompt, target_step)
+                        num_prompts = prompt_batch.size
+                        if target_step is not None:
+                            buffered = self._buffer.count_for_target_step(target_step)
+                            if buffered:
+                                num_prompts = max(0, prompt_batch.size - buffered)
+                                print(
+                                    f"  target_step={target_step}: {buffered} group(s) "
+                                    f"already buffered; dispatching {num_prompts} of "
+                                    f"{prompt_batch.size} prompt(s), dropping the rest",
+                                    flush=True,
+                                )
 
-                self._current_epoch += 1
+                        for prompt_idx in range(num_prompts):
+                            prompt: DatumSpec = {  # type: ignore
+                                k: v[prompt_idx] for k, v in prompt_batch.items()
+                            }
+                            await _launch(prompt, target_step)
+                    finally:
+                        self._rollout_admission_idle.set()
 
         # Only now that every dispatched rollout has settled is the pool genuinely
         # spare. Draining it inside the group above would race them for it, and a
@@ -879,22 +1356,28 @@ class SingleControllerActor:
         """
         num_prompts_per_step = self._master_config.grpo.num_prompts_per_step
         while len(self._replacement_reserve) >= num_prompts_per_step:
-            # Take the step's prompts out before the first await. A drop resolving
-            # concurrently draws from this same pool, and could otherwise claim one of
-            # them and leave the step it is filling one group short.
-            step_prompts = [
-                self._replacement_reserve.popleft() for _ in range(num_prompts_per_step)
-            ]
-            target_step = await self._sampler.admit(
-                trainer_version_fn=lambda: self._trainer_version
-            )
-            print(
-                f"  dataloader exhausted; training on {len(step_prompts)} pooled "
-                f"spare(s) as target_step={target_step}",
-                flush=True,
-            )
-            for prompt in step_prompts:
-                await launch(prompt, target_step)
+            await self._rollout_admission_permitted.wait()
+            self._rollout_admission_idle.clear()
+            try:
+                # Take the step's prompts out before the first await. A drop resolving
+                # concurrently draws from this same pool, and could otherwise claim one
+                # of them and leave the step it is filling one group short.
+                step_prompts = [
+                    self._replacement_reserve.popleft()
+                    for _ in range(num_prompts_per_step)
+                ]
+                target_step = await self._sampler.admit(
+                    trainer_version_fn=lambda: self._trainer_version
+                )
+                print(
+                    f"  dataloader exhausted; training on {len(step_prompts)} pooled "
+                    f"spare(s) as target_step={target_step}",
+                    flush=True,
+                )
+                for prompt in step_prompts:
+                    await launch(prompt, target_step)
+            finally:
+                self._rollout_admission_idle.set()
 
         if self._replacement_reserve:
             print(
@@ -1027,9 +1510,10 @@ class SingleControllerActor:
 
         Per step:
           1. sampler.evict drops stale groups from the buffer and clears their TQ rows.
-          2. sampler.select returns K prompt groups (or None) and drops them from the
-             buffer; DP rows survive so the trainer can read them. Already trainable —
-             buffer wrote training-shaped rows at rollout time.
+          2. sampler.select returns K prompt groups plus their scalar rollout-metric
+             receipts (or None) and drops them from the buffer; DP rows survive so the
+             trainer can read them. Already trainable — buffer wrote training-shaped
+             rows at rollout time.
           3. _advantage_stage(train_meta).
           4. trainer.train_microbatches_from_meta + finish_train_step.
           5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
@@ -1045,6 +1529,7 @@ class SingleControllerActor:
             step_open = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
+            selected_rollout_metrics: list[dict[str, int | float]] = []
 
             with self._timer.time("total_step_time"):
                 # Re-read on every iteration rather than once: a prompt stamped for this
@@ -1092,10 +1577,16 @@ class SingleControllerActor:
                                 group_multiple=self._train_dispatch_group_multiple,
                             )
                         )
-                        train_meta, num_groups = await self._sampler.select(
-                            current_train_weight=self._trainer_version,
-                            min_prompt_groups=min_prompt_groups,
-                            max_prompt_groups=max_prompt_groups,
+                        (
+                            train_meta,
+                            num_groups,
+                            chunk_rollout_metrics,
+                        ) = _unpack_sampler_selection(
+                            await self._sampler.select(
+                                current_train_weight=self._trainer_version,
+                                min_prompt_groups=min_prompt_groups,
+                                max_prompt_groups=max_prompt_groups,
+                            )
                         )
 
                         if (
@@ -1133,6 +1624,15 @@ class SingleControllerActor:
                                 )
                             await asyncio.sleep(0.005)
                             continue
+
+                        if len(chunk_rollout_metrics) != num_groups:
+                            raise RuntimeError(
+                                "sampler selected replay groups without an exact "
+                                "rollout metric receipt: "
+                                f"groups={num_groups}, "
+                                f"metrics={len(chunk_rollout_metrics)}"
+                            )
+                        selected_rollout_metrics.extend(chunk_rollout_metrics)
 
                         # Release buffer capacity
                         for _ in range(num_groups):
@@ -1276,6 +1776,14 @@ class SingleControllerActor:
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
+                rollout_step_metrics, rollout_timing_metrics = (
+                    _reduce_rollout_step_metrics(selected_rollout_metrics)
+                )
+                step_metrics.update(rollout_step_metrics)
+                if "reward" in step_metrics and "verifier_reward" in step_metrics:
+                    step_metrics["reward_processing_delta"] = (
+                        step_metrics["reward"] - step_metrics["verifier_reward"]
+                    )
                 if self._step_shared_prefix_opportunities:
                     step_metrics.update(
                         _reduce_shared_prefix_step_metrics(
@@ -1382,6 +1890,7 @@ class SingleControllerActor:
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
             )  # type: ignore
+            timing_metrics.update(rollout_timing_metrics)
 
             total_time = timing_metrics.get("total_step_time", 0.0)
             total_num_gpus = int(ray.cluster_resources().get("GPU", 0))
@@ -1720,33 +2229,68 @@ class SingleControllerActor:
         )
         return len(stale_tasks)
 
+    async def _checkpoint_rollout_runtime_state(
+        self,
+    ) -> tuple[int, dict[str, Any], list[DatumSpec], dict[str, Any]]:
+        """Take one restart-consistent loader/reserve/TQ cutoff.
+
+        New dataloader and reserve-step admissions are paused first.  A batch
+        that already advanced the loader is allowed to finish dispatching, then
+        every dispatched rollout is drained to a committed or removed terminal
+        state.  At that point no consumed prompt exists only on a coroutine's
+        stack or in an unready TQ slot, so the epoch, dataloader position,
+        replacement reserve, and ready TQ groups describe the same boundary.
+
+        The generation pause used by weight sync is intentionally not reused:
+        replacement attempts wait on ``_rollout_permitted`` and draining them
+        while that event is clear would deadlock the checkpoint.
+        """
+        self._rollout_admission_permitted.clear()
+        try:
+            await self._rollout_admission_idle.wait()
+
+            inflight = list(self._dispatched_rollouts)
+            if inflight:
+                results = await asyncio.gather(*inflight, return_exceptions=True)
+                failures = [
+                    result for result in results if isinstance(result, BaseException)
+                ]
+                if failures:
+                    raise BaseExceptionGroup(
+                        "rollout failed while establishing checkpoint cutoff",
+                        failures,
+                    )
+
+            # These synchronous reads and TQ state_dict's synchronous snapshot
+            # prelude run without an event-loop interleave.  With admission
+            # closed and no dispatched tasks left, later DataPlane fetch awaits
+            # cannot change the captured membership.
+            current_epoch = self._current_epoch
+            dataloader_state = self._dataloader.state_dict()
+            reserve_state = list(self._replacement_reserve)
+            buffer_state = await self._buffer.state_dict(
+                saved_capacity=self._async_cfg.max_buffered_rollouts
+            )
+            return current_epoch, dataloader_state, reserve_state, buffer_state
+        finally:
+            self._rollout_admission_permitted.set()
+
     async def _save_checkpoint(self, step_metrics: dict[str, Any]) -> None:
         """Write a full checkpoint for the just-finished train step.
 
         Everything except the (possibly async) policy weight write must be
-        on disk before begin_finalization; rollouts keep running throughout.
+        on disk before begin_finalization.  Rollouts continue while the prior
+        save finalizes and while policy files are written, but new admissions
+        pause at the explicit runtime-state cutoff below.
         """
         save_state = self._save_state
         save_state.current_step = self._train_steps
         save_state.total_steps = self._train_steps
-        save_state.current_epoch = self._current_epoch
         save_state.consumed_samples = self._consumed_samples
         save_state.total_valid_tokens = self._total_valid_tokens
         # The restore skips the replay buffer when the resuming run uses a
         # different sampler (its stamps may never be selectable there).
         save_state.sampler_name = self._async_cfg.sampler.name
-        # Snapshot before any await so it can't interleave with
-        # _rollout_pump iterating this same dataloader.
-        dataloader_state = self._dataloader.state_dict()
-        # The spare pool has to be saved with that snapshot, not left out of the
-        # checkpoint: diverting a batch already advanced the iterator, so the state
-        # above records those prompts as consumed while they are still only in memory.
-        # Without this a resumed replace-mode run comes back with an empty pool and a
-        # dataloader positioned past the diverted batch, silently losing it -- and
-        # losing it for good, since _drain_reserve_into_steps only ever recovers spares
-        # held by the process that diverted them. Snapshotted here, in the same
-        # await-free window, so the pair cannot disagree.
-        reserve_state = list(self._replacement_reserve)
         # SC has no validation loop yet; drop the default sentinel instead of
         # persisting a bogus val_reward.
         if hasattr(save_state, "val_reward"):
@@ -1764,6 +2308,14 @@ class SingleControllerActor:
         # Flush the previous checkpoint's background finalization first;
         # re-raises a failure from it.
         await asyncio.to_thread(self._checkpointer.finalize_pending)
+
+        (
+            current_epoch,
+            dataloader_state,
+            reserve_state,
+            buffer_state,
+        ) = await self._checkpoint_rollout_runtime_state()
+        save_state.current_epoch = current_epoch
 
         print(f"Saving checkpoint for step {self._train_steps}...")
         checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
@@ -1794,9 +2346,6 @@ class SingleControllerActor:
                 reserve_state,
                 os.path.join(checkpoint_path, "replacement_reserve.pt"),
             )
-        buffer_state = await self._buffer.state_dict(
-            saved_capacity=self._async_cfg.max_buffered_rollouts
-        )
         await asyncio.to_thread(
             torch.save,
             buffer_state,
@@ -1914,10 +2463,40 @@ class SingleControllerActor:
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
+        grpo_cfg = self._master_config.grpo
 
-        seq_logprob_error_threshold = (
-            self._master_config.grpo.seq_logprob_error_threshold
-        )
+        repeated_batch = BatchedDataDict({"total_reward": rewards})
+        for field_name in adv_cfg.repeated_batch_fields:
+            repeated_batch[field_name] = squeeze_trailing_unit_dim(
+                tensor_field(data, field_name)
+            )
+        reward_scaling_cfg = getattr(grpo_cfg, "reward_scaling", None)
+        if reward_scaling_cfg is not None:
+            repeated_batch = scale_rewards(repeated_batch, reward_scaling_cfg)
+        reward_shaping_cfg = getattr(grpo_cfg, "reward_shaping", None)
+        if reward_shaping_cfg is not None and reward_shaping_cfg.enabled:
+            repeated_batch[ROLLOUT_TRUNCATED] = squeeze_trailing_unit_dim(
+                tensor_field(data, ROLLOUT_TRUNCATED)
+            ).bool()
+            repeated_batch[RESPONSE_TOKEN_LENGTHS] = squeeze_trailing_unit_dim(
+                tensor_field(data, RESPONSE_TOKEN_LENGTHS)
+            ).long()
+            repeated_batch = apply_reward_shaping(
+                repeated_batch,
+                reward_shaping_cfg,
+            )
+        rewards = repeated_batch["total_reward"].float()
+
+        sample_mask_modified = False
+        if getattr(grpo_cfg, "overlong_filtering", False):
+            truncated = squeeze_trailing_unit_dim(
+                tensor_field(data, ROLLOUT_TRUNCATED)
+            ).bool()
+            sample_mask = sample_mask.clone()
+            sample_mask[truncated] = 0
+            sample_mask_modified = True
+
+        seq_logprob_error_threshold = grpo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
         # report sequence-level generation/training mismatch. A threshold adds
         # masking; leaving it unset keeps this metrics-only.
@@ -1958,16 +2537,11 @@ class SingleControllerActor:
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
+            sample_mask_modified = sample_mask_modified or (
+                seq_logprob_error_threshold is not None
+            )
 
         mask = token_mask * sample_mask.unsqueeze(-1)
-
-        repeated_batch: dict[str, torch.Tensor] = {
-            "total_reward": rewards,
-        }
-        for field_name in adv_cfg.repeated_batch_fields:
-            repeated_batch[field_name] = squeeze_trailing_unit_dim(
-                tensor_field(data, field_name)
-            )
 
         kwargs: dict[str, torch.Tensor] = {}
         if self._policy_logprobs_required:
@@ -2012,14 +2586,148 @@ class SingleControllerActor:
             )
         else:
             advantages = torch.zeros_like(mask)
-        response_advantages = torch.masked_select(advantages, mask.bool())
+
+        # Preserve the legacy/synchronous dashboard boundary: advantage summary
+        # metrics observe the estimator output before message-level overrides and
+        # clipping.  Use token_mask (rather than the combined loss mask) so samples
+        # intentionally excluded from loss remain visible in behavior diagnostics.
+        response_advantages = torch.masked_select(advantages, token_mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["masked_advantages"].append(
             response_advantages.detach().cpu()
         )
 
+        invalid_advantage = getattr(grpo_cfg, "invalid_tool_call_advantage", None)
+        malformed_advantage = getattr(grpo_cfg, "malformed_thinking_advantage", None)
+        if invalid_advantage is not None or malformed_advantage is not None:
+            invalid_token_mask = _validated_message_token_mask(
+                tensor_field(data, INVALID_TOOL_CALL_TOKEN_MASK),
+                field_name=INVALID_TOOL_CALL_TOKEN_MASK,
+                expected_shape=advantages.shape,
+                response_token_mask=token_mask,
+            )
+            malformed_token_mask = _validated_message_token_mask(
+                tensor_field(data, MALFORMED_THINKING_TOKEN_MASK),
+                field_name=MALFORMED_THINKING_TOKEN_MASK,
+                expected_shape=advantages.shape,
+                response_token_mask=token_mask,
+            )
+            batch_size = advantages.shape[0]
+            assistant_counts = _validated_message_counts(
+                tensor_field(data, GENERATED_ASSISTANT_MESSAGE_COUNT),
+                field_name=GENERATED_ASSISTANT_MESSAGE_COUNT,
+                batch_size=batch_size,
+            )
+            raw_invalid_counts = _validated_message_counts(
+                tensor_field(data, INVALID_TOOL_CALL_MESSAGE_COUNT),
+                field_name=INVALID_TOOL_CALL_MESSAGE_COUNT,
+                batch_size=batch_size,
+            )
+            raw_malformed_counts = _validated_message_counts(
+                tensor_field(data, MALFORMED_THINKING_MESSAGE_COUNT),
+                field_name=MALFORMED_THINKING_MESSAGE_COUNT,
+                batch_size=batch_size,
+            )
+            overlap_counts = _validated_message_counts(
+                tensor_field(data, INVALID_AND_MALFORMED_MESSAGE_COUNT),
+                field_name=INVALID_AND_MALFORMED_MESSAGE_COUNT,
+                batch_size=batch_size,
+            )
+
+            valid_count_relationships = (
+                (overlap_counts <= raw_invalid_counts)
+                & (overlap_counts <= raw_malformed_counts)
+                & (raw_invalid_counts <= assistant_counts)
+                & (raw_malformed_counts <= assistant_counts)
+                & (
+                    raw_invalid_counts + raw_malformed_counts - overlap_counts
+                    <= assistant_counts
+                )
+            )
+            if not valid_count_relationships.all():
+                rows = torch.nonzero(
+                    ~valid_count_relationships, as_tuple=False
+                ).flatten()
+                raise RuntimeError(
+                    "invalid per-row message-level advantage penalty receipt in "
+                    f"rows {rows.tolist()}: assistant={assistant_counts.tolist()}, "
+                    f"invalid={raw_invalid_counts.tolist()}, "
+                    f"malformed={raw_malformed_counts.tolist()}, "
+                    f"overlap={overlap_counts.tolist()}"
+                )
+
+            _validate_count_mask_presence(
+                counts=assistant_counts,
+                token_mask=token_mask.bool(),
+                receipt_name="generated assistant",
+            )
+            _validate_count_mask_presence(
+                counts=raw_invalid_counts,
+                token_mask=invalid_token_mask,
+                receipt_name="raw invalid-tool-call",
+            )
+            _validate_count_mask_presence(
+                counts=raw_malformed_counts,
+                token_mask=malformed_token_mask,
+                receipt_name="raw malformed-thinking",
+            )
+            overlap_token_mask = invalid_token_mask & malformed_token_mask
+            _validate_count_mask_presence(
+                counts=overlap_counts,
+                token_mask=overlap_token_mask,
+                receipt_name="invalid/malformed overlap",
+            )
+
+            assistant_messages = int(assistant_counts.sum().item())
+            raw_invalid_messages = int(raw_invalid_counts.sum().item())
+            raw_malformed_messages = int(raw_malformed_counts.sum().item())
+            overlap_messages = int(overlap_counts.sum().item())
+            invalid_messages = (
+                raw_invalid_messages if invalid_advantage is not None else 0
+            )
+            malformed_messages = (
+                raw_malformed_messages
+                - (overlap_messages if invalid_advantage is not None else 0)
+                if malformed_advantage is not None
+                else 0
+            )
+
+            if invalid_advantage is not None and invalid_token_mask.any():
+                advantages = advantages.clone()
+                advantages[invalid_token_mask] = float(invalid_advantage)
+            if malformed_advantage is not None:
+                effective_malformed_mask = malformed_token_mask
+                if invalid_advantage is not None:
+                    effective_malformed_mask = (
+                        effective_malformed_mask & ~invalid_token_mask
+                    )
+                    _validate_count_mask_presence(
+                        counts=raw_malformed_counts - overlap_counts,
+                        token_mask=effective_malformed_mask,
+                        receipt_name="post-precedence malformed-thinking",
+                    )
+                if effective_malformed_mask.any():
+                    advantages = advantages.clone()
+                    advantages[effective_malformed_mask] = float(malformed_advantage)
+            self._step_log_dict.setdefault("message_level_penalty_metrics", []).append(
+                {
+                    "num_invalid_tool_calls": invalid_messages,
+                    "num_malformed_thinking": malformed_messages,
+                    "num_assistant_messages": assistant_messages,
+                    "num_raw_invalid_tool_calls": raw_invalid_messages,
+                    "num_raw_malformed_thinking": raw_malformed_messages,
+                    "num_invalid_and_malformed_messages": overlap_messages,
+                }
+            )
+
+        if (
+            getattr(grpo_cfg, "advantage_clip_low", None) is not None
+            or getattr(grpo_cfg, "advantage_clip_high", None) is not None
+        ):
+            advantages = _clip_grpo_advantages(advantages, grpo_cfg)
+
         fields_to_put = {adv_cfg.output_field: advantages}
-        if seq_logprob_error_threshold is not None:
+        if sample_mask_modified:
             fields_to_put[adv_cfg.sample_mask_field] = sample_mask
 
         await self._call_dp(
@@ -2044,6 +2752,28 @@ class SingleControllerActor:
             adv_cfg.sample_mask_field,
             *adv_cfg.repeated_batch_fields,
         ]
+        grpo_cfg = self._master_config.grpo
+        reward_shaping_cfg = getattr(grpo_cfg, "reward_shaping", None)
+        if getattr(grpo_cfg, "overlong_filtering", False) or (
+            reward_shaping_cfg is not None and reward_shaping_cfg.enabled
+        ):
+            fields.append(ROLLOUT_TRUNCATED)
+        if reward_shaping_cfg is not None and reward_shaping_cfg.enabled:
+            fields.append(RESPONSE_TOKEN_LENGTHS)
+        if (
+            getattr(grpo_cfg, "invalid_tool_call_advantage", None) is not None
+            or getattr(grpo_cfg, "malformed_thinking_advantage", None) is not None
+        ):
+            fields.extend(
+                [
+                    INVALID_TOOL_CALL_TOKEN_MASK,
+                    MALFORMED_THINKING_TOKEN_MASK,
+                    GENERATED_ASSISTANT_MESSAGE_COUNT,
+                    INVALID_TOOL_CALL_MESSAGE_COUNT,
+                    MALFORMED_THINKING_MESSAGE_COUNT,
+                    INVALID_AND_MALFORMED_MESSAGE_COUNT,
+                ]
+            )
         if self._shared_prefix_training_config.mode != "disabled":
             fields.extend(
                 [

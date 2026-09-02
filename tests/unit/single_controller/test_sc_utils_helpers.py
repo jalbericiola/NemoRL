@@ -160,6 +160,43 @@ class TestReduceAdvantagePumpMetrics:
     def test_all_empty_inputs_returns_empty_dict(self) -> None:
         assert reduce_advantage_pump_metrics([], [], []) == {}
 
+    def test_message_level_penalty_metrics_reduce_exact_chunk_counts(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            rewards=[],
+            masked_advantages=[],
+            sequence_lengths=[],
+            message_level_penalty_metrics=[
+                {
+                    "num_invalid_tool_calls": 1,
+                    "num_malformed_thinking": 0,
+                    "num_assistant_messages": 3,
+                    "num_raw_invalid_tool_calls": 1,
+                    "num_raw_malformed_thinking": 1,
+                    "num_invalid_and_malformed_messages": 1,
+                },
+                {
+                    "num_invalid_tool_calls": 0,
+                    "num_malformed_thinking": 2,
+                    "num_assistant_messages": 5,
+                    "num_raw_invalid_tool_calls": 0,
+                    "num_raw_malformed_thinking": 2,
+                    "num_invalid_and_malformed_messages": 0,
+                },
+            ],
+        )
+
+        assert out["num_invalid_tool_calls"] == 1
+        assert out["num_malformed_thinking"] == 2
+        assert out["num_assistant_messages"] == 8
+        assert out["invalid_tool_call_rate"] == pytest.approx(1 / 8)
+        assert out["malformed_thinking_rate"] == pytest.approx(2 / 8)
+        assert out["num_raw_invalid_tool_calls"] == 1
+        assert out["num_raw_malformed_thinking"] == 3
+        assert out["num_invalid_and_malformed_messages"] == 1
+        assert out["raw_invalid_tool_call_rate"] == pytest.approx(1 / 8)
+        assert out["raw_malformed_thinking_rate"] == pytest.approx(3 / 8)
+        assert out["invalid_and_malformed_rate"] == pytest.approx(1 / 8)
+
     def test_seq_logprob_error_metrics_are_reduced_across_streaming_chunks(
         self,
     ) -> None:

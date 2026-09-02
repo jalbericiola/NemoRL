@@ -1944,10 +1944,9 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     monkeypatch.setattr(
         rollouts_mod,
         "collect_multimodal_payload_metrics",
-        lambda payload, boundary, enabled: payload_calls.append(
-            (payload, boundary, enabled)
-        )
-        or {},
+        lambda payload, boundary, enabled: (
+            payload_calls.append((payload, boundary, enabled)) or {}
+        ),
     )
     monkeypatch.setattr(
         rollouts_mod, "print_multimodal_payload_metrics", lambda metrics: None
@@ -2139,6 +2138,41 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
     assert actual is expected
 
 
+def test_tensorize_by_key_handles_sparse_multiturn_fields_idempotently() -> None:
+    messages = [
+        {"role": "assistant", "token_ids": torch.tensor([1])},
+        {"role": "user", "token_ids": [2]},
+        {
+            "role": "assistant",
+            "token_ids": [3],
+            "generation_logprobs": [0.5],
+        },
+    ]
+
+    rollouts_mod._tensorize_by_key(messages, "generation_logprobs")
+    rollouts_mod._tensorize_by_key(messages, "generation_logprobs")
+
+    assert "generation_logprobs" not in messages[0]
+    assert "generation_logprobs" not in messages[1]
+    torch.testing.assert_close(messages[2]["generation_logprobs"], torch.tensor([0.5]))
+
+
+def test_tensorize_by_key_assigns_explicit_empty_field_dtypes() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "token_ids": [],
+            "generation_logprobs": [],
+        }
+    ]
+
+    rollouts_mod._tensorize_by_key(messages, "token_ids")
+    rollouts_mod._tensorize_by_key(messages, "generation_logprobs")
+
+    assert messages[0]["token_ids"].dtype == torch.long
+    assert messages[0]["generation_logprobs"].dtype == torch.float32
+
+
 def test_rollout_manager_consumes_stream_and_restores_input_order():
     class _ReadyRef:
         def __init__(self, value):
@@ -2159,8 +2193,16 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
                             1,
                             {
                                 "value": "second",
+                                "full_result": {"reward": 0.0},
                                 "input_message_log": [
                                     {"role": "user", "token_ids": [1]}
+                                ],
+                                "message_log": [
+                                    {
+                                        "role": "assistant",
+                                        "token_ids": [2],
+                                        "generation_logprobs": [0.0],
+                                    }
                                 ],
                             },
                             None,
@@ -2171,8 +2213,16 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
                             0,
                             {
                                 "value": "first",
+                                "full_result": {"reward": 0.0},
                                 "input_message_log": [
                                     {"role": "user", "token_ids": [1]}
+                                ],
+                                "message_log": [
+                                    {
+                                        "role": "assistant",
+                                        "token_ids": [2],
+                                        "generation_logprobs": [0.0],
+                                    }
                                 ],
                             },
                             {"remote_time": 2.0},
@@ -2203,12 +2253,14 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
+    manager._effort_config = None
+    manager._reward_penalty_config = None
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
     manager._tokenizer = None
     manager._result_to_completion = lambda result: result["value"]
-    manager._compute_rollout_metrics = lambda completions, agent: {
+    manager._compute_rollout_metrics = lambda completions, agent, **kwargs: {
         "completion_count": len(completions),
         "agent": agent,
     }

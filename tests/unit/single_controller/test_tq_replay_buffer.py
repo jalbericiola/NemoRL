@@ -25,7 +25,10 @@ import torch
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    TQReplayBuffer,
+    build_rollout_reward_semantics_fingerprint,
+)
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_GROUP_ID,
     SHARED_PREFIX_PROMPT_LENGTHS,
@@ -36,6 +39,83 @@ from nemo_rl.experience.interfaces import PromptGroupRecord
 
 # Each record yields _N_GENS training rows.
 _N_GENS = 2
+
+
+def _semantics_fingerprint(**overrides: Any) -> str:
+    config: dict[str, Any] = {
+        "use_nemo_gym": False,
+        "effort_config": None,
+        "reward_penalty_config": {},
+        "mask_env_flagged_samples": True,
+        "thinking_tags": ["<think>", "</think>"],
+        "invalid_tool_call_advantage": None,
+        "malformed_thinking_advantage": None,
+    }
+    config.update(overrides)
+    return build_rollout_reward_semantics_fingerprint(**config)
+
+
+_TEST_ROLLOUT_REWARD_SEMANTICS_FINGERPRINT = _semantics_fingerprint()
+
+
+def _rollout_receipt(**overrides: Any) -> dict[str, int | float]:
+    metrics: dict[str, int | float] = {
+        "cohort/samples": _N_GENS,
+        "cohort/generated_tokens": 2,
+        "cohort/total_tokens": 6,
+        "cohort/pre_penalty_reward_sum": 0.0,
+        "cohort/raw_environment_reward_sum": 0.0,
+        "cohort/effort_low_sample_count": 0,
+        "cohort/effort_reward_delta_sum": 0.0,
+        "cohort/env_masked_sample_count": 0,
+        "cohort/post_penalty_reward_sum": 0.0,
+        "cohort/duplicated_reasoning_count": 0,
+        "cohort/empty_final_answer_count": 0,
+        "cohort/unwanted_token_count": 0,
+        "cohort/malformed_think_tag_count": 0,
+        "cohort/rollout_started_at_s": 10.0,
+        "cohort/rollout_finished_at_s": 11.0,
+        "timing/rollout/total": 1.0,
+    }
+    metrics.update(overrides)
+    return metrics
+
+
+class TestRolloutRewardSemanticsFingerprint:
+    def test_mapping_order_does_not_change_fingerprint(self):
+        left = _semantics_fingerprint(
+            reward_penalty_config={
+                "penalize_empty_final_answer": True,
+                "token_ids": {"think_open": 1, "think_close": 2},
+            }
+        )
+        right = _semantics_fingerprint(
+            reward_penalty_config={
+                "token_ids": {"think_close": 2, "think_open": 1},
+                "penalize_empty_final_answer": True,
+            }
+        )
+
+        assert left == right
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"use_nemo_gym": True},
+            {"effort_config": {"low_weight": 0.1}},
+            {"reward_penalty_config": {"penalize_empty_final_answer": True}},
+            {"mask_env_flagged_samples": False},
+            {"thinking_tags": ["<reason>", "</reason>"]},
+            {"invalid_tool_call_advantage": -5.0},
+            {"malformed_thinking_advantage": -4.0},
+        ],
+    )
+    def test_every_reward_semantics_component_changes_fingerprint(self, override):
+        assert _semantics_fingerprint(**override) != _semantics_fingerprint()
+
+    def test_nonfinite_advantage_is_rejected(self):
+        with pytest.raises(ValueError, match="canonical-JSON serializable"):
+            _semantics_fingerprint(invalid_tool_call_advantage=float("nan"))
 
 
 def _stub_record_to_train_batch(
@@ -114,7 +194,7 @@ class FakeDataPlaneClient:
         sample_ids: list[str],
         partition_id: str,
         select_fields: list[str] | None = None,
-    ) -> dict[str, Any]:
+    ) -> TensorDict:
         assert partition_id == self._partition_id
         self.get_calls.append(
             {
@@ -124,8 +204,15 @@ class FakeDataPlaneClient:
                 ),
             }
         )
-        # Opaque per-group payload; load_state_dict must re-put it verbatim.
-        return {"payload_for": list(sample_ids)}
+        # The production DataPlane contract returns a TensorDict whose top-level
+        # keys exactly match select_fields. Values are opaque to checkpointing.
+        return TensorDict(
+            {
+                field: torch.zeros(len(sample_ids), 1, dtype=torch.long)
+                for field in select_fields
+            },
+            batch_size=(len(sample_ids),),
+        )
 
     def depth(self) -> int:
         return len(self._rows)
@@ -149,7 +236,9 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _make_record() -> PromptGroupRecord:
+def _make_record(
+    rollout_metrics: dict[str, Any] | None = None,
+) -> PromptGroupRecord:
     """Opaque PromptGroupRecord — converter is stubbed, so contents are unused."""
     return PromptGroupRecord(
         prompt_idx=0,
@@ -157,7 +246,9 @@ def _make_record() -> PromptGroupRecord:
         extra_env_info=None,
         metadata={},
         completions=[],
-        rollout_metrics={},
+        rollout_metrics=(
+            dict(rollout_metrics) if rollout_metrics is not None else _rollout_receipt()
+        ),
     )
 
 
@@ -166,6 +257,9 @@ def _make_buffer(
     *,
     require_routed_experts: bool = False,
     include_shared_prefix_metadata: bool = False,
+    rollout_reward_semantics_fingerprint: str = (
+        _TEST_ROLLOUT_REWARD_SEMANTICS_FINGERPRINT
+    ),
 ) -> TQReplayBuffer:
     return TQReplayBuffer(
         dp,
@@ -173,6 +267,7 @@ def _make_buffer(
         pad_value_dict={"token_ids": 0},
         require_routed_experts=require_routed_experts,
         include_shared_prefix_metadata=include_shared_prefix_metadata,
+        rollout_reward_semantics_fingerprint=(rollout_reward_semantics_fingerprint),
     )
 
 
@@ -196,6 +291,57 @@ def _add_group(
 
 
 class TestTQReplayBufferReserveCommit:
+    def test_commit_retains_only_finite_scalar_rollout_metrics(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+
+        _run(
+            buf.commit(
+                group_id,
+                _make_record(
+                    {
+                        **_rollout_receipt(),
+                        "reward": 1.5,
+                        "samples": 2,
+                        "histogram": [1, 2],
+                        "table": object(),
+                    }
+                ),
+                start_weight_version=3,
+                end_weight_version=3,
+            )
+        )
+
+        assert buf.rollout_metrics_list == [
+            {**_rollout_receipt(), "reward": 1.5, "samples": 2}
+        ]
+
+    @pytest.mark.parametrize("nonfinite", [float("nan"), float("inf")])
+    def test_commit_rejects_nonfinite_rollout_metrics_before_tq_write(self, nonfinite):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+
+        with pytest.raises(ValueError, match="must be finite"):
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record(
+                        {
+                            **_rollout_receipt(),
+                            "cohort/pre_penalty_reward_sum": nonfinite,
+                            "cohort/raw_environment_reward_sum": nonfinite,
+                            "cohort/effort_reward_delta_sum": nonfinite,
+                        }
+                    ),
+                    start_weight_version=3,
+                    end_weight_version=3,
+                )
+            )
+
+        assert dp.put_calls == []
+
     def test_disabled_commit_keeps_legacy_converter_call_shape(self, monkeypatch):
         def legacy_converter(
             record: PromptGroupRecord,
@@ -373,7 +519,7 @@ class TestTQReplayBufferReserveCommit:
             _run(
                 buf.commit(
                     gids[i],
-                    _make_record(),
+                    _make_record({**_rollout_receipt(), "dispatch_index": i}),
                     start_weight_version=weights[i],
                     end_weight_version=weights[i],
                 )
@@ -383,6 +529,11 @@ class TestTQReplayBufferReserveCommit:
         assert buf.start_weight_list == [1, 2, 3]
         assert buf.end_weight_list == [1, 2, 3]
         assert buf.ready_list == [True, True, True]
+        assert [metrics["dispatch_index"] for metrics in buf.rollout_metrics_list] == [
+            0,
+            1,
+            2,
+        ]
         # sample_id head equals reserved group_id at each slot.
         for i, gid in enumerate(gids):
             assert buf.meta_list[i] is not None
@@ -405,6 +556,30 @@ class TestTQReplayBufferReserveCommit:
 
 
 class TestTQReplayBufferRemove:
+    def test_remove_selected_returns_exact_metrics_once(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        for value in (1.0, 2.0, 3.0):
+            group_id = buf.reserve(weight_version=0)
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record({**_rollout_receipt(), "reward": value}),
+                    start_weight_version=0,
+                    end_weight_version=0,
+                )
+            )
+
+        # Exercise non-contiguous selection: metrics must follow the selected
+        # metas, while the unselected middle receipt remains in the buffer.
+        removed, rollout_metrics = _run(buf.remove_selected([0, 2]))
+        assert removed == 2
+        assert rollout_metrics == [
+            {**_rollout_receipt(), "reward": 1.0},
+            {**_rollout_receipt(), "reward": 3.0},
+        ]
+        assert buf.rollout_metrics_list == [{**_rollout_receipt(), "reward": 2.0}]
+
     def test_remove_drops_indices_and_clears_dp_when_requested(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
@@ -607,8 +782,28 @@ def _make_group_entry(
         "end_weight": weight,
         "target_step": target_step,
         "group_id": group_id,
-        "fields_data": {"payload_for": sids},
+        "rollout_metrics": _rollout_receipt(),
+        "fields_data": TensorDict(
+            {
+                field: torch.zeros(len(sids), 1, dtype=torch.long)
+                for field in (meta.fields or [])
+            },
+            batch_size=(len(sids),),
+        ),
     }
+
+
+def _extend_group_fields(group: dict[str, Any], fields: list[str]) -> None:
+    """Keep a hand-built checkpoint group's metadata and payload coherent."""
+    meta = group["meta"]
+    assert meta.fields is not None
+    meta.fields.extend(fields)
+    fields_data = group["fields_data"]
+    for field in fields:
+        fields_data.set(
+            field,
+            torch.zeros(len(meta.sample_ids), 1, dtype=torch.long),
+        )
 
 
 def _make_envelope(
@@ -616,10 +811,14 @@ def _make_envelope(
     *,
     partition_id: str = "rollout_data",
     saved_capacity: int = 8,
+    rollout_reward_semantics_fingerprint: str = (
+        _TEST_ROLLOUT_REWARD_SEMANTICS_FINGERPRINT
+    ),
 ) -> dict[str, Any]:
     return {
         "partition_id": partition_id,
         "saved_capacity": saved_capacity,
+        "rollout_reward_semantics_fingerprint": (rollout_reward_semantics_fingerprint),
         "groups": list(groups),
     }
 
@@ -643,6 +842,69 @@ def _load(
 
 
 class TestTQReplayBufferStateDict:
+    def test_state_dict_persists_reward_semantics_fingerprint(self):
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        state = _run(buf.state_dict(saved_capacity=8))
+
+        assert (
+            state["rollout_reward_semantics_fingerprint"]
+            == _TEST_ROLLOUT_REWARD_SEMANTICS_FINGERPRINT
+        )
+
+    def test_state_dict_rejects_data_plane_field_drift(self, monkeypatch):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=1)
+        monkeypatch.setattr(
+            dp,
+            "get_samples",
+            lambda **kwargs: TensorDict(
+                {"input_ids": torch.zeros(_N_GENS, 1, dtype=torch.long)},
+                batch_size=(_N_GENS,),
+            ),
+        )
+
+        with pytest.raises(ValueError, match="field mismatch"):
+            _run(buf.state_dict(saved_capacity=8))
+
+    def test_state_dict_rejects_invalid_meta_before_data_plane_fetch(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        _add_group(buf, weight=1)
+        buf.meta_list[0].fields = None
+
+        with pytest.raises(ValueError, match="meta.fields=None"):
+            _run(buf.state_dict(saved_capacity=8))
+
+        assert dp.get_calls == []
+
+    def test_state_dict_round_trip_preserves_rollout_metrics(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=1)
+        _run(
+            buf.commit(
+                group_id,
+                _make_record({**_rollout_receipt(), "reward": 0.75}),
+                start_weight_version=1,
+                end_weight_version=1,
+            )
+        )
+
+        state = _run(buf.state_dict(saved_capacity=8))
+        assert state["groups"][0]["rollout_metrics"] == {
+            **_rollout_receipt(),
+            "reward": 0.75,
+        }
+
+        restored = _make_buffer(FakeDataPlaneClient())
+        assert _load(restored, state) == 1
+        assert restored.rollout_metrics_list == [{**_rollout_receipt(), "reward": 0.75}]
+        removed, selected_metrics = _run(restored.remove_selected([0]))
+        assert removed == 1
+        assert selected_metrics == [{**_rollout_receipt(), "reward": 0.75}]
+
     def test_state_dict_serializes_ready_and_skips_unready(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
@@ -667,9 +929,7 @@ class TestTQReplayBufferStateDict:
             list(metas[1].sample_ids),
         ]
         assert dp.get_calls[0]["select_fields"] == list(metas[0].fields)
-        assert state["groups"][0]["fields_data"] == {
-            "payload_for": list(metas[0].sample_ids)
-        }
+        assert set(state["groups"][0]["fields_data"].keys()) == set(metas[0].fields)
 
     def test_round_trip_restores_lists_and_rows(self):
         dp = FakeDataPlaneClient()
@@ -697,7 +957,7 @@ class TestTQReplayBufferStateDict:
         assert len(dp2.put_calls) == 2
         for put, meta in zip(dp2.put_calls, metas):
             assert put["sample_ids"] == list(meta.sample_ids)
-            assert put["fields"] == {"payload_for": list(meta.sample_ids)}
+            assert set(put["fields"].keys()) == set(meta.fields)
             assert put["tags"] == [dict(t) for t in meta.tags]
 
     def test_round_trip_preserves_end_weight_and_target_step(self):
@@ -763,6 +1023,7 @@ class TestTQReplayBufferStateDict:
             batch_size=(2,),
         )
         group = _make_group_entry("g0", weight=1)
+        group["meta"].fields = list(fields.keys())
         group["fields_data"] = fields
         state = _make_envelope([group])
 
@@ -800,10 +1061,44 @@ class TestTQReplayBufferLoadPreflight:
         state = _make_envelope([], partition_id="other_partition")
         self._assert_rejected(state, match="partition_id mismatch")
 
+    def test_missing_reward_semantics_fingerprint_is_rejected(self):
+        state = _make_envelope([])
+        del state["rollout_reward_semantics_fingerprint"]
+        self._assert_rejected(state, match="missing required keys")
+
+    def test_changed_reward_semantics_are_rejected_before_any_write(self):
+        state = _make_envelope(
+            [_make_group_entry("g0", weight=1)],
+            rollout_reward_semantics_fingerprint=_semantics_fingerprint(
+                mask_env_flagged_samples=False
+            ),
+        )
+        self._assert_rejected(state, match="reward-semantics fingerprint mismatch")
+
+    def test_malformed_reward_semantics_fingerprint_is_rejected(self):
+        state = _make_envelope(
+            [_make_group_entry("g0", weight=1)],
+            rollout_reward_semantics_fingerprint="not-a-sha256",
+        )
+        self._assert_rejected(state, match="sha256.*prefix")
+
     def test_group_missing_keys(self):
         group = _make_group_entry("g0", weight=1)
         del group["fields_data"]
         self._assert_rejected(_make_envelope([group]), match="group missing keys")
+
+    def test_checkpoint_without_rollout_receipt_is_rejected_at_load(self):
+        group = _make_group_entry("g0", weight=1)
+        del group["rollout_metrics"]
+        self._assert_rejected(_make_envelope([group]), match="group missing keys")
+
+    def test_checkpoint_with_incomplete_rollout_receipt_is_rejected_at_load(self):
+        group = _make_group_entry("g0", weight=1)
+        group["rollout_metrics"] = {"cohort/samples": _N_GENS}
+        self._assert_rejected(
+            _make_envelope([group]),
+            match="predates exact SingleController rollout logging",
+        )
 
     def test_group_misaligned_sequence_lengths(self):
         group = _make_group_entry("g0", weight=1, sequence_lengths=[3])
@@ -812,6 +1107,69 @@ class TestTQReplayBufferLoadPreflight:
     def test_group_size_mismatch(self):
         state = _make_envelope([_make_group_entry("g0", weight=1, n=2)])
         self._assert_rejected(state, match="misaligned", expected_group_size=3)
+
+    def test_group_missing_materialized_field_is_rejected(self):
+        group = _make_group_entry("g0", weight=1)
+        del group["fields_data"]["total_reward"]
+        self._assert_rejected(_make_envelope([group]), match="field mismatch")
+
+    def test_group_with_unexpected_materialized_field_is_rejected(self):
+        group = _make_group_entry("g0", weight=1)
+        group["fields_data"].set(
+            "unexpected",
+            torch.zeros(_N_GENS, 1, dtype=torch.long),
+        )
+        self._assert_rejected(_make_envelope([group]), match="field mismatch")
+
+    def test_group_with_non_tensordict_fields_data_is_rejected(self):
+        group = _make_group_entry("g0", weight=1)
+        group["fields_data"] = {
+            field: torch.zeros(_N_GENS, 1) for field in (group["meta"].fields or [])
+        }
+        self._assert_rejected(_make_envelope([group]), match="must be a TensorDict")
+
+    def test_group_with_wrong_fields_data_batch_size_is_rejected(self):
+        group = _make_group_entry("g0", weight=1)
+        group["fields_data"] = TensorDict(
+            {
+                field: torch.zeros(1, 1, dtype=torch.long)
+                for field in (group["meta"].fields or [])
+            },
+            batch_size=(1,),
+        )
+        self._assert_rejected(_make_envelope([group]), match="batch_size mismatch")
+
+    def test_duplicate_declared_field_is_rejected(self):
+        group = _make_group_entry("g0", weight=1)
+        group["meta"].fields.append("input_ids")
+        self._assert_rejected(_make_envelope([group]), match="duplicate meta.fields")
+
+    def test_declared_fields_must_be_a_list_of_strings(self):
+        group = _make_group_entry("g0", weight=1)
+        group["meta"].fields = tuple(  # type: ignore[assignment]
+            group["meta"].fields or []
+        )
+        self._assert_rejected(_make_envelope([group]), match="must be a list")
+
+        group = _make_group_entry("g1", weight=1)
+        group["meta"].fields[0] = 7  # type: ignore[assignment]
+        self._assert_rejected(_make_envelope([group]), match="non-string meta.fields")
+
+    def test_declared_and_materialized_field_order_may_differ(self):
+        group = _make_group_entry("g0", weight=1)
+        group["meta"].fields.reverse()
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        assert _load(buf, _make_envelope([group])) == 1
+
+    def test_later_invalid_group_prevents_all_data_plane_writes(self):
+        valid = _make_group_entry("g0", weight=1)
+        invalid = _make_group_entry("g1", weight=2)
+        del invalid["fields_data"]["total_reward"]
+        self._assert_rejected(
+            _make_envelope([valid, invalid]),
+            match="field mismatch",
+        )
 
     def test_duplicate_sample_ids_across_groups(self):
         g0 = _make_group_entry("g0", weight=1)
@@ -833,9 +1191,10 @@ class TestTQReplayBufferLoadPreflight:
 
     def test_disabled_buffer_rejects_checkpoint_with_shared_prefix_fields(self):
         group = _make_group_entry("g0", weight=1)
-        meta = group["meta"]
-        assert meta.fields is not None
-        meta.fields.extend([SHARED_PREFIX_GROUP_ID, SHARED_PREFIX_PROMPT_LENGTHS])
+        _extend_group_fields(
+            group,
+            [SHARED_PREFIX_GROUP_ID, SHARED_PREFIX_PROMPT_LENGTHS],
+        )
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
 
@@ -847,9 +1206,10 @@ class TestTQReplayBufferLoadPreflight:
 
     def test_enabled_buffer_accepts_matching_checkpoint_schema(self):
         group = _make_group_entry("g0", weight=1)
-        meta = group["meta"]
-        assert meta.fields is not None
-        meta.fields.extend([SHARED_PREFIX_GROUP_ID, SHARED_PREFIX_PROMPT_LENGTHS])
+        _extend_group_fields(
+            group,
+            [SHARED_PREFIX_GROUP_ID, SHARED_PREFIX_PROMPT_LENGTHS],
+        )
         buf = _make_buffer(
             FakeDataPlaneClient(),
             include_shared_prefix_metadata=True,

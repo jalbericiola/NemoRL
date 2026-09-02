@@ -95,6 +95,7 @@ def reduce_advantage_pump_metrics(
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
     seq_logprob_error_metrics: list[dict[str, float]] | None = None,
+    message_level_penalty_metrics: list[dict[str, int]] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -103,6 +104,8 @@ def reduce_advantage_pump_metrics(
         masked_advantages: Token-masked advantages, one tensor per call.
         sequence_lengths: All input_lengths trained on this step.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
+            counts, one record per streaming chunk.
+        message_level_penalty_metrics: Exact generated-assistant and detector
             counts, one record per streaming chunk.
 
     Returns:
@@ -126,6 +129,67 @@ def reduce_advantage_pump_metrics(
         out["total_num_tokens"] = float(sum(sequence_lengths))
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
+    if message_level_penalty_metrics:
+        assistant_messages = sum(
+            record["num_assistant_messages"] for record in message_level_penalty_metrics
+        )
+        invalid_tool_calls = sum(
+            record["num_invalid_tool_calls"] for record in message_level_penalty_metrics
+        )
+        malformed_thinking = sum(
+            record["num_malformed_thinking"] for record in message_level_penalty_metrics
+        )
+        raw_invalid_tool_calls = sum(
+            record["num_raw_invalid_tool_calls"]
+            for record in message_level_penalty_metrics
+        )
+        raw_malformed_thinking = sum(
+            record["num_raw_malformed_thinking"]
+            for record in message_level_penalty_metrics
+        )
+        invalid_and_malformed = sum(
+            record["num_invalid_and_malformed_messages"]
+            for record in message_level_penalty_metrics
+        )
+        if (
+            assistant_messages < 0
+            or invalid_tool_calls < 0
+            or malformed_thinking < 0
+            or raw_invalid_tool_calls < 0
+            or raw_malformed_thinking < 0
+            or invalid_and_malformed < 0
+            or invalid_tool_calls > assistant_messages
+            or malformed_thinking > assistant_messages
+            or invalid_tool_calls + malformed_thinking > assistant_messages
+            or invalid_and_malformed > raw_invalid_tool_calls
+            or invalid_and_malformed > raw_malformed_thinking
+            or raw_invalid_tool_calls > assistant_messages
+            or raw_malformed_thinking > assistant_messages
+            or (
+                raw_invalid_tool_calls + raw_malformed_thinking - invalid_and_malformed
+                > assistant_messages
+            )
+        ):
+            raise RuntimeError(
+                "invalid message-level advantage penalty counts: "
+                f"assistant={assistant_messages}, invalid={invalid_tool_calls}, "
+                f"malformed={malformed_thinking}, "
+                f"raw_invalid={raw_invalid_tool_calls}, "
+                f"raw_malformed={raw_malformed_thinking}, "
+                f"overlap={invalid_and_malformed}"
+            )
+        denominator = max(assistant_messages, 1)
+        out["invalid_tool_call_rate"] = invalid_tool_calls / denominator
+        out["malformed_thinking_rate"] = malformed_thinking / denominator
+        out["raw_invalid_tool_call_rate"] = raw_invalid_tool_calls / denominator
+        out["raw_malformed_thinking_rate"] = raw_malformed_thinking / denominator
+        out["invalid_and_malformed_rate"] = invalid_and_malformed / denominator
+        out["num_invalid_tool_calls"] = float(invalid_tool_calls)
+        out["num_malformed_thinking"] = float(malformed_thinking)
+        out["num_assistant_messages"] = float(assistant_messages)
+        out["num_raw_invalid_tool_calls"] = float(raw_invalid_tool_calls)
+        out["num_raw_malformed_thinking"] = float(raw_malformed_thinking)
+        out["num_invalid_and_malformed_messages"] = float(invalid_and_malformed)
     return out
 
 

@@ -175,7 +175,7 @@ class _FakeSampler:
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
-    ) -> tuple[KVBatchMeta, int]:
+    ) -> tuple[KVBatchMeta, int, list[dict[str, int | float]]]:
         n = max_prompt_groups
         sample_ids = [f"s{self._step}-{i}" for i in range(n)]
         self._step += 1
@@ -186,7 +186,28 @@ class _FakeSampler:
             sequence_lengths=[16] * n,
             tags=[{"weight_version": current_train_weight}] * n,
         )
-        return meta, n
+        rollout_metrics = [
+            {
+                "cohort/samples": 1,
+                "cohort/generated_tokens": 1,
+                "cohort/total_tokens": 1,
+                "cohort/pre_penalty_reward_sum": 0.0,
+                "cohort/raw_environment_reward_sum": 0.0,
+                "cohort/effort_low_sample_count": 0,
+                "cohort/effort_reward_delta_sum": 0.0,
+                "cohort/env_masked_sample_count": 0,
+                "cohort/post_penalty_reward_sum": 0.0,
+                "cohort/duplicated_reasoning_count": 0,
+                "cohort/empty_final_answer_count": 0,
+                "cohort/unwanted_token_count": 0,
+                "cohort/malformed_think_tag_count": 0,
+                "cohort/rollout_started_at_s": 10.0,
+                "cohort/rollout_finished_at_s": 10.0,
+                "timing/rollout/total": 0.0,
+            }
+            for _ in range(n)
+        ]
+        return meta, n, rollout_metrics
 
     @property
     def is_on_policy(self) -> bool:
@@ -206,9 +227,9 @@ class _ExhaustingSampler(_FakeSampler):
         super().__init__()
         self._remaining = steps
 
-    async def select(self, **kwargs) -> tuple[Optional[KVBatchMeta], int]:
+    async def select(self, **kwargs):
         if self._remaining == 0:
-            return None, 0
+            return None, 0, []
         self._remaining -= 1
         return await super().select(**kwargs)
 
@@ -1007,6 +1028,56 @@ def _make_int_dataloader() -> StatefulDataLoader:
         drop_last=True,
         num_workers=0,
     )
+
+
+class TestAtomicRolloutCutoff:
+    def test_waits_for_inflight_group_before_snapshotting_tq(self, tmp_path):
+        async def _main():
+            buffer = _FakeTQBuffer(state={"groups": []})
+            dataloader = _FakeDataloader(state={"fake_position": 7})
+            actor = _ACTOR_CLS(
+                _actor_master_config(tmp_path),
+                _make_actor_args(dataloader=dataloader, tq_buffer=buffer),
+                SetupTimingMetrics(),
+            )
+            actor._current_epoch = 3
+            actor._replacement_reserve.extend(["spare-0"])
+
+            allow_commit = asyncio.Event()
+
+            async def _commit_inflight_group() -> None:
+                await allow_commit.wait()
+                buffer._state = {"groups": ["committed-group"]}
+
+            inflight = asyncio.create_task(_commit_inflight_group())
+            actor._dispatched_rollouts.add(inflight)
+            inflight.add_done_callback(actor._dispatched_rollouts.discard)
+
+            snapshot = asyncio.create_task(actor._checkpoint_rollout_runtime_state())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            assert not actor._rollout_admission_permitted.is_set()
+            assert buffer.state_dict_calls == []
+            assert not snapshot.done()
+
+            allow_commit.set()
+            (
+                current_epoch,
+                dataloader_state,
+                reserve_state,
+                buffer_state,
+            ) = await asyncio.wait_for(snapshot, timeout=1.0)
+
+            assert current_epoch == 3
+            assert dataloader_state == {"fake_position": 7}
+            assert reserve_state == ["spare-0"]
+            assert buffer_state == {"groups": ["committed-group"]}
+            assert buffer.state_dict_calls == [4]
+            assert actor._dispatched_rollouts == set()
+            assert actor._rollout_admission_permitted.is_set()
+
+        asyncio.run(_main())
 
 
 class TestDataloaderState:

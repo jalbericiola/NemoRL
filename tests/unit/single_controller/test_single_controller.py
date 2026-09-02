@@ -26,15 +26,22 @@ from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
-from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    RewardScalingConfig,
+    _initial_grpo_save_state,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.shared_prefix_metrics import SharedPrefixOpportunity
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
+    _reduce_rollout_step_metrics,
     _reduce_shared_prefix_step_metrics,
     _resolve_train_dispatch_group_multiple,
     _train_selection_group_bounds,
+    _unpack_sampler_selection,
     _validate_train_dispatch_buffer_capacity,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -48,6 +55,16 @@ from nemo_rl.data.packing.shared_prefix_metadata import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.interfaces import (
+    GENERATED_ASSISTANT_MESSAGE_COUNT,
+    INVALID_AND_MALFORMED_MESSAGE_COUNT,
+    INVALID_TOOL_CALL_MESSAGE_COUNT,
+    INVALID_TOOL_CALL_TOKEN_MASK,
+    MALFORMED_THINKING_MESSAGE_COUNT,
+    MALFORMED_THINKING_TOKEN_MASK,
+    RESPONSE_TOKEN_LENGTHS,
+    ROLLOUT_TRUNCATED,
+)
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
@@ -323,6 +340,321 @@ class _MaskRecordingAdvantageEstimator:
         del kwargs
         self.mask = mask.clone()
         return rewards.unsqueeze(-1).expand_as(mask).clone()
+
+
+def _valid_message_penalty_data() -> TensorDict:
+    batch_size, sequence_length = 2, 4
+    return TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([0.25, 0.75]),
+            "token_mask": torch.tensor([[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]]),
+            "sample_mask": torch.ones(batch_size),
+            INVALID_TOOL_CALL_TOKEN_MASK: torch.tensor(
+                [
+                    [False, False, True, True],
+                    [False, False, False, False],
+                ]
+            ),
+            MALFORMED_THINKING_TOKEN_MASK: torch.tensor(
+                [
+                    [False, False, True, True],
+                    [False, False, False, False],
+                ]
+            ),
+            GENERATED_ASSISTANT_MESSAGE_COUNT: torch.tensor([1, 1]),
+            INVALID_TOOL_CALL_MESSAGE_COUNT: torch.tensor([1, 0]),
+            MALFORMED_THINKING_MESSAGE_COUNT: torch.tensor([1, 0]),
+            INVALID_AND_MALFORMED_MESSAGE_COUNT: torch.tensor([1, 0]),
+        },
+        batch_size=[batch_size],
+    )
+
+
+def _run_message_penalty_stage(
+    data: TensorDict,
+    *,
+    invalid_advantage: float | None = -5.0,
+    malformed_advantage: float | None = -3.0,
+) -> tuple[SingleControllerActor, _AdvantageDataPlane]:
+    data_plane = _AdvantageDataPlane(data)
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = _MaskRecordingAdvantageEstimator()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(
+            seq_logprob_error_threshold=None,
+            reward_scaling=None,
+            reward_shaping=None,
+            overlong_filtering=False,
+            invalid_tool_call_advantage=invalid_advantage,
+            malformed_thinking_advantage=malformed_advantage,
+            advantage_clip_low=None,
+            advantage_clip_high=None,
+        )
+    )
+    ctrl._shared_prefix_training_config = SimpleNamespace(mode="disabled")
+    ctrl._step_shared_prefix_opportunities = []
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+        "message_level_penalty_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(data.batch_size[0])],
+        fields=list(data.keys()),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+    return ctrl, data_plane
+
+
+def test_advantage_stage_matches_scale_shape_message_penalty_and_clip_order() -> None:
+    batch_size, sequence_length = 3, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([0.0, 0.5, 1.0]),
+            "token_mask": torch.tensor([[0.0, 0.0, 1.0, 1.0]] * batch_size),
+            "sample_mask": torch.ones(batch_size),
+            ROLLOUT_TRUNCATED: torch.zeros(batch_size, dtype=torch.bool),
+            RESPONSE_TOKEN_LENGTHS: torch.tensor([2, 3, 4]),
+            INVALID_TOOL_CALL_TOKEN_MASK: torch.tensor(
+                [
+                    [False, False, False, False],
+                    [False, False, True, True],
+                    [False, False, False, False],
+                ]
+            ),
+            MALFORMED_THINKING_TOKEN_MASK: torch.tensor(
+                [
+                    [False, False, False, False],
+                    [False, False, True, True],
+                    [False, False, True, False],
+                ]
+            ),
+            GENERATED_ASSISTANT_MESSAGE_COUNT: torch.tensor([1, 1, 1]),
+            INVALID_TOOL_CALL_MESSAGE_COUNT: torch.tensor([0, 1, 0]),
+            MALFORMED_THINKING_MESSAGE_COUNT: torch.tensor([0, 1, 1]),
+            INVALID_AND_MALFORMED_MESSAGE_COUNT: torch.tensor([0, 1, 0]),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=SimpleNamespace(
+            seq_logprob_error_threshold=None,
+            reward_scaling=RewardScalingConfig(
+                enabled=True,
+                source_min=0.0,
+                source_max=1.0,
+                target_min=0.0,
+                target_max=2.0,
+            ),
+            reward_shaping=RewardShapingConfig(
+                enabled=True,
+                overlong_buffer_length=2,
+                overlong_buffer_penalty=1.0,
+                max_response_length=4,
+            ),
+            overlong_filtering=False,
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=-3.0,
+            advantage_clip_low=-2.0,
+            advantage_clip_high=2.0,
+        )
+    )
+    ctrl._shared_prefix_training_config = SimpleNamespace(mode="disabled")
+    ctrl._step_shared_prefix_opportunities = []
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+        "message_level_penalty_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    assert estimator.mask is not None
+    assert torch.equal(ctrl._step_log_dict["rewards"][0], torch.tensor([0.0, 0.5, 1.0]))
+    torch.testing.assert_close(
+        ctrl._step_log_dict["masked_advantages"][0],
+        torch.tensor([0.0, 0.0, 0.5, 0.5, 1.0, 1.0]),
+    )
+    assert data_plane.written_fields is not None
+    advantages = data_plane.written_fields["advantages"]
+    assert advantages[1, 2:].tolist() == [-2.0, -2.0]
+    assert advantages[2].tolist() == [1.0, 1.0, -2.0, 1.0]
+    assert ctrl._step_log_dict["message_level_penalty_metrics"] == [
+        {
+            "num_invalid_tool_calls": 1,
+            "num_malformed_thinking": 1,
+            "num_assistant_messages": 3,
+            "num_raw_invalid_tool_calls": 1,
+            "num_raw_malformed_thinking": 2,
+            "num_invalid_and_malformed_messages": 1,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement", "error_match"),
+    [
+        (
+            INVALID_TOOL_CALL_TOKEN_MASK,
+            torch.tensor([[0, 0, 1, 1], [0, 0, 0, 0]], dtype=torch.int64),
+            "must have dtype torch.bool",
+        ),
+        (
+            MALFORMED_THINKING_TOKEN_MASK,
+            torch.zeros(2, 5, dtype=torch.bool),
+            "shape does not match advantages",
+        ),
+        (
+            GENERATED_ASSISTANT_MESSAGE_COUNT,
+            torch.tensor([1.0, 1.0]),
+            "must have an integral, non-bool dtype",
+        ),
+        (
+            GENERATED_ASSISTANT_MESSAGE_COUNT,
+            torch.ones(2, 2, dtype=torch.long),
+            "must have shape",
+        ),
+        (
+            GENERATED_ASSISTANT_MESSAGE_COUNT,
+            torch.tensor([True, True]),
+            "must have an integral, non-bool dtype",
+        ),
+        (
+            INVALID_TOOL_CALL_MESSAGE_COUNT,
+            torch.tensor([-1, 0]),
+            "must be nonnegative",
+        ),
+    ],
+)
+def test_advantage_stage_rejects_invalid_message_penalty_field_contract(
+    field_name: str,
+    replacement: torch.Tensor,
+    error_match: str,
+) -> None:
+    data = _valid_message_penalty_data()
+    data[field_name] = replacement
+
+    with pytest.raises(RuntimeError, match=error_match):
+        _run_message_penalty_stage(data)
+
+
+def test_advantage_stage_rejects_detector_mask_outside_generated_response() -> None:
+    data = _valid_message_penalty_data()
+    data[INVALID_TOOL_CALL_TOKEN_MASK][0, 0] = True
+
+    with pytest.raises(RuntimeError, match="outside the generated response token_mask"):
+        _run_message_penalty_stage(data)
+
+
+def test_advantage_stage_validates_message_counts_per_row_not_only_in_total() -> None:
+    data = _valid_message_penalty_data()
+    # The aggregate assistant count remains two, but row 0 cannot contain its
+    # invalid/malformed message while declaring zero generated assistants.
+    data[GENERATED_ASSISTANT_MESSAGE_COUNT] = torch.tensor([0, 2])
+
+    with pytest.raises(RuntimeError, match="per-row message-level"):
+        _run_message_penalty_stage(data)
+
+
+def test_advantage_stage_requires_zero_assistant_count_to_have_empty_mask() -> None:
+    data = _valid_message_penalty_data()
+    data[GENERATED_ASSISTANT_MESSAGE_COUNT] = torch.tensor([0, 1])
+    data[INVALID_TOOL_CALL_MESSAGE_COUNT] = torch.tensor([0, 0])
+    data[MALFORMED_THINKING_MESSAGE_COUNT] = torch.tensor([0, 0])
+    data[INVALID_AND_MALFORMED_MESSAGE_COUNT] = torch.tensor([0, 0])
+    data[INVALID_TOOL_CALL_TOKEN_MASK][0] = False
+    data[MALFORMED_THINKING_TOKEN_MASK][0] = False
+
+    with pytest.raises(RuntimeError, match="generated assistant count/mask presence"):
+        _run_message_penalty_stage(data)
+
+
+@pytest.mark.parametrize(
+    ("count_field", "mask_field", "receipt_name"),
+    [
+        (
+            INVALID_TOOL_CALL_MESSAGE_COUNT,
+            INVALID_TOOL_CALL_TOKEN_MASK,
+            "raw invalid-tool-call",
+        ),
+        (
+            MALFORMED_THINKING_MESSAGE_COUNT,
+            MALFORMED_THINKING_TOKEN_MASK,
+            "raw malformed-thinking",
+        ),
+    ],
+)
+def test_advantage_stage_requires_detector_count_and_mask_presence_to_match(
+    count_field: str,
+    mask_field: str,
+    receipt_name: str,
+) -> None:
+    data = _valid_message_penalty_data()
+    data[count_field] = torch.tensor([0, 0])
+    data[INVALID_AND_MALFORMED_MESSAGE_COUNT] = torch.tensor([0, 0])
+    if mask_field == INVALID_TOOL_CALL_TOKEN_MASK:
+        data[MALFORMED_THINKING_MESSAGE_COUNT] = torch.tensor([0, 0])
+        data[MALFORMED_THINKING_TOKEN_MASK][0] = False
+    else:
+        data[INVALID_TOOL_CALL_MESSAGE_COUNT] = torch.tensor([0, 0])
+        data[INVALID_TOOL_CALL_TOKEN_MASK][0] = False
+
+    with pytest.raises(RuntimeError, match=receipt_name):
+        _run_message_penalty_stage(data)
+
+
+def test_advantage_stage_requires_overlap_count_and_mask_presence_to_match() -> None:
+    data = _valid_message_penalty_data()
+    data[GENERATED_ASSISTANT_MESSAGE_COUNT] = torch.tensor([2, 1])
+    data[INVALID_AND_MALFORMED_MESSAGE_COUNT] = torch.tensor([0, 0])
+
+    with pytest.raises(RuntimeError, match="invalid/malformed overlap"):
+        _run_message_penalty_stage(data)
+
+
+def test_advantage_stage_validates_invalid_precedence_against_message_counts() -> None:
+    data = _valid_message_penalty_data()
+    # The receipt says the sole malformed message is the overlapping invalid
+    # message. A malformed-only token after removing invalid tokens therefore
+    # proves that the producer's count and masks disagree.
+    data[INVALID_TOOL_CALL_TOKEN_MASK][0] = torch.tensor([False, False, True, False])
+
+    with pytest.raises(RuntimeError, match="post-precedence malformed-thinking"):
+        _run_message_penalty_stage(data)
 
 
 def test_advantage_stage_applies_seq_logprob_error_mask_before_streaming_train(
@@ -696,6 +1028,148 @@ def test_reduce_shared_prefix_step_metrics_weights_streaming_chunks_exactly() ->
         )
 
 
+def test_reduce_rollout_step_metrics_uses_exact_selected_cohort() -> None:
+    common = {
+        "cohort/samples": 2,
+        "cohort/generated_tokens": 7,
+        "cohort/total_tokens": 13,
+        "cohort/duplicated_reasoning_count": 0,
+        "cohort/empty_final_answer_count": 0,
+        "cohort/unwanted_token_count": 0,
+        "cohort/malformed_think_tag_count": 0,
+    }
+    train_metrics, timing_metrics = _reduce_rollout_step_metrics(
+        [
+            {
+                **common,
+                "cohort/pre_penalty_reward_sum": 2.0,
+                "cohort/raw_environment_reward_sum": 2.0,
+                "cohort/effort_low_sample_count": 0,
+                "cohort/effort_reward_delta_sum": 0.0,
+                "cohort/env_masked_sample_count": 0,
+                "cohort/post_penalty_reward_sum": 1.0,
+                "cohort/duplicated_reasoning_count": 1,
+                "cohort/rollout_started_at_s": 10.0,
+                "cohort/rollout_finished_at_s": 13.0,
+                "timing/rollout/total": 3.0,
+                "total_reward/mean": 0.5,
+            },
+            {
+                **common,
+                "cohort/pre_penalty_reward_sum": 1.0,
+                "cohort/raw_environment_reward_sum": 1.0,
+                "cohort/effort_low_sample_count": 0,
+                "cohort/effort_reward_delta_sum": 0.0,
+                "cohort/env_masked_sample_count": 0,
+                "cohort/post_penalty_reward_sum": 1.0,
+                "cohort/empty_final_answer_count": 1,
+                "cohort/rollout_started_at_s": 11.0,
+                "cohort/rollout_finished_at_s": 16.0,
+                "timing/rollout/total": 5.0,
+                "total_reward/mean": 0.5,
+            },
+        ]
+    )
+
+    assert train_metrics["rollout/samples"] == 4
+    assert train_metrics["rollout/generated_tokens"] == 14
+    assert train_metrics["rollout/total_tokens"] == 26
+    assert train_metrics["raw_environment_reward"] == pytest.approx(0.75)
+    assert train_metrics["pre_penalty_environment_reward"] == pytest.approx(0.75)
+    assert train_metrics["effort_low_sample_count"] == 0
+    assert train_metrics["effort_low_sample_rate"] == 0.0
+    assert train_metrics["effort_reward_delta"] == 0.0
+    assert train_metrics["num_mask_sample_filtered"] == 0
+    assert train_metrics["verifier_reward"] == pytest.approx(0.5)
+    assert train_metrics["reasoning_equal_to_final_answer_rate"] == pytest.approx(0.25)
+    assert train_metrics["empty_final_answer_rate"] == pytest.approx(0.25)
+    assert train_metrics["unwanted_token_rate"] == 0.0
+    assert train_metrics["malformed_think_tag_rate"] == 0.0
+    assert train_metrics["total_reward/mean"] == pytest.approx(0.5)
+    assert timing_metrics["rollout_generation_cohort"] == 6.0
+    assert timing_metrics["rollout_generation_active"] == 6.0
+    assert timing_metrics["rollout_generation_work"] == 8.0
+
+
+def test_reduce_rollout_step_metrics_does_not_average_noncomposable_summaries() -> None:
+    def _receipt(*, samples: int, reward_sum: float, mean_turns: float) -> dict:
+        return {
+            "cohort/samples": samples,
+            "cohort/generated_tokens": samples,
+            "cohort/total_tokens": samples,
+            "cohort/raw_environment_reward_sum": reward_sum,
+            "cohort/pre_penalty_reward_sum": reward_sum,
+            "cohort/effort_low_sample_count": 0,
+            "cohort/effort_reward_delta_sum": 0.0,
+            "cohort/env_masked_sample_count": 0,
+            "cohort/post_penalty_reward_sum": reward_sum,
+            "cohort/duplicated_reasoning_count": 0,
+            "cohort/empty_final_answer_count": 0,
+            "cohort/unwanted_token_count": 0,
+            "cohort/malformed_think_tag_count": 0,
+            "cohort/rollout_started_at_s": 10.0,
+            "cohort/rollout_finished_at_s": 11.0,
+            "timing/rollout/total": 1.0,
+            "total_reward/mean": reward_sum / samples,
+            "total_reward/min": reward_sum / samples,
+            "total_reward/max": reward_sum / samples,
+            # These are valid only inside this prompt group. Their average is
+            # neither the selected cohort's statistic nor a useful bound.
+            "total_reward/median": reward_sum / samples,
+            "total_reward/stddev": 0.0,
+            "turns_per_sample/mean": mean_turns,
+            "turns_per_sample/p95": mean_turns,
+            "truncation_rate": mean_turns / 2.0,
+        }
+
+    train_metrics, _ = _reduce_rollout_step_metrics(
+        [
+            _receipt(samples=1, reward_sum=0.0, mean_turns=0.0),
+            _receipt(samples=3, reward_sum=3.0, mean_turns=2.0),
+        ]
+    )
+
+    assert train_metrics["total_reward/mean"] == pytest.approx(0.75)
+    assert train_metrics["total_reward/min"] == 0.0
+    assert train_metrics["total_reward/max"] == 1.0
+    assert train_metrics["turns_per_sample/mean"] == pytest.approx(1.5)
+    assert train_metrics["truncation_rate"] == pytest.approx(0.75)
+    assert "total_reward/median" not in train_metrics
+    assert "total_reward/stddev" not in train_metrics
+    assert "turns_per_sample/p95" not in train_metrics
+
+
+def test_reduce_rollout_step_metrics_fails_closed_on_incomplete_receipt() -> None:
+    with pytest.raises(RuntimeError, match="missing exact cohort metrics"):
+        _reduce_rollout_step_metrics(
+            [{"cohort/samples": 2, "timing/rollout/total": 1.0}]
+        )
+
+
+def _test_rollout_receipt(groups: int = 1) -> list[dict[str, int | float]]:
+    return [
+        {
+            "cohort/samples": 1,
+            "cohort/generated_tokens": 1,
+            "cohort/total_tokens": 1,
+            "cohort/pre_penalty_reward_sum": 0.0,
+            "cohort/raw_environment_reward_sum": 0.0,
+            "cohort/effort_low_sample_count": 0,
+            "cohort/effort_reward_delta_sum": 0.0,
+            "cohort/env_masked_sample_count": 0,
+            "cohort/post_penalty_reward_sum": 0.0,
+            "cohort/duplicated_reasoning_count": 0,
+            "cohort/empty_final_answer_count": 0,
+            "cohort/unwanted_token_count": 0,
+            "cohort/malformed_think_tag_count": 0,
+            "cohort/rollout_started_at_s": 10.0,
+            "cohort/rollout_finished_at_s": 10.0,
+            "timing/rollout/total": 0.0,
+        }
+        for _ in range(groups)
+    ]
+
+
 class _EmptySampler:
     async def evict(self, *, current_train_weight: int) -> int:
         del current_train_weight
@@ -703,7 +1177,7 @@ class _EmptySampler:
 
     async def select(self, **kwargs):
         del kwargs
-        return None, 0
+        return None, 0, []
 
 
 class _OneThenEmptySampler(_EmptySampler):
@@ -713,10 +1187,10 @@ class _OneThenEmptySampler(_EmptySampler):
     async def select(self, **kwargs):
         del kwargs
         if self._meta is None:
-            return None, 0
+            return None, 0, []
         meta = self._meta
         self._meta = None
-        return meta, 1
+        return meta, 1, _test_rollout_receipt()
 
 
 class _EvictingSampler(_OneThenEmptySampler):
@@ -725,8 +1199,10 @@ class _EvictingSampler(_OneThenEmptySampler):
         return 2
 
     async def select(self, **kwargs):
-        meta, num_groups = await super().select(**kwargs)
-        return meta, 2 if num_groups else 0
+        meta, num_groups, rollout_metrics = await super().select(**kwargs)
+        if num_groups:
+            rollout_metrics.extend(_test_rollout_receipt())
+        return meta, 2 if num_groups else 0, rollout_metrics
 
 
 class _ChunkedSampler(_EmptySampler):
@@ -744,9 +1220,9 @@ class _ChunkedSampler(_EmptySampler):
     async def select(self, **kwargs):
         del kwargs
         if self._remaining == 0:
-            return None, 0
+            return None, 0, []
         self._remaining -= 1
-        return self._meta, 1
+        return self._meta, 1, _test_rollout_receipt()
 
 
 class _SequenceSampler(_EmptySampler):
@@ -756,8 +1232,23 @@ class _SequenceSampler(_EmptySampler):
     async def select(self, **kwargs):
         del kwargs
         if not self._metas:
-            return None, 0
-        return self._metas.pop(0), 1
+            return None, 0, []
+        return self._metas.pop(0), 1, _test_rollout_receipt()
+
+
+class _MetricSequenceSampler(_EmptySampler):
+    def __init__(
+        self,
+        selections: list[tuple[KVBatchMeta, dict[str, int | float]]],
+    ) -> None:
+        self._selections = list(selections)
+
+    async def select(self, **kwargs):
+        del kwargs
+        if not self._selections:
+            return None, 0, []
+        meta, rollout_metrics = self._selections.pop(0)
+        return meta, 1, [dict(rollout_metrics)]
 
 
 class _ExactBoundsSampler(_EmptySampler):
@@ -771,10 +1262,10 @@ class _ExactBoundsSampler(_EmptySampler):
         maximum = kwargs["max_prompt_groups"]
         self.bounds.append((minimum, maximum))
         if self._remaining == 0:
-            return None, 0
+            return None, 0, []
         self._remaining -= 1
         assert minimum == maximum
-        return self._meta, maximum
+        return self._meta, maximum, _test_rollout_receipt(maximum)
 
 
 class _EmptyBuffer:
@@ -876,6 +1367,111 @@ def test_train_pump_stops_after_rollout_exhaustion_and_buffer_drain() -> None:
     assert ctrl._train_steps == 0
 
 
+def test_train_pump_logs_only_selected_rollout_cohort(monkeypatch) -> None:
+    def _meta(group: str) -> KVBatchMeta:
+        return KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"{group}_g0", f"{group}_g1"],
+            fields=[],
+            sequence_lengths=[1, 1],
+            tags=[{"weight_version": 0}, {"weight_version": 0}],
+        )
+
+    common = {
+        "cohort/samples": 2,
+        "cohort/generated_tokens": 7,
+        "cohort/total_tokens": 13,
+        "cohort/duplicated_reasoning_count": 0,
+        "cohort/empty_final_answer_count": 0,
+        "cohort/unwanted_token_count": 0,
+        "cohort/malformed_think_tag_count": 0,
+    }
+    first = {
+        **common,
+        "cohort/pre_penalty_reward_sum": 2.0,
+        "cohort/raw_environment_reward_sum": 2.0,
+        "cohort/effort_low_sample_count": 0,
+        "cohort/effort_reward_delta_sum": 0.0,
+        "cohort/env_masked_sample_count": 0,
+        "cohort/post_penalty_reward_sum": 1.0,
+        "cohort/duplicated_reasoning_count": 1,
+        "cohort/rollout_started_at_s": 10.0,
+        "cohort/rollout_finished_at_s": 13.0,
+        "timing/rollout/total": 3.0,
+    }
+    second = {
+        **common,
+        "cohort/pre_penalty_reward_sum": 1.0,
+        "cohort/raw_environment_reward_sum": 1.0,
+        "cohort/effort_low_sample_count": 0,
+        "cohort/effort_reward_delta_sum": 0.0,
+        "cohort/env_masked_sample_count": 0,
+        "cohort/post_penalty_reward_sum": 1.0,
+        "cohort/empty_final_answer_count": 1,
+        "cohort/rollout_started_at_s": 11.0,
+        "cohort/rollout_finished_at_s": 16.0,
+        "timing/rollout/total": 5.0,
+    }
+    # This third receipt is deliberately never selected into the two-group step.
+    sentinel = {
+        **common,
+        "cohort/samples": 1000,
+        "cohort/generated_tokens": 999999,
+        "cohort/pre_penalty_reward_sum": 999999.0,
+        "cohort/raw_environment_reward_sum": 999999.0,
+        "cohort/effort_low_sample_count": 0,
+        "cohort/effort_reward_delta_sum": 0.0,
+        "cohort/env_masked_sample_count": 0,
+        "cohort/post_penalty_reward_sum": 999999.0,
+        "cohort/rollout_started_at_s": 0.0,
+        "cohort/rollout_finished_at_s": 999999.0,
+        "timing/rollout/total": 999999.0,
+    }
+    sampler = _MetricSequenceSampler(
+        [
+            (_meta("first"), first),
+            (_meta("second"), second),
+            (_meta("sentinel"), sentinel),
+        ]
+    )
+    ctrl = _train_pump_controller(sampler=sampler)
+
+    async def _advantage_stage(meta):
+        ctrl._step_log_dict["rewards"].append(torch.tensor([0.5, 0.5]))
+        ctrl._step_log_dict["masked_advantages"].append(torch.tensor([0.0]))
+        return meta, True
+
+    ctrl._advantage_stage = _advantage_stage
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_call, timing_call = ctrl._logger.log_metrics.call_args_list
+    assert train_call.kwargs["prefix"] == "train"
+    train_metrics = train_call.args[0]
+    assert train_metrics["rollout/samples"] == 4
+    assert train_metrics["rollout/generated_tokens"] == 14
+    assert train_metrics["rollout/total_tokens"] == 26
+    assert train_metrics["raw_environment_reward"] == pytest.approx(0.75)
+    assert train_metrics["pre_penalty_environment_reward"] == pytest.approx(0.75)
+    assert train_metrics["verifier_reward"] == pytest.approx(0.5)
+    assert train_metrics["reward"] == pytest.approx(0.5)
+    assert train_metrics["reward_processing_delta"] == pytest.approx(0.0)
+    assert train_metrics["reasoning_equal_to_final_answer_rate"] == pytest.approx(0.25)
+    assert train_metrics["empty_final_answer_rate"] == pytest.approx(0.25)
+    assert train_metrics["unwanted_token_rate"] == 0.0
+    assert train_metrics["malformed_think_tag_rate"] == 0.0
+
+    assert timing_call.kwargs["prefix"] == "timing/train"
+    assert timing_call.args[0]["rollout_generation_cohort"] == 6.0
+    assert timing_call.args[0]["rollout_generation_active"] == 6.0
+    assert timing_call.args[0]["rollout_generation_work"] == 8.0
+    assert len(sampler._selections) == 1
+
+
 @pytest.mark.parametrize("mode", ["disabled", "observe"])
 def test_non_train_mode_preserves_greedy_streaming_bounds(mode: str) -> None:
     assert (
@@ -944,6 +1540,57 @@ def test_shared_prefix_train_rejects_buffer_smaller_than_rounded_claim() -> None
         group_multiple=2,
         max_buffered_rollouts=4,
     )
+
+
+def test_sampler_selection_rejects_legacy_two_value_contract() -> None:
+    with pytest.raises(RuntimeError, match="legacy two-value sampler contract"):
+        _unpack_sampler_selection((None, 0))
+
+
+def test_sampler_selection_requires_receipt_list() -> None:
+    with pytest.raises(RuntimeError, match="rollout_metric_receipts as a list"):
+        _unpack_sampler_selection((None, 0, ()))
+
+
+def _sampler_selection_meta(samples: int = 1) -> KVBatchMeta:
+    return KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{idx}" for idx in range(samples)],
+    )
+
+
+@pytest.mark.parametrize(
+    ("selection", "error"),
+    [
+        ((None, 1, [{"cohort/samples": 1}]), "returned no metadata"),
+        ((None, 0, [{"cohort/samples": 1}]), "returned no metadata"),
+        ((_sampler_selection_meta(), 0, []), "non-positive num_groups"),
+        ((_sampler_selection_meta(), -1, []), "non-positive num_groups"),
+        (
+            (_sampler_selection_meta(), 1, []),
+            "one rollout metric receipt per selected prompt group",
+        ),
+        (
+            (_sampler_selection_meta(), 2, [{}, {}]),
+            "fewer samples than selected prompt groups",
+        ),
+        (({"sample_ids": ["sample-0"]}, 1, [{}]), "non-KVBatchMeta"),
+    ],
+)
+def test_sampler_selection_rejects_inconsistent_empty_count_and_meta(
+    selection: object,
+    error: str,
+) -> None:
+    with pytest.raises(RuntimeError, match=error):
+        _unpack_sampler_selection(selection)
+
+
+def test_sampler_selection_accepts_exact_receipt_contract() -> None:
+    receipts = [{"cohort/samples": 1}]
+    meta = _sampler_selection_meta()
+    assert _unpack_sampler_selection((meta, 1, receipts)) == (meta, 1, receipts)
+    assert _unpack_sampler_selection((None, 0, [])) == (None, 0, [])
 
 
 def test_shared_prefix_train_pump_claims_only_exact_dp_divisible_chunks(
@@ -1030,10 +1677,10 @@ class _DroppingSampler(_OneThenEmptySampler):
         BaseSampler._validate_group_bounds(
             kwargs["min_prompt_groups"], kwargs["max_prompt_groups"]
         )
-        meta, num_groups = await super().select(**kwargs)
+        meta, num_groups, rollout_metrics = await super().select(**kwargs)
         if meta is None and not self._credit_in_evict:
             self._credit()
-        return meta, num_groups
+        return meta, num_groups, rollout_metrics
 
 
 def _dropping_controller(*, credit_in_evict: bool):

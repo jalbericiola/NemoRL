@@ -86,6 +86,10 @@ class FakeBuffer:
             del self.ready_list[i]
         return len(idxs)
 
+    async def remove_selected(self, idxs: list[int]):
+        removed = await self.remove(idxs, remove_in_dp=False)
+        return removed, [{} for _ in idxs]
+
 
 def _run(coro):
     return asyncio.run(coro)
@@ -257,10 +261,11 @@ class TestWindowedSelect:
         buf.add("b", weight=5)  # current
         buf.add("c", weight=1)  # below window (5-2=3)
         s = WindowedSampler(buf, max_staleness_versions=2)
-        meta, n = _run(
+        meta, n, rollout_metrics = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
         )
         assert n == 2  # a(3) and b(5); c(1) excluded
+        assert rollout_metrics == [{}, {}]
         assert len(buf.start_weight_list) == 1  # only c remains
 
     def test_below_min_returns_none(self):
@@ -269,7 +274,7 @@ class TestWindowedSelect:
         s = WindowedSampler(buf, max_staleness_versions=2)
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=2, max_prompt_groups=8)
-        ) == (None, 0)
+        ) == (None, 0, [])
 
     def test_unready_excluded(self):
         buf = FakeBuffer()
@@ -277,14 +282,14 @@ class TestWindowedSelect:
         s = WindowedSampler(buf, max_staleness_versions=2)
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
-        ) == (None, 0)
+        ) == (None, 0, [])
 
     def test_freshest_first_orders_by_lag(self):
         buf = FakeBuffer()
         buf.add("old", weight=1)
         buf.add("new", weight=5)
         s = WindowedSampler(buf, max_staleness_versions=10, sample_freshest_first=True)
-        meta, n = _run(
+        meta, n, _ = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1)
         )
         # freshest (weight 5) picked first -> "old" (weight 1) remains.
@@ -299,7 +304,7 @@ class TestWeightFifoSelect:
         buf.add("new", weight=5)
         buf.add("old2", weight=3)
         s = WeightFifoSampler(buf, max_staleness_versions=5)
-        meta, n = _run(
+        meta, n, _ = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
         )
         assert n == 2  # both weight-3 groups; weight-5 waits its turn
@@ -313,7 +318,7 @@ class TestWeightFifoSelect:
         # ahead to a newer weight.
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=2, max_prompt_groups=8)
-        ) == (None, 0)
+        ) == (None, 0, [])
 
     def test_empty_window_returns_none(self):
         buf = FakeBuffer()
@@ -321,7 +326,7 @@ class TestWeightFifoSelect:
         s = WeightFifoSampler(buf, max_staleness_versions=2)
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
-        ) == (None, 0)
+        ) == (None, 0, [])
 
 
 class TestReadyFirstSelect:
@@ -333,7 +338,7 @@ class TestReadyFirstSelect:
         buf.add("future", weight=4)
         s = ReadyFirstSampler(buf, max_staleness_versions=1)
 
-        meta, n = _run(
+        meta, n, _ = _run(
             s.select(current_train_weight=3, min_prompt_groups=3, max_prompt_groups=3)
         )
 
@@ -348,7 +353,7 @@ class TestReadyFirstSelect:
         s = ReadyFirstSampler(buf, max_staleness_versions=1)
 
         assert _run(s.evict(current_train_weight=5)) == 0
-        meta, n = _run(
+        meta, n, _ = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1)
         )
 
@@ -364,7 +369,7 @@ class TestInOrderSelect:
         # weight far outside any window, but target_step == trainer version.
         buf.add("g", weight=100, target_step=5)
         s = InOrderSampler(buf, max_lookahead_versions=1)
-        meta, n = _run(
+        meta, n, _ = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
         )
         assert n == 1
@@ -375,7 +380,7 @@ class TestInOrderSelect:
         s = InOrderSampler(buf, max_lookahead_versions=1)
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
-        ) == (None, 0)
+        ) == (None, 0, [])
 
 
 class TestDefaultEvictSkipsUnready:

@@ -20,6 +20,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
+from nemo_rl.algorithms.grpo import (
+    RewardPenaltyConfig,
+    RewardPenaltyTokenIdsConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     GRPOConfig,
@@ -126,6 +131,81 @@ def _full_master_config(*, env: dict, max_inflight_prompts: int) -> MasterConfig
         env=env,
         checkpointing={"enabled": False, "metric_name": None},
     )
+
+
+@pytest.mark.parametrize(
+    "penalty_config",
+    [
+        RewardPenaltyConfig(penalize_duplicated_reasoning=True),
+        RewardPenaltyConfig(penalize_empty_final_answer=True),
+        RewardPenaltyConfig(
+            penalize_unwanted_tokens=True,
+            token_ids=RewardPenaltyTokenIdsConfig(unwanted=[1]),
+        ),
+        RewardPenaltyConfig(penalize_malformed_think_tag=True),
+    ],
+)
+def test_single_controller_rejects_native_reward_penalties(
+    penalty_config: RewardPenaltyConfig,
+) -> None:
+    master_config = _full_master_config(
+        env={"should_use_nemo_gym": False},
+        max_inflight_prompts=2,
+    )
+    master_config.reward_penalties = penalty_config
+
+    with pytest.raises(ValueError, match="reward_penalties require the NeMo-Gym path"):
+        validate_single_controller_config(master_config)
+
+
+def test_single_controller_accepts_nemo_gym_reward_penalties() -> None:
+    master_config = _full_master_config(
+        env=_gym_env({"max_concurrency": 64}),
+        max_inflight_prompts=2,
+    )
+    master_config.reward_penalties = RewardPenaltyConfig(
+        penalize_empty_final_answer=True
+    )
+
+    validate_single_controller_config(master_config)
+
+
+def test_single_controller_rejects_native_message_level_advantage_penalty() -> None:
+    master_config = _full_master_config(
+        env={"should_use_nemo_gym": False},
+        max_inflight_prompts=2,
+    )
+    master_config.grpo.invalid_tool_call_advantage = -5.0
+
+    with pytest.raises(ValueError, match="invalid_tool_call_advantage.*NeMo-Gym"):
+        validate_single_controller_config(master_config)
+
+
+def test_single_controller_rejects_dynamic_sampling() -> None:
+    master_config = _full_master_config(
+        env=_gym_env({"max_concurrency": 64}),
+        max_inflight_prompts=2,
+    )
+    master_config.grpo.use_dynamic_sampling = True
+
+    with pytest.raises(ValueError, match="does not support.*dynamic_sampling"):
+        validate_single_controller_config(master_config)
+
+
+def test_single_controller_rejects_gdpo_without_reward_component_payload() -> None:
+    master_config = _full_master_config(
+        env=_gym_env({"max_concurrency": 64}),
+        max_inflight_prompts=2,
+    )
+    master_config.grpo.adv_estimator = AdvEstimatorConfig(name="gdpo")
+
+    with pytest.raises(ValueError, match="does not support the GDPO"):
+        validate_single_controller_config(master_config)
+
+
+def test_reward_penalty_config_rejects_unknown_enabled_flag() -> None:
+    with pytest.raises(ValueError, match="unsupported enabled reward penalty"):
+        RewardPenaltyConfig(penalize_empty_final_answers=True)
 
 
 class TestGymActorConcurrencyIsReachedFromTheEntryPoint:

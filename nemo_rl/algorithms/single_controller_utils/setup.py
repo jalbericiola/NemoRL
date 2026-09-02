@@ -34,7 +34,10 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    TQReplayBuffer,
+    build_rollout_reward_semantics_fingerprint,
+)
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     _create_advantage_estimator,
@@ -67,7 +70,12 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutTimeouts,
 )
-from nemo_rl.experience.rollouts import should_mask_flagged_samples
+from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
+    get_nemo_gym_thinking_tags,
+    resolve_reward_penalty_config,
+    should_mask_flagged_samples,
+)
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -792,6 +800,35 @@ def setup_single_controller(
     loss_fn: LossFunction = ClippedPGLossFn(master_config.loss_fn)
 
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+    mask_env_flagged_samples = should_mask_flagged_samples(master_config.env)
+    nemo_gym_config = master_config.env.get("nemo_gym")
+    effort_config_data = (
+        nemo_gym_config.get("effort_levels")
+        if use_nemo_gym and isinstance(nemo_gym_config, dict)
+        else None
+    )
+    effort_config = (
+        EffortLevelsConfig.model_validate(effort_config_data)
+        if effort_config_data is not None
+        else None
+    )
+    thinking_tags = get_nemo_gym_thinking_tags(master_config.env)
+    resolved_reward_penalty_config = resolve_reward_penalty_config(
+        master_config.reward_penalties,
+        tokenizer,
+        thinking_tags=thinking_tags,
+    )
+    rollout_reward_semantics_fingerprint = build_rollout_reward_semantics_fingerprint(
+        use_nemo_gym=use_nemo_gym,
+        effort_config=(
+            effort_config.model_dump(mode="json") if effort_config is not None else None
+        ),
+        reward_penalty_config=resolved_reward_penalty_config or {},
+        mask_env_flagged_samples=mask_env_flagged_samples,
+        thinking_tags=thinking_tags,
+        invalid_tool_call_advantage=grpo_config.invalid_tool_call_advantage,
+        malformed_thinking_advantage=grpo_config.malformed_thinking_advantage,
+    )
     tq_buffer = TQReplayBuffer(
         dp_client,
         partition_id=partition_id,
@@ -800,6 +837,14 @@ def setup_single_controller(
         include_shared_prefix_metadata=(
             get_shared_prefix_training_config(policy_config).mode != "disabled"
         ),
+        include_reward_processing_metadata=(
+            grpo_config.reward_shaping.enabled or grpo_config.overlong_filtering
+        ),
+        include_message_advantage_metadata=(
+            grpo_config.invalid_tool_call_advantage is not None
+            or grpo_config.malformed_thinking_advantage is not None
+        ),
+        rollout_reward_semantics_fingerprint=rollout_reward_semantics_fingerprint,
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
@@ -810,7 +855,10 @@ def setup_single_controller(
         policy_generation=generation,
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
-        mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
+        mask_env_flagged_samples=mask_env_flagged_samples,
+        effort_config=effort_config,
+        reward_penalty_config=resolved_reward_penalty_config,
+        thinking_tags=thinking_tags,
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
             rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,

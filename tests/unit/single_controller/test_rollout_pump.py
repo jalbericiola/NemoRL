@@ -25,7 +25,10 @@ import pytest
 import ray
 import torch
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    TQReplayBuffer,
+    build_rollout_reward_semantics_fingerprint,
+)
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
     WeightFifoSampler,
@@ -62,6 +65,16 @@ from tests.unit.single_controller._dp_fakes import (
     _TQActor,
 )
 
+_TEST_ROLLOUT_REWARD_SEMANTICS_FINGERPRINT = build_rollout_reward_semantics_fingerprint(
+    use_nemo_gym=False,
+    effort_config=None,
+    reward_penalty_config={},
+    mask_env_flagged_samples=True,
+    thinking_tags=["<think>", "</think>"],
+    invalid_tool_call_advantage=None,
+    malformed_thinking_advantage=None,
+)
+
 
 def _failure_cfg(
     *,
@@ -91,6 +104,10 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
     ctrl._replacement_reserve = deque()
+    ctrl._rollout_admission_permitted = asyncio.Event()
+    ctrl._rollout_admission_permitted.set()
+    ctrl._rollout_admission_idle = asyncio.Event()
+    ctrl._rollout_admission_idle.set()
 
 
 class _RecordingBuffer:
@@ -187,6 +204,49 @@ def test_rollout_pump_stamps_target_steps(
 
     assert buffer.target_step_list == expected_target_steps
     assert ctrl._rollout_exhausted.is_set()
+
+
+def test_checkpoint_admission_gate_stops_before_dataloader_advance() -> None:
+    class _CountingDataloader:
+        def __init__(self, batch: BatchedDataDict) -> None:
+            self._batch = batch
+            self._yielded = False
+            self.next_calls = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.next_calls += 1
+            if self._yielded:
+                raise StopIteration
+            self._yielded = True
+            return self._batch
+
+    async def _main() -> None:
+        buffer = _RecordingBuffer()
+        dataloader = _CountingDataloader(_batch("prompt"))
+        ctrl = _pump_controller(
+            _RecordingRolloutManager(buffer),
+            dataloader,  # type: ignore[arg-type]
+            buffer=buffer,
+        )
+        ctrl._rollout_admission_permitted.clear()
+
+        pump = asyncio.create_task(ctrl._rollout_pump())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert dataloader.next_calls == 0
+        assert ctrl._rollout_admission_idle.is_set()
+
+        ctrl._rollout_admission_permitted.set()
+        await asyncio.wait_for(pump, timeout=1.0)
+
+        assert dataloader.next_calls == 2  # one batch, then StopIteration
+        assert buffer.target_step_list == [0]
+
+    asyncio.run(_main())
 
 
 @pytest.mark.parametrize(
@@ -1036,6 +1096,9 @@ def test_rollout_pump_writes_expected_tq_data(
         dp_adapter,
         partition_id=_PARTITION_ID,
         pad_value_dict={"token_ids": int(tokenizer.pad_token_id or 0)},
+        rollout_reward_semantics_fingerprint=(
+            _TEST_ROLLOUT_REWARD_SEMANTICS_FINGERPRINT
+        ),
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,

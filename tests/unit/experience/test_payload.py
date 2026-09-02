@@ -24,6 +24,16 @@ from nemo_rl.data.packing.shared_prefix_metadata import (
 )
 from nemo_rl.data_plane.codec import materialize
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.interfaces import (
+    GENERATED_ASSISTANT_MESSAGE_COUNT,
+    INVALID_AND_MALFORMED_MESSAGE_COUNT,
+    INVALID_TOOL_CALL_MESSAGE_COUNT,
+    INVALID_TOOL_CALL_TOKEN_MASK,
+    MALFORMED_THINKING_MESSAGE_COUNT,
+    MALFORMED_THINKING_TOKEN_MASK,
+    RESPONSE_TOKEN_LENGTHS,
+    ROLLOUT_TRUNCATED,
+)
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
 
@@ -89,8 +99,59 @@ def _record(completions: list[Completion]) -> PromptGroupRecord:
             }
         ],
         extra_env_info=None,
-        metadata={"task_name": "test"},
+        metadata={"task_name": "test", "loss_multiplier": 1.0},
         completions=completions,
+        rollout_metrics={},
+    )
+
+
+def _assistant_history_record(
+    *, history_has_logprobs: bool = False
+) -> PromptGroupRecord:
+    prompt_messages = [
+        {
+            "role": "user",
+            "content": "first question",
+            "token_ids": torch.tensor([10]),
+            "routed_experts": _routes(10, 1),
+        },
+        {
+            "role": "assistant",
+            "content": "answer in prompt history",
+            "token_ids": torch.tensor([11, 12, 13]),
+            "routed_experts": _routes(11, 3),
+        },
+        {
+            "role": "user",
+            "content": "follow-up question",
+            "token_ids": torch.tensor([14, 15]),
+            "routed_experts": _routes(14, 2),
+        },
+    ]
+    if history_has_logprobs:
+        # Reconstructed message logs may carry synthetic zero logprobs on prompt
+        # assistants; the prompt boundary must still keep this turn loss-masked.
+        prompt_messages[1]["generation_logprobs"] = torch.zeros(3)
+    generated = {
+        "role": "assistant",
+        "content": "new response",
+        "token_ids": torch.tensor([20, 21]),
+        "generation_logprobs": torch.tensor([-0.1, -0.2]),
+        "routed_experts": _routes(20, 2),
+        "is_invalid_tool_call": True,
+    }
+    completion = Completion(
+        message_log=[*prompt_messages, generated],
+        env_extras=None,
+        truncated=False,
+        reward=1.0,
+    )
+    return PromptGroupRecord(
+        prompt_idx=0,
+        prompt=[dict(message) for message in prompt_messages],
+        extra_env_info=None,
+        metadata={"task_name": "test", "loss_multiplier": 1.0},
+        completions=[completion],
         rollout_metrics={},
     )
 
@@ -157,6 +218,169 @@ def test_record_to_train_batch_omits_routed_experts_when_absent() -> None:
         group_id="group",
     )
     assert "routed_experts" not in fields
+
+
+def test_reward_processing_payload_preserves_masks_counts_and_loss_gate() -> None:
+    completion = _completion(route_start=10, reward=1.0)
+    assistant = completion.message_log[1]
+    assistant["is_invalid_tool_call"] = True
+    assistant["has_malformed_thinking"] = True
+    completion.env_extras = {"instance_config": {"mask_sample": True}}
+    completion.env_masked = True
+    completion.truncated = True
+    record = _record([completion])
+    record.metadata["loss_multiplier"] = 0.5
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_reward_processing_metadata=True,
+        include_message_advantage_metadata=True,
+    )
+
+    assert train_batch["sample_mask"].tolist() == [0.0]
+    assert train_batch[ROLLOUT_TRUNCATED].tolist() == [True]
+    assert train_batch[RESPONSE_TOKEN_LENGTHS].tolist() == [2]
+    assert train_batch[GENERATED_ASSISTANT_MESSAGE_COUNT].tolist() == [1]
+    assert train_batch[INVALID_TOOL_CALL_MESSAGE_COUNT].tolist() == [1]
+    assert train_batch[MALFORMED_THINKING_MESSAGE_COUNT].tolist() == [1]
+    assert train_batch[INVALID_AND_MALFORMED_MESSAGE_COUNT].tolist() == [1]
+    assert train_batch[INVALID_TOOL_CALL_TOKEN_MASK][0, :5].tolist() == [
+        False,
+        False,
+        True,
+        True,
+        False,
+    ]
+    assert train_batch[MALFORMED_THINKING_TOKEN_MASK][0, :5].tolist() == [
+        False,
+        False,
+        True,
+        True,
+        False,
+    ]
+
+    _, fields, _ = pack_payload(
+        train_batch,
+        weight_version=3,
+        group_id="group",
+    )
+    assert fields[INVALID_TOOL_CALL_TOKEN_MASK].is_nested
+    assert fields[MALFORMED_THINKING_TOKEN_MASK].is_nested
+
+
+def test_response_length_and_masks_skip_assistant_prompt_history() -> None:
+    record = _assistant_history_record(history_has_logprobs=True)
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_reward_processing_metadata=True,
+        include_message_advantage_metadata=True,
+    )
+
+    assert train_batch[RESPONSE_TOKEN_LENGTHS].tolist() == [2]
+    assert train_batch[GENERATED_ASSISTANT_MESSAGE_COUNT].tolist() == [1]
+    assert train_batch[INVALID_TOOL_CALL_MESSAGE_COUNT].tolist() == [1]
+    assert train_batch["token_mask"][0, :8].tolist() == [0, 0, 0, 0, 0, 0, 1, 1]
+    assert train_batch[INVALID_TOOL_CALL_TOKEN_MASK][0, :8].tolist() == [
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+        True,
+    ]
+
+
+def test_record_to_train_batch_is_idempotent_and_does_not_mutate_record() -> None:
+    record = _assistant_history_record()
+
+    kwargs = {
+        "pad_value_dict": {"token_ids": 0, "input_ids": 0},
+        "include_reward_processing_metadata": True,
+        "include_message_advantage_metadata": True,
+    }
+    first = record_to_train_batch(record, **kwargs)
+    second = record_to_train_batch(record, **kwargs)
+
+    assert set(first) == set(second)
+    for key in first:
+        assert torch.equal(first[key], second[key]), key
+    assert all(
+        "token_loss_mask" not in message
+        for message in record.completions[0].message_log
+    )
+    assert "generation_logprobs" not in record.completions[0].message_log[1]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("is_invalid_tool_call", 1),
+        ("has_malformed_thinking", "false"),
+        ("is_invalid_tool_call", torch.tensor(True)),
+    ],
+)
+def test_message_detector_flags_require_bool(field: str, value: object) -> None:
+    completion = _completion(route_start=10, reward=1.0)
+    completion.message_log[1][field] = value
+
+    with pytest.raises(TypeError, match=rf"message\.{field} must be a bool"):
+        record_to_train_batch(
+            _record([completion]),
+            pad_value_dict={"token_ids": 0, "input_ids": 0},
+            include_message_advantage_metadata=True,
+        )
+
+
+@pytest.mark.parametrize("value", [1, "false", torch.tensor(False)])
+def test_completion_env_masked_requires_bool(value: object) -> None:
+    completion = _completion(route_start=10, reward=1.0)
+    completion.env_masked = value  # type: ignore[assignment]
+
+    with pytest.raises(TypeError, match=r"Completion\.env_masked must be a bool"):
+        record_to_train_batch(
+            _record([completion]),
+            pad_value_dict={"token_ids": 0, "input_ids": 0},
+        )
+
+
+def test_native_env_extras_cannot_implicitly_mask_sample() -> None:
+    completion = _completion(route_start=10, reward=1.0)
+    completion.env_extras = {"instance_config": {"mask_sample": True}}
+
+    train_batch = record_to_train_batch(
+        _record([completion]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+
+    assert train_batch["sample_mask"].tolist() == [1.0]
+
+
+def test_record_to_train_batch_requires_loss_multiplier() -> None:
+    record = _record([_completion(route_start=10, reward=1.0)])
+    record.metadata.pop("loss_multiplier")
+
+    with pytest.raises(ValueError, match="requires loss_multiplier"):
+        record_to_train_batch(
+            record,
+            pad_value_dict={"token_ids": 0, "input_ids": 0},
+        )
+
+
+def test_record_to_train_batch_preserves_base_loss_multiplier() -> None:
+    record = _record([_completion(route_start=10, reward=1.0)])
+    record.metadata["loss_multiplier"] = 0.25
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+
+    assert train_batch["sample_mask"].tolist() == [0.25]
 
 
 def test_shared_prefix_payload_metadata_is_explicitly_opt_in() -> None:
