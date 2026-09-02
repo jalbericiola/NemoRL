@@ -1,0 +1,21 @@
+# =============================================================================
+# Nemotron 3.5 Nano — strict live citation-format shared-prefix A/B overlay
+# =============================================================================
+defaults: single_env_reasoning_gym_sc.yaml
+
+policy:
+  max_total_sequence_length: 4096
+  logprob_chunk_size: 512
+  sequence_packing:
+    # Preserve the full K=4 cohort even at the configured sequence ceiling.
+    train_mb_tokens: 16384
+    logprob_mb_tokens: 16384
+  generation:
+    vllm_cfg:
+      max_model_len: 4096
+
+env:
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/format_verification/configs/citation_format.yaml

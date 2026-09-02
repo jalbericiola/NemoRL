@@ -91,8 +91,191 @@ set -euo pipefail
 # =============================================================================
 # Recipe selection
 # =============================================================================
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/../../..")"
+_NANO35_SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+case "${_NANO35_SCRIPT_SOURCE}" in
+  /*) _NANO35_SCRIPT_ABSOLUTE="${_NANO35_SCRIPT_SOURCE}" ;;
+  */*) _NANO35_SCRIPT_ABSOLUTE="${PWD}/${_NANO35_SCRIPT_SOURCE}" ;;
+  *) _NANO35_SCRIPT_ABSOLUTE="${PWD}/${_NANO35_SCRIPT_SOURCE}" ;;
+esac
+_NANO35_SCRIPT_DIR_RAW="${_NANO35_SCRIPT_ABSOLUTE%/*}"
+STRICT_PAIR_HOST_RUNTIME=0
+if [[ -n "${STRICT_PREBUILT_SNAPSHOT_DIR:-}" ]]; then
+  if [[ "$-" != *p* ]]; then
+    echo "ERROR: strict prebuilt mode requires privileged Bash (-p)." >&2
+    exit 2
+  fi
+  while IFS= read -r _nano35_environment_name; do
+    case "${_nano35_environment_name}" in
+      BASH_ENV|ENV|BASHOPTS|SHELLOPTS|BASH_COMPAT|CDPATH|GLOBIGNORE|BASH_XTRACEFD|\
+      PYTHON*|GIT_*|LD_*|DYLD_*|BASH_FUNC_*%%)
+        echo "ERROR: hostile startup environment variable must be unset: ${_nano35_environment_name}" >&2
+        exit 2
+        ;;
+    esac
+  done < <(builtin compgen -e)
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin
+  IFS=$' \t\n'
+  LC_ALL=C
+  export PATH LC_ALL
+  unset CDPATH GLOBIGNORE BASH_XTRACEFD
+  hash -r
+  umask 077
+
+  : "${EXPECTED_STRICT_PAIR_BOOTSTRAP_SHA256SUM_SHA256:?strict prebuilt mode requires bootstrap SHA-256}"
+  : "${EXPECTED_STRICT_PREBUILT_SNAPSHOT_MANIFEST_SHA256:?strict prebuilt mode requires snapshot-manifest SHA-256}"
+  if [[ -f /usr/bin/sha256sum && ! -L /usr/bin/sha256sum && \
+        -x /usr/bin/sha256sum && ! -w /usr/bin/sha256sum ]]; then
+    _NANO35_BOOTSTRAP_SHA256SUM=/usr/bin/sha256sum
+  elif [[ -f /sbin/sha256sum && ! -L /sbin/sha256sum && \
+          -x /sbin/sha256sum && ! -w /sbin/sha256sum ]]; then
+    _NANO35_BOOTSTRAP_SHA256SUM=/sbin/sha256sum
+  else
+    echo "ERROR: no supported fixed bootstrap sha256sum is available." >&2
+    exit 2
+  fi
+  if ! _nano35_hash_output="$(
+    "${_NANO35_BOOTSTRAP_SHA256SUM}" -- "${_NANO35_BOOTSTRAP_SHA256SUM}"
+  )"; then
+    echo "ERROR: bootstrap sha256sum failed while authenticating itself." >&2
+    exit 2
+  fi
+  _nano35_actual_sha256="${_nano35_hash_output%% *}"
+  if [[ "${_nano35_actual_sha256}" != \
+        "${EXPECTED_STRICT_PAIR_BOOTSTRAP_SHA256SUM_SHA256}" ]]; then
+    echo "ERROR: bootstrap sha256sum SHA-256 mismatch." >&2
+    exit 2
+  fi
+
+  _nano35_expected_launcher="${STRICT_PREBUILT_SNAPSHOT_DIR}/examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh"
+  _nano35_contract="${STRICT_PREBUILT_SNAPSHOT_DIR}/examples/nemo_gym/nemotron-3.5-nano/strict_pair_contract.sh"
+  _nano35_snapshot_manifest="${STRICT_PREBUILT_SNAPSHOT_DIR}/strict-pair-snapshot-manifest.sha256"
+  if [[ "${BASH_SOURCE[0]}" != "${_nano35_expected_launcher}" ]]; then
+    echo "ERROR: strict prebuilt launcher must be the exact authenticated snapshot path." >&2
+    exit 2
+  fi
+  for _nano35_guard_path in "${BASH_SOURCE[0]}" "${_nano35_contract}" \
+                            "${_nano35_snapshot_manifest}"; do
+    if [[ -L "${_nano35_guard_path}" || ! -f "${_nano35_guard_path}" || \
+          -w "${_nano35_guard_path}" ]]; then
+      echo "ERROR: strict prebuilt startup input must be regular, non-symlink, and sealed: ${_nano35_guard_path}" >&2
+      exit 2
+    fi
+  done
+  if [[ ! -x "${BASH_SOURCE[0]}" || ! -x "${_nano35_contract}" ]]; then
+    echo "ERROR: strict prebuilt launcher and contract must be executable." >&2
+    exit 2
+  fi
+  if ! _nano35_hash_output="$(
+    "${_NANO35_BOOTSTRAP_SHA256SUM}" -- "${_nano35_snapshot_manifest}"
+  )"; then
+    echo "ERROR: bootstrap sha256sum failed for strict snapshot manifest." >&2
+    exit 2
+  fi
+  _nano35_actual_sha256="${_nano35_hash_output%% *}"
+  if [[ "${_nano35_actual_sha256}" != \
+        "${EXPECTED_STRICT_PREBUILT_SNAPSHOT_MANIFEST_SHA256}" ]]; then
+    echo "ERROR: strict prebuilt snapshot manifest SHA-256 mismatch before source." >&2
+    exit 2
+  fi
+  _nano35_launcher_manifest_sha256=""
+  _nano35_contract_manifest_sha256=""
+  while IFS= read -r _nano35_manifest_line; do
+    _nano35_manifest_sha256="${_nano35_manifest_line%%  *}"
+    _nano35_manifest_path="${_nano35_manifest_line#*  }"
+    case "${_nano35_manifest_path}" in
+      examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh)
+        [[ -z "${_nano35_launcher_manifest_sha256}" ]] || {
+          echo "ERROR: duplicate nano35 launcher snapshot-manifest entry." >&2
+          exit 2
+        }
+        _nano35_launcher_manifest_sha256="${_nano35_manifest_sha256}"
+        ;;
+      examples/nemo_gym/nemotron-3.5-nano/strict_pair_contract.sh)
+        [[ -z "${_nano35_contract_manifest_sha256}" ]] || {
+          echo "ERROR: duplicate strict contract snapshot-manifest entry." >&2
+          exit 2
+        }
+        _nano35_contract_manifest_sha256="${_nano35_manifest_sha256}"
+        ;;
+    esac
+  done < "${_nano35_snapshot_manifest}"
+  for _nano35_guard_record in \
+    "${BASH_SOURCE[0]}:${_nano35_launcher_manifest_sha256}:launcher" \
+    "${_nano35_contract}:${_nano35_contract_manifest_sha256}:contract"; do
+    _nano35_guard_path="${_nano35_guard_record%%:*}"
+    _nano35_guard_rest="${_nano35_guard_record#*:}"
+    _nano35_expected_sha256="${_nano35_guard_rest%%:*}"
+    _nano35_guard_label="${_nano35_guard_rest#*:}"
+    if ! _nano35_hash_output="$(
+      "${_NANO35_BOOTSTRAP_SHA256SUM}" -- "${_nano35_guard_path}"
+    )"; then
+      echo "ERROR: bootstrap sha256sum failed for strict ${_nano35_guard_label}." >&2
+      exit 2
+    fi
+    _nano35_actual_sha256="${_nano35_hash_output%% *}"
+    if [[ -z "${_nano35_expected_sha256}" || \
+          "${_nano35_actual_sha256}" != "${_nano35_expected_sha256}" ]]; then
+      echo "ERROR: strict ${_nano35_guard_label} is absent or drifted before source." >&2
+      exit 2
+    fi
+  done
+
+  # The parent arm anchored the complete snapshot. Re-authenticate the exact
+  # launcher and sibling contract before sourcing any snapshot-owned shell.
+  # shellcheck source=strict_pair_contract.sh
+  source "${_nano35_contract}"
+  strict_pair_load_runtime_tools
+  STRICT_PAIR_HOST_RUNTIME=1
+  STRICT_PAIR_PREPARE_SLURM_EXPORT="${STRICT_PAIR_PREPARE_SLURM_EXPORT:-0}"
+  case "${STRICT_PAIR_PREPARE_SLURM_EXPORT}" in
+    0|1) ;;
+    *)
+      echo "ERROR: STRICT_PAIR_PREPARE_SLURM_EXPORT must be parent-owned 0 or 1." >&2
+      exit 2
+      ;;
+  esac
+  NANO35_REALPATH="${STRICT_PAIR_TOOL_REALPATH}"
+  NANO35_SHA256SUM="${STRICT_PAIR_TOOL_SHA256SUM}"
+  NANO35_PYTHON="${STRICT_PAIR_TOOL_PYTHON}"
+  NANO35_STAT="${STRICT_PAIR_TOOL_STAT}"
+  NANO35_FIND="${STRICT_PAIR_TOOL_FIND}"
+  NANO35_SBATCH="${STRICT_PAIR_TOOL_SBATCH}"
+  NANO35_ENV="${STRICT_PAIR_TOOL_ENV}"
+  NANO35_DATE="${STRICT_PAIR_TOOL_DATE}"
+  NANO35_GREP="${STRICT_PAIR_TOOL_GREP}"
+  NANO35_LN="${STRICT_PAIR_TOOL_LN}"
+  NANO35_MKDIR="${STRICT_PAIR_TOOL_MKDIR}"
+  NANO35_MKTEMP="${STRICT_PAIR_TOOL_MKTEMP}"
+  NANO35_CHMOD="${STRICT_PAIR_TOOL_CHMOD}"
+  NANO35_RM="${STRICT_PAIR_TOOL_RM}"
+  unset _NANO35_BOOTSTRAP_SHA256SUM _nano35_actual_sha256 \
+    _nano35_contract _nano35_contract_manifest_sha256 \
+    _nano35_environment_name _nano35_expected_launcher \
+    _nano35_expected_sha256 _nano35_guard_label _nano35_guard_path \
+    _nano35_guard_record _nano35_guard_rest _nano35_hash_output \
+    _nano35_launcher_manifest_sha256 _nano35_manifest_line \
+    _nano35_manifest_path _nano35_manifest_sha256 \
+    _nano35_snapshot_manifest
+else
+  STRICT_PAIR_PREPARE_SLURM_EXPORT=0
+  NANO35_REALPATH=realpath
+  NANO35_SHA256SUM=sha256sum
+  NANO35_PYTHON=python3
+  NANO35_STAT=stat
+  NANO35_FIND=find
+  NANO35_SBATCH=sbatch
+  NANO35_ENV=env
+  NANO35_DATE=date
+  NANO35_GREP=grep
+  NANO35_LN=ln
+  NANO35_MKDIR=mkdir
+  NANO35_MKTEMP=mktemp
+  NANO35_CHMOD=chmod
+  NANO35_RM=rm
+fi
+SCRIPT_DIR="$(cd -- "${_NANO35_SCRIPT_DIR_RAW}" && pwd -P)"
+PROJECT_ROOT="$("${NANO35_REALPATH}" "${SCRIPT_DIR}/../../..")"
+unset _NANO35_SCRIPT_ABSOLUTE _NANO35_SCRIPT_DIR_RAW _NANO35_SCRIPT_SOURCE
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: bash ${BASH_SOURCE[0]} <swe|rlvr> [Hydra overrides ...]" >&2
@@ -191,6 +374,39 @@ TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
 : "${PERSISTENT_CACHE:?PERSISTENT_CACHE is required (shared directory for vLLM/Triton/Inductor caches)}"
 : "${SLURM_PARTITION:?SLURM_PARTITION is required}"
 : "${SLURM_ACCOUNT:?SLURM_ACCOUNT is required}"
+if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
+  STRICT_PAIR_EXPECTED_WANDB_NAME="${STRICT_PAIR_ARM}-${STRICT_PAIR_ENVIRONMENT}-${PAIR_ID}"
+  STRICT_PAIR_EXPECTED_WANDB_GROUP="${STRICT_PAIR_ENVIRONMENT}-${PAIR_ID}"
+  STRICT_PAIR_EXPECTED_WANDB_RUN_ID="$(
+    strict_pair_sha256_text \
+      "nemo-rl-strict-wandb-v1:${STRICT_PAIR_ENVIRONMENT}:${PAIR_ID}:${STRICT_PAIR_ARM}"
+  )"
+  if [[ "${BASE_LOG_DIR:-}" != "${RESULTS_DIR}/ray_logs" || \
+        "${CPUS_PER_WORKER:-}" != "144" || \
+        "${HF_HUB_CACHE:-}" != "${HF_HOME}/hub" || \
+        "${HF_DATASETS_CACHE:-}" != "${HF_HOME}/hub" || \
+        "${SANDBOX_COMMAND:-}" != "/start-with-nginx.sh" || \
+        "${NEMO_SKILLS_SANDBOX_PORT:-}" != "6000" || \
+        "${RAY_LOG_SYNC_FREQUENCY:-}" != "60" || \
+        "${VAL_PATH}" != "${TRAIN_PATH}" ]]; then
+    echo "ERROR: strict execution controls differ from the closed pair contract." >&2
+    exit 2
+  fi
+  if [[ "${EXP_NAME}" != "${STRICT_PAIR_EXPECTED_WANDB_NAME}" || \
+        "${WANDB_NAME:-}" != "${STRICT_PAIR_EXPECTED_WANDB_NAME}" || \
+        "${WANDB_ENTITY:-}" != "nvidia" || \
+        "${WANDB_PROJ:-}" != "nano35-rlvr-convergence" || \
+        "${WANDB_RESUME:-}" != "never" || \
+        "${WANDB_RUN_GROUP:-}" != "${STRICT_PAIR_EXPECTED_WANDB_GROUP}" || \
+        "${WANDB_RUN_ID:-}" != "${STRICT_PAIR_EXPECTED_WANDB_RUN_ID}" ]]; then
+    echo "ERROR: strict W&B identity differs from the closed pair contract." >&2
+    exit 2
+  fi
+  if [[ -n "${SETUP_COMMAND+x}" || -n "${SLURM_SUBMIT_DIR+x}" ]]; then
+    echo "ERROR: SETUP_COMMAND and SLURM_SUBMIT_DIR must be unset before strict rendering." >&2
+    exit 2
+  fi
+fi
 cd "${PROJECT_ROOT}"
 
 # SingleController is outside the directories historically overlaid into the
@@ -204,9 +420,15 @@ SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST=""
 sha256_file() {
   local path="$1"
   local digest
-  local ignored
+  local output
 
-  if command -v sha256sum >/dev/null 2>&1; then
+  if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
+    if ! output="$("${NANO35_SHA256SUM}" -- "${path}")"; then
+      echo "ERROR: authenticated sha256sum failed for ${path}." >&2
+      return 1
+    fi
+    digest="${output%% *}"
+  elif command -v sha256sum >/dev/null 2>&1; then
     read -r digest ignored < <(sha256sum -- "${path}")
   elif command -v shasum >/dev/null 2>&1; then
     read -r digest ignored < <(shasum -a 256 -- "${path}")
@@ -269,7 +491,7 @@ fi
 # The SWE recipe interpolates `${sif_dir}/...` paths at runtime. The
 # exemplar config carries only a placeholder, so hard-require SIF_DIR whenever
 # the selected config actually uses it (mirrors the teacher-path guard).
-if grep -q '${sif_dir}' "${CONFIG_PATH}"; then
+if "${NANO35_GREP}" -q '${sif_dir}' "${CONFIG_PATH}"; then
   : "${SIF_DIR:?SIF_DIR is required for the SWE recipe (directory of apptainer .sif images)}"
 fi
 
@@ -288,11 +510,17 @@ RESULTS_DIR="${RESULTS_DIR:-results/${EXP_NAME}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RESULTS_DIR}/checkpoints}"
 
 # Per-submission dirs for logs and Slurm output (timestamped for history).
-RUN_DIR="${RESULTS_DIR}/runs/$(date +%Y%m%d-%H%M)"
+if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
+  RUN_DIR="${RESULTS_DIR}/runs/${PAIR_ID:?strict prebuilt mode requires PAIR_ID}"
+else
+  RUN_DIR="${RESULTS_DIR}/runs/$("${NANO35_DATE}" +%Y%m%d-%H%M)"
+fi
 LOG_DIR="${RUN_DIR}/logs"
 SLURM_LOG_DIR="${RUN_DIR}/slurm"
-mkdir -p "${CHECKPOINT_DIR}" "${LOG_DIR}" "${SLURM_LOG_DIR}"
-ln -sfn "$(realpath "${RUN_DIR}")" "${RESULTS_DIR}/runs/latest"
+if [[ "${STRICT_PAIR_PREPARE_SLURM_EXPORT}" != "1" ]]; then
+  "${NANO35_MKDIR}" -p "${CHECKPOINT_DIR}" "${LOG_DIR}" "${SLURM_LOG_DIR}"
+  "${NANO35_LN}" -sfn "$("${NANO35_REALPATH}" "${RUN_DIR}")" "${RESULTS_DIR}/runs/latest"
+fi
 
 # ray.sub reads BASE_LOG_DIR and creates $BASE_LOG_DIR/$SLURM_JOB_ID-logs/ for
 # ray infrastructure logs (ray-head.log, ray-driver.log, ray-worker-*.log,
@@ -307,6 +535,12 @@ SLURM_QOS="${SLURM_QOS:-}"
 SLURM_RESERVATION="${SLURM_RESERVATION:-}"
 EXCLUDE_NODES="${EXCLUDE_NODES:-}"
 SLURM_COMMENT="${SLURM_COMMENT:-}"
+if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" && \
+      "${STRICT_PAIR_PREPARE_SLURM_EXPORT}" != "1" ]]; then
+  : "${STRICT_PAIR_SUBMISSION_NONCE:?strict pair submission nonce is required}"
+  : "${EXPECTED_PAIR_MANIFEST_SHA256:?strict pair manifest SHA-256 is required}"
+  SLURM_COMMENT="nemo-rl-strict-pair-v1:${STRICT_PAIR_ARM}:${STRICT_PAIR_SUBMISSION_NONCE}:${EXPECTED_PAIR_MANIFEST_SHA256}"
+fi
 SLURM_COMMENT_ARGS=()
 if [[ -n "${SLURM_COMMENT}" ]]; then
   SLURM_COMMENT_ARGS=(--comment="${SLURM_COMMENT}")
@@ -402,6 +636,9 @@ if [[ -n "${WANDB_API_KEY:-}" ]]; then
   WANDB_ENABLED=True
   if [[ -n "${WANDB_ENTITY:-}" ]]; then
     export WANDB_ENTITY
+  fi
+  if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
+    export WANDB_NAME WANDB_RESUME WANDB_RUN_GROUP WANDB_RUN_ID
   fi
 else
   echo "[WARN] WANDB_API_KEY is not set — W&B logging will be disabled." >&2
@@ -601,14 +838,17 @@ export INDUCTOR_CACHE_DIR
 export TRITON_CACHE_DIR
 export CACHE_SYNC_FREQUENCY
 
-mkdir -p "${LUSTRE_FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
-  "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}" \
-  "${CACHE_READ_DIR}" "${CACHE_WRITE_DIR}"
+if [[ "${STRICT_PAIR_PREPARE_SLURM_EXPORT}" != "1" ]]; then
+  "${NANO35_MKDIR}" -p "${LUSTRE_FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" \
+    "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}" \
+    "${CACHE_READ_DIR}" "${CACHE_WRITE_DIR}"
+fi
 
 # Read path  : cache_read/*.tar.zst   — compute nodes extract tarballs (hundreds of concurrent reads)
 # Write path : cache_write/*/        — sidecar rsyncs individual files (one sequential writer)
 # Splitting reads (tarball) from writes (directory) avoids Lustre MDT invalidation storms
 # and lets rsync accumulate the union of all roles' kernels across jobs.
+if [[ "${STRICT_PAIR_HOST_RUNTIME}" != "1" ]]; then
 for _name in inductor_cache triton_cache; do
   _write_dir="${CACHE_WRITE_DIR}/${_name}"
   _old_dir="${PERSISTENT_CACHE}/${_name}"
@@ -667,6 +907,7 @@ done
 if (( _purge_count > 0 )); then
   echo "[CACHE] Purged ${_purge_count} redundant legacy vLLM cache directories from ${PERSISTENT_CACHE}/"
 fi
+fi
 
 # =============================================================================
 # Code snapshot
@@ -693,7 +934,7 @@ if [[ -n "${STRICT_PREBUILT_SNAPSHOT_DIR}" ]]; then
   if [[ "${STRICT_PREBUILT_SNAPSHOT_DIR}" != /* || \
         -L "${STRICT_PREBUILT_SNAPSHOT_DIR}" || \
         ! -d "${STRICT_PREBUILT_SNAPSHOT_DIR}" || \
-        "$(realpath -- "${STRICT_PREBUILT_SNAPSHOT_DIR}")" != "${STRICT_PREBUILT_SNAPSHOT_DIR}" ]]; then
+        "$("${NANO35_REALPATH}" -- "${STRICT_PREBUILT_SNAPSHOT_DIR}")" != "${STRICT_PREBUILT_SNAPSHOT_DIR}" ]]; then
     echo "ERROR: strict prebuilt snapshot must be one canonical, non-symlink directory: ${STRICT_PREBUILT_SNAPSHOT_DIR}" >&2
     exit 1
   fi
@@ -712,7 +953,7 @@ if [[ -n "${STRICT_PREBUILT_SNAPSHOT_DIR}" ]]; then
     exit 1
   fi
   if ! (cd -- "${STRICT_PREBUILT_SNAPSHOT_DIR}" && \
-        sha256sum --check --strict --quiet -- "${STRICT_PREBUILT_SNAPSHOT_MANIFEST_NAME}"); then
+        "${NANO35_SHA256SUM}" --check --strict --quiet -- "${STRICT_PREBUILT_SNAPSHOT_MANIFEST_NAME}"); then
     echo "ERROR: strict prebuilt snapshot content verification failed." >&2
     exit 1
   fi
@@ -725,7 +966,7 @@ if [[ -n "${STRICT_PREBUILT_SNAPSHOT_DIR}" ]]; then
     echo "ERROR: strict prebuilt snapshot inventory manifests must be regular, non-symlink files." >&2
     exit 1
   fi
-  if ! python3 -I -B - \
+  if ! "${NANO35_PYTHON}" -I -B - \
     "${STRICT_PREBUILT_SNAPSHOT_DIR}" \
     "${STRICT_PREBUILT_SNAPSHOT_MANIFEST}" \
     "${STRICT_PREBUILT_SNAPSHOT_SYMLINKS}" \
@@ -767,7 +1008,15 @@ if not isinstance(regular_file_executable, dict) or any(
 actual_regular = set()
 actual_symlinks = {}
 actual_executable = {}
-for directory, directory_names, file_names in os.walk(root, followlinks=False):
+
+
+def raise_walk_error(error: OSError) -> None:
+    raise error
+
+
+for directory, directory_names, file_names in os.walk(
+    root, onerror=raise_walk_error, followlinks=False
+):
     directory_names.sort()
     file_names.sort()
     for name in list(directory_names):
@@ -800,17 +1049,35 @@ PY
     exit 1
   fi
   writable_snapshot_path=""
+  strict_snapshot_find_inventory="$(
+    "${NANO35_MKTEMP}" "${RESULTS_DIR}/.strict-snapshot-find.XXXXXX"
+  )"
+  if ! "${NANO35_FIND}" "${STRICT_PREBUILT_SNAPSHOT_DIR}" \
+      \( -type d -o -type f \) -print0 > "${strict_snapshot_find_inventory}"; then
+    "${NANO35_RM}" -f -- "${strict_snapshot_find_inventory}"
+    echo "ERROR: strict prebuilt snapshot inventory enumeration failed." >&2
+    exit 1
+  fi
+  "${NANO35_CHMOD}" 400 "${strict_snapshot_find_inventory}"
+  strict_snapshot_find_sha256="$(sha256_file "${strict_snapshot_find_inventory}")"
   while IFS= read -r -d '' snapshot_path; do
-    if snapshot_mode="$(stat -c '%a' -- "${snapshot_path}" 2>/dev/null)"; then
+    if snapshot_mode="$("${NANO35_STAT}" -c '%a' -- "${snapshot_path}" 2>/dev/null)"; then
       :
     else
-      snapshot_mode="$(stat -f '%Lp' -- "${snapshot_path}")"
+      snapshot_mode="$("${NANO35_STAT}" -f '%Lp' -- "${snapshot_path}")"
     fi
     if (( (8#${snapshot_mode} & 8#222) != 0 )); then
       writable_snapshot_path="${snapshot_path}"
       break
     fi
-  done < <(find "${STRICT_PREBUILT_SNAPSHOT_DIR}" \( -type d -o -type f \) -print0)
+  done < "${strict_snapshot_find_inventory}"
+  if [[ "$(sha256_file "${strict_snapshot_find_inventory}")" != \
+        "${strict_snapshot_find_sha256}" ]]; then
+    "${NANO35_RM}" -f -- "${strict_snapshot_find_inventory}"
+    echo "ERROR: strict prebuilt snapshot inventory changed while consumed." >&2
+    exit 1
+  fi
+  "${NANO35_RM}" -f -- "${strict_snapshot_find_inventory}"
   if [[ -n "${writable_snapshot_path}" ]]; then
     echo "ERROR: strict prebuilt snapshot contains a writable path: ${writable_snapshot_path}" >&2
     exit 1
@@ -829,8 +1096,8 @@ elif [[ "${USE_SNAPSHOT}" == "1" ]]; then
   SNAPSHOT_DIR=$(bash "${PROJECT_ROOT}/tools/code_snapshot.sh" "${JOB_NAME}")
 
   if [[ -d "${PROJECT_ROOT}/3rdparty/vllm" ]] && [[ ! -e "${SNAPSHOT_DIR}/3rdparty/vllm" ]]; then
-    mkdir -p "${SNAPSHOT_DIR}/3rdparty"
-    ln -s "${PROJECT_ROOT}/3rdparty/vllm" "${SNAPSHOT_DIR}/3rdparty/vllm"
+    "${NANO35_MKDIR}" -p "${SNAPSHOT_DIR}/3rdparty"
+    "${NANO35_LN}" -s "${PROJECT_ROOT}/3rdparty/vllm" "${SNAPSHOT_DIR}/3rdparty/vllm"
   fi
 
   echo "Code snapshot: ${SNAPSHOT_DIR}"
@@ -959,17 +1226,26 @@ fi
 export RAY_SUB
 
 # =============================================================================
-# Per-node cache seeding (SETUP_COMMAND)
+# Per-node cache setup (SETUP_COMMAND)
 # =============================================================================
 # Triton, Inductor, and FlashInfer cubins compile/download to node-local /tmp to
 # avoid Lustre race conditions and file lock contention during concurrent JIT
-# compilation. To avoid cold-start penalties, we seed /tmp from a warm Lustre
-# cache before Ray starts.
+# compilation. Ordinary recipes may seed /tmp from a warm Lustre cache. Strict
+# pairs deliberately prohibit seed reads and start from cleared local caches.
 #
 # IMPORTANT: Stale /tmp caches from previous jobs can cause hangs (e.g. the
-# Triton bundler skipping non-empty temp dirs). We rm -rf /tmp caches first,
-# then seed fresh from Lustre.
+# Triton bundler skipping non-empty temp dirs). Every mode clears /tmp first;
+# only non-strict mode may then seed from Lustre.
 # =============================================================================
+if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
+read -r -d '' SETUP_COMMAND <<'SETUPEOF' || true
+echo "[CACHE SETUP] Clearing stale node-local caches; strict pairs forbid cache seeds."
+rm -rf /tmp/nemo_rl_vllm_cache /tmp/nemo_rl_vllm_cache_* \
+  /tmp/nemo_rl_inductor_cache /tmp/nemo_rl_triton_cache
+mkdir -p /tmp/nemo_rl_inductor_cache /tmp/nemo_rl_triton_cache
+echo "[CACHE SETUP] Done."
+SETUPEOF
+else
 read -r -d '' SETUP_COMMAND <<SETUPEOF || true
 command -v zstd >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq zstd; } 2>/dev/null || true
 echo "[CACHE SEED] Clearing stale /tmp caches and seeding from Lustre..."
@@ -1011,6 +1287,7 @@ _seed_cache "\$CACHE_READ/triton_cache.tar.zst" "\$LOCAL_TRI" "Triton"
 
 echo "[CACHE SEED] Done."
 SETUPEOF
+fi
 export SETUP_COMMAND
 
 # =============================================================================
@@ -1020,6 +1297,10 @@ export SETUP_COMMAND
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
+UV_RUNNER=uv
+if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
+  UV_RUNNER="${STRICT_PAIR_UV_SHIM}"
+fi
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${VLLM_ENV_SOURCE}\
 OMP_NUM_THREADS=16 \
@@ -1041,7 +1322,7 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=\${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ${TRAIN_ENTRYPOINT} \
+${UV_RUNNER} run ${TRAIN_ENTRYPOINT} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
@@ -1067,6 +1348,31 @@ ${MTP_EXTRA_ARGS} \
 ${*}"
 
 export COMMAND="${TRAIN_CMD}"
+
+# The authoritative parent renders both complete Slurm payloads before it
+# publishes PAIR_MANIFEST.json. A later launch re-renders and byte-compares the
+# payload, so COMMAND/mount/cache drift cannot hide behind a matching name list.
+if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
+  : "${STRICT_PAIR_SLURM_EXPORT_FILE:?strict prebuilt mode requires its arm export-file path}"
+  HF_TOKEN="${HF_TOKEN:-}"
+  if [[ "${STRICT_PAIR_PREPARE_SLURM_EXPORT}" == "1" ]]; then
+    if [[ -n "${EXPECTED_STRICT_PAIR_SLURM_EXPORT_SHA256:-}" ]]; then
+      echo "ERROR: pre-Pair export rendering cannot accept an expected payload SHA-256." >&2
+      exit 2
+    fi
+    strict_pair_publish_or_verify_slurm_export \
+      "${STRICT_PAIR_SLURM_EXPORT_FILE}"
+    echo "STRICT_PAIR_SLURM_EXPORT_PREPARED arm=${STRICT_PAIR_ARM} schema=nemo-rl-strict-slurm-export-file-v2 sha256=${STRICT_PAIR_ACTIVE_SLURM_EXPORT_SHA256} names=${#STRICT_PAIR_SLURM_EXPORT_ALLOWED_NAMES[@]}"
+    exit 0
+  fi
+  if [[ ! "${EXPECTED_STRICT_PAIR_SLURM_EXPORT_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "ERROR: strict launch requires its parent-bound Slurm export SHA-256." >&2
+    exit 2
+  fi
+  strict_pair_publish_or_verify_slurm_export \
+    "${STRICT_PAIR_SLURM_EXPORT_FILE}" \
+    "${EXPECTED_STRICT_PAIR_SLURM_EXPORT_SHA256}"
+fi
 
 # =============================================================================
 # Summary
@@ -1123,7 +1429,7 @@ echo ""
 # Record code provenance in the run directory
 # =============================================================================
 {
-  echo "timestamp: $(date -Iseconds)"
+  echo "timestamp: $("${NANO35_DATE}" -Iseconds)"
   if [[ "${STRICT_PREBUILT_SNAPSHOT}" == "1" ]]; then
     echo "branch: authenticated-parent-snapshot"
     echo "commit: recorded-in-pair-manifest"
@@ -1184,7 +1490,7 @@ if [[ "${INTERACTIVE}" == "1" ]]; then
   echo "  Ray will start and idle until you attach."
   echo "================================================================"
 
-  SBATCH_OUTPUT=$(sbatch \
+  SBATCH_OUTPUT=$("${NANO35_SBATCH}" \
     --nodes="${NUM_TOTAL_NODES}" \
     --account="${SLURM_ACCOUNT}" \
     --job-name="interactive-${JOB_NAME}" \
@@ -1199,7 +1505,7 @@ if [[ "${INTERACTIVE}" == "1" ]]; then
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
     ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-    "${SLURM_COMMENT_ARGS[@]}" \
+    ${SLURM_COMMENT_ARGS[@]+"${SLURM_COMMENT_ARGS[@]}"} \
     "${RAY_SUB}")
   echo "${SBATCH_OUTPUT}"
   JOB_ID=$(echo "${SBATCH_OUTPUT}" | grep -oP '\d+$')
@@ -1246,8 +1552,39 @@ SLURM_DEPENDENCY="${SLURM_DEPENDENCY:-}"
 DEPENDENCY="singleton"
 [[ -n "${SLURM_DEPENDENCY}" ]] && DEPENDENCY="singleton,${SLURM_DEPENDENCY}"
 
-if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
-  SBATCH_OUTPUT=$(sbatch \
+SBATCH_SCRIPT_ARGS=("${BATCH_SCRIPT}")
+SBATCH_PARSABLE_ARGS=()
+SBATCH_HOLD_ARGS=()
+SBATCH_CHDIR_ARGS=()
+SBATCH_CLIENT=("${NANO35_SBATCH}")
+if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
+  strict_pair_verify_slurm_export_before_sbatch \
+    "${STRICT_PAIR_SLURM_EXPORT_FILE}" \
+    "${EXPECTED_STRICT_PAIR_SLURM_EXPORT_SHA256}"
+  SBATCH_SCRIPT_ARGS=(
+    "--export-file=${STRICT_PAIR_SLURM_EXPORT_FILE}"
+    "${BATCH_SCRIPT}"
+    --pair-manifest "${STRICT_PAIR_MANIFEST_PATH}"
+    --pair-manifest-sha256 "${EXPECTED_PAIR_MANIFEST_SHA256}"
+    --arm "${STRICT_PAIR_ARM}"
+  )
+  SBATCH_PARSABLE_ARGS=(--parsable)
+  SBATCH_HOLD_ARGS=(--hold)
+  SBATCH_CHDIR_ARGS=("--chdir=${PROJECT_ROOT}")
+  SBATCH_CLIENT=(
+    "${NANO35_ENV}" -i
+    LC_ALL=C
+    "SLURM_CONF=${STRICT_PAIR_SLURM_CONF}"
+    "${NANO35_SBATCH}"
+  )
+fi
+
+nano35_invoke_sbatch() {
+  if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+    exec "${SBATCH_CLIENT[@]}" \
+    ${SBATCH_PARSABLE_ARGS[@]+"${SBATCH_PARSABLE_ARGS[@]}"} \
+    ${SBATCH_HOLD_ARGS[@]+"${SBATCH_HOLD_ARGS[@]}"} \
+    ${SBATCH_CHDIR_ARGS[@]+"${SBATCH_CHDIR_ARGS[@]}"} \
     --nodes="${NUM_RAY_NODES}" \
     --account="${SLURM_ACCOUNT}" \
     --job-name="${JOB_NAME}" \
@@ -1263,7 +1600,7 @@ if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
     ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-    "${SLURM_COMMENT_ARGS[@]}" \
+    ${SLURM_COMMENT_ARGS[@]+"${SLURM_COMMENT_ARGS[@]}"} \
     : \
     --nodes="${NUM_EXTERNAL_SERVICE_NODES}" \
     --account="${SLURM_ACCOUNT}" \
@@ -1277,9 +1614,12 @@ if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
     ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-    "${BATCH_SCRIPT}")
-else
-  SBATCH_OUTPUT=$(sbatch \
+    "${SBATCH_SCRIPT_ARGS[@]}"
+  else
+    exec "${SBATCH_CLIENT[@]}" \
+    ${SBATCH_PARSABLE_ARGS[@]+"${SBATCH_PARSABLE_ARGS[@]}"} \
+    ${SBATCH_HOLD_ARGS[@]+"${SBATCH_HOLD_ARGS[@]}"} \
+    ${SBATCH_CHDIR_ARGS[@]+"${SBATCH_CHDIR_ARGS[@]}"} \
     --nodes="${NUM_TOTAL_NODES}" \
     --account="${SLURM_ACCOUNT}" \
     --job-name="${JOB_NAME}" \
@@ -1295,12 +1635,161 @@ else
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
     ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-    "${SLURM_COMMENT_ARGS[@]}" \
-    "${BATCH_SCRIPT}")
-fi
+    ${SLURM_COMMENT_ARGS[@]+"${SLURM_COMMENT_ARGS[@]}"} \
+    "${SBATCH_SCRIPT_ARGS[@]}"
+  fi
+}
 
-echo "${SBATCH_OUTPUT}"
-JOB_ID=$(echo "${SBATCH_OUTPUT}" | grep -oP '\d+$')
+if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
+  : "${STRICT_PAIR_ACCEPTED_ID_FD:?strict accepted-ID descriptor is required}"
+  : "${STRICT_PAIR_ACCEPTED_ID_RECORD:?strict accepted-ID record path is required}"
+  if [[ "${STRICT_PAIR_ARM}" == "off" ]]; then
+    STRICT_PAIR_EXPECTED_ACCEPTED_ID_FD=8
+  else
+    STRICT_PAIR_EXPECTED_ACCEPTED_ID_FD=9
+  fi
+  STRICT_PAIR_EXPECTED_ACCEPTED_ID_RECORD="${STRICT_PAIR_MANIFEST_PATH%/*}/strict_pair_submission_state/${PAIR_ID}/${STRICT_PAIR_ARM}.job-id"
+  if [[ "${STRICT_PAIR_ACCEPTED_ID_FD}" != \
+        "${STRICT_PAIR_EXPECTED_ACCEPTED_ID_FD}" || \
+        "${STRICT_PAIR_ACCEPTED_ID_RECORD}" != \
+        "${STRICT_PAIR_EXPECTED_ACCEPTED_ID_RECORD}" ]]; then
+    echo "ERROR: strict accepted-ID descriptor/path differs from the parent contract." >&2
+    exit 2
+  fi
+  SBATCH_STATUS=0
+  STRICT_PAIR_DEFERRED_SIGNAL_STATUS=0
+  strict_pair_relay_sbatch_output() {
+    "${NANO35_PYTHON}" -I -B -c '
+import os
+import signal
+import sys
+
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+destination_fd = int(sys.argv[1])
+while True:
+    chunk = os.read(0, 1024 * 1024)
+    if not chunk:
+        break
+    view = memoryview(chunk)
+    while view:
+        written = os.write(destination_fd, view)
+        if written <= 0:
+            raise SystemExit("accepted-ID relay made no write progress")
+        view = view[written:]
+os.fsync(destination_fd)
+' "${STRICT_PAIR_ACCEPTED_ID_FD}"
+  }
+  strict_pair_defer_scheduler_signal() {
+    local signal_status="$1"
+
+    if [[ "${STRICT_PAIR_DEFERRED_SIGNAL_STATUS}" == "0" ]]; then
+      STRICT_PAIR_DEFERRED_SIGNAL_STATUS="${signal_status}"
+    fi
+  }
+  trap 'strict_pair_defer_scheduler_signal 130' INT
+  trap 'strict_pair_defer_scheduler_signal 143' TERM
+  STRICT_PAIR_SBATCH_STARTED_UNIX_NS="$(
+    "${NANO35_PYTHON}" -I -B -c 'import time; print(time.time_ns())'
+  )"
+  set +e
+  if [[ "${STRICT_PAIR_ARM}" == "off" ]]; then
+    (trap '' INT TERM; nano35_invoke_sbatch 8>&-) | \
+      (trap '' INT TERM; strict_pair_relay_sbatch_output)
+    STRICT_PAIR_PIPELINE_STATUS=("${PIPESTATUS[@]}")
+  else
+    (trap '' INT TERM; nano35_invoke_sbatch 9>&-) | \
+      (trap '' INT TERM; strict_pair_relay_sbatch_output)
+    STRICT_PAIR_PIPELINE_STATUS=("${PIPESTATUS[@]}")
+  fi
+  set -e
+  SBATCH_STATUS="${STRICT_PAIR_PIPELINE_STATUS[0]:-125}"
+  STRICT_PAIR_RELAY_STATUS="${STRICT_PAIR_PIPELINE_STATUS[1]:-125}"
+  STRICT_PAIR_WRITER_DRAINED_UNIX_NS="$(
+    "${NANO35_PYTHON}" -I -B -c 'import time; print(time.time_ns())'
+  )"
+  trap - INT TERM
+  if (( STRICT_PAIR_RELAY_STATUS != 0 )); then
+    echo "ERROR: strict sbatch accepted-ID relay failed." >&2
+    exit "${STRICT_PAIR_RELAY_STATUS}"
+  fi
+  if ! JOB_ID="$(
+    "${NANO35_PYTHON}" -I -B - \
+      "${STRICT_PAIR_ACCEPTED_ID_RECORD}" \
+      "${STRICT_PAIR_ACCEPTED_ID_FD}" <<'PY'
+import os
+import pathlib
+import re
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+fd = int(sys.argv[2])
+path_stat = os.lstat(path)
+fd_stat = os.fstat(fd)
+if (
+    not path.is_absolute()
+    or os.path.realpath(path) != str(path)
+    or stat.S_ISLNK(path_stat.st_mode)
+    or not stat.S_ISREG(path_stat.st_mode)
+    or (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino)
+    or path_stat.st_nlink != 1
+    or stat.S_IMODE(path_stat.st_mode) != 0o600
+):
+    raise SystemExit("strict accepted-ID record inode changed before sealing")
+os.fsync(fd)
+read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+read_fd = os.open(path, read_flags)
+try:
+    read_stat = os.fstat(read_fd)
+    if (read_stat.st_dev, read_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+        raise SystemExit("strict accepted-ID record path no longer names its open inode")
+    chunks = []
+    while True:
+        chunk = os.read(read_fd, 4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+finally:
+    os.close(read_fd)
+os.fchmod(fd, 0o400)
+os.fsync(fd)
+directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+payload = b"".join(chunks)
+if re.fullmatch(rb"[1-9][0-9]*\n", payload) is None:
+    raise SystemExit("strict sbatch --parsable output must be one numeric job ID")
+print(payload[:-1].decode("ascii"))
+PY
+  )"; then
+    echo "ERROR: strict sbatch accepted-ID record is invalid or could not be sealed." >&2
+    exit 2
+  fi
+  if [[ "${STRICT_PAIR_ARM}" == "off" ]]; then
+    exec 8>&-
+  else
+    exec 9>&-
+  fi
+  SBATCH_OUTPUT_SHA256="$(strict_pair_sha256_text "${JOB_ID}")"
+  ACCEPTED_ID_RECORD_SHA256="$(strict_pair_sha256_file "${STRICT_PAIR_ACCEPTED_ID_RECORD}")"
+  echo "STRICT_PAIR_HELD arm=${STRICT_PAIR_ARM} job_id=${JOB_ID} job_id_sha256_ascii_no_newline=${SBATCH_OUTPUT_SHA256} accepted_id_record_sha256=${ACCEPTED_ID_RECORD_SHA256} sbatch_status=${SBATCH_STATUS} relay_status=${STRICT_PAIR_RELAY_STATUS} writer_drained=true started_unix_ns=${STRICT_PAIR_SBATCH_STARTED_UNIX_NS} drained_unix_ns=${STRICT_PAIR_WRITER_DRAINED_UNIX_NS}"
+  if [[ "${STRICT_PAIR_DEFERRED_SIGNAL_STATUS}" != "0" ]]; then
+    exit "${STRICT_PAIR_DEFERRED_SIGNAL_STATUS}"
+  fi
+  if (( SBATCH_STATUS != 0 )); then
+    echo "ERROR: strict sbatch failed after writing an accepted-ID record." >&2
+    exit "${SBATCH_STATUS}"
+  fi
+else
+  SBATCH_OUTPUT="$(nano35_invoke_sbatch)"
+  echo "${SBATCH_OUTPUT}"
+  if ! JOB_ID=$("${NANO35_GREP}" -oE '[0-9]+$' <<< "${SBATCH_OUTPUT}"); then
+    JOB_ID=""
+  fi
+fi
 
 if [[ -n "${JOB_ID}" ]]; then
   echo ""
