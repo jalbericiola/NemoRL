@@ -50,6 +50,11 @@ set -euo pipefail
 #   NUM_TRAIN_NODES=                        Training (Megatron) nodes
 #   NUM_GEN_NODES=                          Policy-generation nodes
 #   NUM_GYM_NODES=                          In-cluster NeMo Gym judge nodes
+#   COLOCATED_GENERATION=0                  Set to 1 only for the exact
+#                                          single-node shape: train=1, gen=0,
+#                                          Gym=0, segment=1, four GPUs/node.
+#                                          Requires a SingleController-compatible
+#                                          entrypoint and four-rank model topology.
 #   NUM_EXTERNAL_SERVICE_NODES=0            Nodes reserved outside training Ray
 #   GENRM_SEGMENT_SIZE=                      Segment size for the external
 #                                          service hetgroup
@@ -385,16 +390,12 @@ fi
 # through NUM_TRAIN_NODES / NUM_GEN_NODES / NUM_GYM_NODES.
 # =============================================================================
 NUM_EXTERNAL_SERVICE_NODES="${NUM_EXTERNAL_SERVICE_NODES:-0}"
-
-NUM_ACTOR_NODES=$((NUM_TRAIN_NODES + NUM_GEN_NODES))
-NUM_RAY_NODES=$((NUM_ACTOR_NODES + NUM_GYM_NODES))
-NUM_TOTAL_NODES=$((NUM_RAY_NODES + NUM_EXTERNAL_SERVICE_NODES))
+COLOCATED_GENERATION="${COLOCATED_GENERATION:-0}"
+SEGMENT_SIZE="${SEGMENT_SIZE:-16}"
+DEDICATED_RAY_HEAD="${DEDICATED_RAY_HEAD:-0}"
 
 if (( NUM_TRAIN_NODES <= 0 )); then
   echo "ERROR: NUM_TRAIN_NODES must be > 0 (got ${NUM_TRAIN_NODES})" >&2; exit 1
-fi
-if (( NUM_GEN_NODES <= 0 )); then
-  echo "ERROR: NUM_GEN_NODES must be > 0 (got ${NUM_GEN_NODES})" >&2; exit 1
 fi
 if (( NUM_GYM_NODES < 0 )); then
   echo "ERROR: NUM_GYM_NODES must be >= 0 (got ${NUM_GYM_NODES})" >&2; exit 1
@@ -403,9 +404,78 @@ if (( NUM_EXTERNAL_SERVICE_NODES < 0 )); then
   echo "ERROR: NUM_EXTERNAL_SERVICE_NODES must be >= 0 (got ${NUM_EXTERNAL_SERVICE_NODES})" >&2; exit 1
 fi
 
+case "${COLOCATED_GENERATION}" in
+  0)
+    if (( NUM_GEN_NODES <= 0 )); then
+      echo "ERROR: NUM_GEN_NODES must be > 0 (got ${NUM_GEN_NODES})" >&2
+      echo "  NUM_GEN_NODES=0 is allowed only with the exact COLOCATED_GENERATION=1 single-node shape." >&2
+      exit 1
+    fi
+    NUM_ACTOR_NODES=$((NUM_TRAIN_NODES + NUM_GEN_NODES))
+    GENERATION_RESOURCE_NODES="${NUM_GEN_NODES}"
+    COLOCATED_GENERATION_HYDRA_ARGS=""
+    ;;
+  1)
+    if (( NUM_TRAIN_NODES != 1 || NUM_GEN_NODES != 0 || NUM_GYM_NODES != 0 || \
+          NUM_EXTERNAL_SERVICE_NODES != 0 || SEGMENT_SIZE != 1 || GPUS_PER_NODE != 4 )); then
+      echo "ERROR: COLOCATED_GENERATION=1 requires the exact one-node/four-GPU shape:" >&2
+      echo "  NUM_TRAIN_NODES=1 NUM_GEN_NODES=0 NUM_GYM_NODES=0 NUM_EXTERNAL_SERVICE_NODES=0 SEGMENT_SIZE=1 GPUS_PER_NODE=4" >&2
+      echo "  got train=${NUM_TRAIN_NODES} gen=${NUM_GEN_NODES} gym=${NUM_GYM_NODES} external=${NUM_EXTERNAL_SERVICE_NODES} segment=${SEGMENT_SIZE} gpus_per_node=${GPUS_PER_NODE}" >&2
+      exit 1
+    fi
+    if [[ "${DEDICATED_RAY_HEAD}" != "0" ]]; then
+      echo "ERROR: COLOCATED_GENERATION=1 requires DEDICATED_RAY_HEAD=0 (got ${DEDICATED_RAY_HEAD})" >&2
+      exit 1
+    fi
+
+    # The policy and vLLM worker groups time-share the same four GPUs.  NeMo-RL
+    # selects its CUDA-IPC weight synchronizer when colocation is enabled and
+    # refit_transport is null.
+    NUM_ACTOR_NODES=1
+    GENERATION_RESOURCE_NODES=1
+    export DEDICATED_RAY_HEAD=0
+    COLOCATED_GENERATION_HYDRA_ARGS="\
+cluster.gpus_per_node=4 \
+policy.generation.backend=vllm \
+policy.generation.colocated.enabled=true \
+policy.generation.colocated.resources.gpus_per_node=4 \
+++policy.generation.refit_transport=null"
+
+    # These launcher-owned values are the safety boundary for the one-node
+    # mode.  Refuse command-line Hydra attempts to replace a protected object
+    # or field instead of relying on argument ordering.
+    for override in "$@"; do
+      override_key="${override%%=*}"
+      override_key="${override_key#++}"
+      override_key="${override_key#+}"
+      override_key="${override_key#\~}"
+      case "${override_key}" in
+        cluster|cluster.num_nodes|cluster.gpus_per_node|cluster.segment_size|\
+        policy.generation|policy.generation.backend|\
+        policy.generation.colocated|\
+        policy.generation.colocated.enabled|\
+        policy.generation.colocated.resources|\
+        policy.generation.colocated.resources.num_nodes|\
+        policy.generation.colocated.resources.gpus_per_node|\
+        policy.generation.refit_transport|env.nemo_gym.num_gpu_nodes)
+          echo "ERROR: COLOCATED_GENERATION=1 forbids overriding launcher-owned Hydra key: ${override_key}" >&2
+          exit 1
+          ;;
+      esac
+    done
+    unset override override_key
+    ;;
+  *)
+    echo "ERROR: COLOCATED_GENERATION must be exactly 0 or 1 (got ${COLOCATED_GENERATION})" >&2
+    exit 1
+    ;;
+esac
+
+NUM_RAY_NODES=$((NUM_ACTOR_NODES + NUM_GYM_NODES))
+NUM_TOTAL_NODES=$((NUM_RAY_NODES + NUM_EXTERNAL_SERVICE_NODES))
+
 # GB200 NVL72 topology: validate the training and external-service components
 # separately because Slurm schedules them as distinct heterogeneous groups.
-SEGMENT_SIZE="${SEGMENT_SIZE:-16}"
 GENRM_SEGMENT_SIZE="${GENRM_SEGMENT_SIZE:-${SEGMENT_SIZE}}"
 if (( NUM_RAY_NODES < SEGMENT_SIZE )); then
   echo "ERROR: NUM_RAY_NODES=${NUM_RAY_NODES} < SEGMENT_SIZE=${SEGMENT_SIZE}" >&2
@@ -743,7 +813,8 @@ uv run ${TRAIN_ENTRYPOINT} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
 cluster.segment_size=${SEGMENT_SIZE} \
-policy.generation.colocated.resources.num_nodes=${NUM_GEN_NODES} \
+policy.generation.colocated.resources.num_nodes=${GENERATION_RESOURCE_NODES} \
+${COLOCATED_GENERATION_HYDRA_ARGS} \
 env.nemo_gym.num_gpu_nodes=${NUM_GYM_NODES} \
 checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
 ${CHECKPOINTING_SAVE_BY:+checkpointing.checkpoint_must_save_by=${CHECKPOINTING_SAVE_BY}} \
@@ -778,7 +849,12 @@ if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 echo "    Hetgroup 0: ${NUM_RAY_NODES} NeMo RL nodes  (segment=${SEGMENT_SIZE})"
 fi
 echo "    Training:  ${NUM_TRAIN_NODES}  ($((NUM_TRAIN_NODES * GPUS_PER_NODE)) GPUs)"
+if [[ "${COLOCATED_GENERATION}" == "1" ]]; then
+echo "    vLLM gen:  colocated on the training node (1 node, ${GPUS_PER_NODE} shared GPUs, CUDA-IPC refit)"
+echo "    Ray head:  shared on the GPU node (DEDICATED_RAY_HEAD=0)"
+else
 echo "    vLLM gen:  ${NUM_GEN_NODES}  ($((NUM_GEN_NODES * GPUS_PER_NODE)) GPUs)"
+fi
 echo "    Gym:       ${NUM_GYM_NODES}  ($((NUM_GYM_NODES * GPUS_PER_NODE)) GPUs)"
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 echo "    Hetgroup 1: ${NUM_EXTERNAL_SERVICE_NODES} external GenRM nodes  (segment=${GENRM_SEGMENT_SIZE})"
