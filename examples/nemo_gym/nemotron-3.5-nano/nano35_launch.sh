@@ -192,6 +192,52 @@ TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
 : "${SLURM_PARTITION:?SLURM_PARTITION is required}"
 : "${SLURM_ACCOUNT:?SLURM_ACCOUNT is required}"
 cd "${PROJECT_ROOT}"
+
+# SingleController is outside the directories historically overlaid into the
+# container. Bind its exact committed bytes explicitly when selected; silently
+# falling back to a container-builtin driver can change orchestration semantics
+# while the printed command still looks correct.
+SINGLE_CONTROLLER_ENTRYPOINT_REL="examples/run_grpo_single_controller.py"
+SINGLE_CONTROLLER_ENTRYPOINT_SHA256=""
+SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST=""
+
+sha256_file() {
+  local path="$1"
+  local digest
+  local ignored
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    read -r digest ignored < <(sha256sum -- "${path}")
+  elif command -v shasum >/dev/null 2>&1; then
+    read -r digest ignored < <(shasum -a 256 -- "${path}")
+  else
+    echo "ERROR: sha256sum or shasum is required to authenticate the SingleController entrypoint." >&2
+    return 1
+  fi
+  echo "${digest}"
+}
+
+if [[ "${TRAIN_ENTRYPOINT}" == "./${SINGLE_CONTROLLER_ENTRYPOINT_REL}" ]]; then
+  SINGLE_CONTROLLER_ENTRYPOINT_SOURCE="${PROJECT_ROOT}/${SINGLE_CONTROLLER_ENTRYPOINT_REL}"
+  if [[ -L "${SINGLE_CONTROLLER_ENTRYPOINT_SOURCE}" ]]; then
+    echo "ERROR: SingleController entrypoint must not be a symbolic link: ${SINGLE_CONTROLLER_ENTRYPOINT_SOURCE}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${SINGLE_CONTROLLER_ENTRYPOINT_SOURCE}" ]]; then
+    echo "ERROR: SingleController entrypoint is missing or not a regular file: ${SINGLE_CONTROLLER_ENTRYPOINT_SOURCE}" >&2
+    exit 1
+  fi
+  if [[ -n "${STRICT_PREBUILT_SNAPSHOT_DIR:-}" ]]; then
+    if [[ "${PROJECT_ROOT}" != "${STRICT_PREBUILT_SNAPSHOT_DIR}" ]]; then
+      echo "ERROR: strict prebuilt mode must execute nano35_launch.sh from the authenticated snapshot." >&2
+      exit 1
+    fi
+  elif ! git -C "${PROJECT_ROOT}" diff --quiet HEAD -- "${SINGLE_CONTROLLER_ENTRYPOINT_REL}"; then
+    echo "ERROR: SingleController entrypoint differs from committed HEAD; refusing a mutable container bind." >&2
+    exit 1
+  fi
+  SINGLE_CONTROLLER_ENTRYPOINT_SHA256="$(sha256_file "${SINGLE_CONTROLLER_ENTRYPOINT_SOURCE}")"
+fi
 # Judge models are recipe-specific. RLVR needs GenRM, NL2Bash, and safety
 # judges; SWE uses code-execution rewards and needs none of them. Set these per
 # recipe; unset variables skip the corresponding override.
@@ -635,7 +681,146 @@ else
   USE_SNAPSHOT="${USE_SNAPSHOT:-1}"
 fi
 
-if [[ "${USE_SNAPSHOT}" == "1" ]]; then
+STRICT_PREBUILT_SNAPSHOT_DIR="${STRICT_PREBUILT_SNAPSHOT_DIR:-}"
+STRICT_PREBUILT_SNAPSHOT_MANIFEST_NAME="strict-pair-snapshot-manifest.sha256"
+STRICT_PREBUILT_SNAPSHOT="0"
+OVERLAY_MOUNT_OPTIONS=""
+if [[ -n "${STRICT_PREBUILT_SNAPSHOT_DIR}" ]]; then
+  if [[ "${USE_SNAPSHOT}" != "1" ]]; then
+    echo "ERROR: STRICT_PREBUILT_SNAPSHOT_DIR requires USE_SNAPSHOT=1." >&2
+    exit 1
+  fi
+  if [[ "${STRICT_PREBUILT_SNAPSHOT_DIR}" != /* || \
+        -L "${STRICT_PREBUILT_SNAPSHOT_DIR}" || \
+        ! -d "${STRICT_PREBUILT_SNAPSHOT_DIR}" || \
+        "$(realpath -- "${STRICT_PREBUILT_SNAPSHOT_DIR}")" != "${STRICT_PREBUILT_SNAPSHOT_DIR}" ]]; then
+    echo "ERROR: strict prebuilt snapshot must be one canonical, non-symlink directory: ${STRICT_PREBUILT_SNAPSHOT_DIR}" >&2
+    exit 1
+  fi
+  if [[ ! "${EXPECTED_STRICT_PREBUILT_SNAPSHOT_MANIFEST_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "ERROR: EXPECTED_STRICT_PREBUILT_SNAPSHOT_MANIFEST_SHA256 must be an explicit lowercase SHA-256." >&2
+    exit 1
+  fi
+  STRICT_PREBUILT_SNAPSHOT_MANIFEST="${STRICT_PREBUILT_SNAPSHOT_DIR}/${STRICT_PREBUILT_SNAPSHOT_MANIFEST_NAME}"
+  if [[ -L "${STRICT_PREBUILT_SNAPSHOT_MANIFEST}" || ! -f "${STRICT_PREBUILT_SNAPSHOT_MANIFEST}" ]]; then
+    echo "ERROR: strict prebuilt snapshot manifest must be a regular, non-symlink file." >&2
+    exit 1
+  fi
+  if [[ "$(sha256_file "${STRICT_PREBUILT_SNAPSHOT_MANIFEST}")" != \
+        "${EXPECTED_STRICT_PREBUILT_SNAPSHOT_MANIFEST_SHA256}" ]]; then
+    echo "ERROR: strict prebuilt snapshot manifest SHA-256 mismatch." >&2
+    exit 1
+  fi
+  if ! (cd -- "${STRICT_PREBUILT_SNAPSHOT_DIR}" && \
+        sha256sum --check --strict --quiet -- "${STRICT_PREBUILT_SNAPSHOT_MANIFEST_NAME}"); then
+    echo "ERROR: strict prebuilt snapshot content verification failed." >&2
+    exit 1
+  fi
+  STRICT_PREBUILT_SNAPSHOT_SYMLINKS="${STRICT_PREBUILT_SNAPSHOT_DIR}/strict-pair-snapshot-symlinks.json"
+  STRICT_PREBUILT_SNAPSHOT_MODES="${STRICT_PREBUILT_SNAPSHOT_DIR}/strict-pair-snapshot-modes.json"
+  if [[ -L "${STRICT_PREBUILT_SNAPSHOT_SYMLINKS}" || \
+        ! -f "${STRICT_PREBUILT_SNAPSHOT_SYMLINKS}" || \
+        -L "${STRICT_PREBUILT_SNAPSHOT_MODES}" || \
+        ! -f "${STRICT_PREBUILT_SNAPSHOT_MODES}" ]]; then
+    echo "ERROR: strict prebuilt snapshot inventory manifests must be regular, non-symlink files." >&2
+    exit 1
+  fi
+  if ! python3 -I -B - \
+    "${STRICT_PREBUILT_SNAPSHOT_DIR}" \
+    "${STRICT_PREBUILT_SNAPSHOT_MANIFEST}" \
+    "${STRICT_PREBUILT_SNAPSHOT_SYMLINKS}" \
+    "${STRICT_PREBUILT_SNAPSHOT_MODES}" <<'PY'
+import json
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+sha_manifest = pathlib.Path(sys.argv[2])
+symlink_manifest = pathlib.Path(sys.argv[3])
+mode_manifest = pathlib.Path(sys.argv[4])
+regular = set()
+for line in sha_manifest.read_text(encoding="ascii").splitlines():
+    _, separator, relative = line.partition("  ")
+    if not separator or relative in regular:
+        raise SystemExit("malformed or duplicate snapshot SHA manifest entry")
+    regular.add(relative)
+symlink_document = json.loads(symlink_manifest.read_text(encoding="ascii"))
+if symlink_document.get("schema") != "nemo-rl-strict-snapshot-symlinks-v1":
+    raise SystemExit("snapshot symlink manifest schema mismatch")
+symlinks = symlink_document.get("symlinks")
+if not isinstance(symlinks, dict) or any(
+    not isinstance(key, str) or not isinstance(value, str)
+    for key, value in symlinks.items()
+):
+    raise SystemExit("malformed snapshot symlink manifest")
+mode_document = json.loads(mode_manifest.read_text(encoding="ascii"))
+if mode_document.get("schema") != "nemo-rl-strict-snapshot-modes-v1":
+    raise SystemExit("snapshot mode manifest schema mismatch")
+regular_file_executable = mode_document.get("regular_file_executable")
+if not isinstance(regular_file_executable, dict) or any(
+    not isinstance(key, str) or not isinstance(value, bool)
+    for key, value in regular_file_executable.items()
+):
+    raise SystemExit("malformed snapshot mode manifest")
+actual_regular = set()
+actual_symlinks = {}
+actual_executable = {}
+for directory, directory_names, file_names in os.walk(root, followlinks=False):
+    directory_names.sort()
+    file_names.sort()
+    for name in list(directory_names):
+        path = pathlib.Path(directory) / name
+        if path.is_symlink():
+            relative = path.relative_to(root).as_posix()
+            actual_symlinks[relative] = os.readlink(path)
+            directory_names.remove(name)
+    for name in file_names:
+        path = pathlib.Path(directory) / name
+        relative = path.relative_to(root).as_posix()
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode):
+            actual_symlinks[relative] = os.readlink(path)
+        elif stat.S_ISREG(metadata.st_mode):
+            if path != sha_manifest:
+                actual_regular.add(relative)
+                actual_executable[relative] = bool(metadata.st_mode & 0o111)
+        else:
+            raise SystemExit(f"snapshot contains special path: {relative}")
+if actual_regular != regular:
+    raise SystemExit("snapshot regular-file inventory differs from SHA manifest")
+if actual_symlinks != symlinks:
+    raise SystemExit("snapshot symlink inventory differs from symlink manifest")
+if actual_executable != regular_file_executable:
+    raise SystemExit("snapshot executable-mode inventory differs from mode manifest")
+PY
+  then
+    echo "ERROR: strict prebuilt snapshot inventory verification failed." >&2
+    exit 1
+  fi
+  writable_snapshot_path=""
+  while IFS= read -r -d '' snapshot_path; do
+    if snapshot_mode="$(stat -c '%a' -- "${snapshot_path}" 2>/dev/null)"; then
+      :
+    else
+      snapshot_mode="$(stat -f '%Lp' -- "${snapshot_path}")"
+    fi
+    if (( (8#${snapshot_mode} & 8#222) != 0 )); then
+      writable_snapshot_path="${snapshot_path}"
+      break
+    fi
+  done < <(find "${STRICT_PREBUILT_SNAPSHOT_DIR}" \( -type d -o -type f \) -print0)
+  if [[ -n "${writable_snapshot_path}" ]]; then
+    echo "ERROR: strict prebuilt snapshot contains a writable path: ${writable_snapshot_path}" >&2
+    exit 1
+  fi
+  SNAPSHOT_DIR="${STRICT_PREBUILT_SNAPSHOT_DIR}"
+  echo "Code snapshot: ${SNAPSHOT_DIR} (strict prebuilt, authenticated, read-only)"
+  OVERLAY_SOURCE="${SNAPSHOT_DIR}"
+  STRICT_PREBUILT_SNAPSHOT="1"
+  OVERLAY_MOUNT_OPTIONS=":ro"
+elif [[ "${USE_SNAPSHOT}" == "1" ]]; then
   if [[ ! -f "${PROJECT_ROOT}/tools/code_snapshot.sh" ]]; then
     echo "ERROR: tools/code_snapshot.sh not found at ${PROJECT_ROOT}/tools/code_snapshot.sh" >&2
     echo "  Set USE_SNAPSHOT=0 to run from the live checkout instead." >&2
@@ -652,6 +837,38 @@ if [[ "${USE_SNAPSHOT}" == "1" ]]; then
   OVERLAY_SOURCE="${SNAPSHOT_DIR}"
 else
   OVERLAY_SOURCE="${PROJECT_ROOT}"
+fi
+
+if [[ -n "${SINGLE_CONTROLLER_ENTRYPOINT_SHA256}" && "${USE_SNAPSHOT}" == "1" ]]; then
+  SNAPSHOT_SINGLE_CONTROLLER_ENTRYPOINT="${SNAPSHOT_DIR}/${SINGLE_CONTROLLER_ENTRYPOINT_REL}"
+  if [[ -L "${SNAPSHOT_SINGLE_CONTROLLER_ENTRYPOINT}" || ! -f "${SNAPSHOT_SINGLE_CONTROLLER_ENTRYPOINT}" ]]; then
+    echo "ERROR: code snapshot is missing a regular, non-symlink SingleController entrypoint: ${SNAPSHOT_SINGLE_CONTROLLER_ENTRYPOINT}" >&2
+    exit 1
+  fi
+  SNAPSHOT_SINGLE_CONTROLLER_ENTRYPOINT_SHA256="$(sha256_file "${SNAPSHOT_SINGLE_CONTROLLER_ENTRYPOINT}")"
+  if [[ "${SNAPSHOT_SINGLE_CONTROLLER_ENTRYPOINT_SHA256}" != "${SINGLE_CONTROLLER_ENTRYPOINT_SHA256}" ]]; then
+    echo "ERROR: code-snapshot SingleController entrypoint SHA-256 mismatch: expected ${SINGLE_CONTROLLER_ENTRYPOINT_SHA256}, got ${SNAPSHOT_SINGLE_CONTROLLER_ENTRYPOINT_SHA256}." >&2
+    exit 1
+  fi
+  SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST="${SNAPSHOT_DIR}/nano35-entrypoint-manifest.sha256"
+  if [[ -L "${SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST}" || ( -e "${SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST}" && ! -f "${SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST}" ) ]]; then
+    echo "ERROR: snapshot entrypoint manifest must be a regular, non-symlink file: ${SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST}" >&2
+    exit 1
+  fi
+  if [[ "${STRICT_PREBUILT_SNAPSHOT}" == "1" ]]; then
+    if [[ ! -f "${SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST}" || \
+          "$(< "${SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST}")" != \
+          "${SINGLE_CONTROLLER_ENTRYPOINT_SHA256}  ${SINGLE_CONTROLLER_ENTRYPOINT_REL}" ]]; then
+      echo "ERROR: strict prebuilt snapshot entrypoint manifest is missing or differs from authenticated source." >&2
+      exit 1
+    fi
+  else
+    printf '%s  %s\n' \
+      "${SINGLE_CONTROLLER_ENTRYPOINT_SHA256}" \
+      "${SINGLE_CONTROLLER_ENTRYPOINT_REL}" \
+      > "${SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST}"
+  fi
+  echo "SingleController entrypoint manifest: ${SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST}"
 fi
 
 # =============================================================================
@@ -683,24 +900,34 @@ _append_mount() {
 }
 
 if [[ -d "${OVERLAY_SOURCE}/nemo_rl" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/nemo_rl:/opt/nemo-rl/nemo_rl"
+  _append_mount "${OVERLAY_SOURCE}/nemo_rl:/opt/nemo-rl/nemo_rl${OVERLAY_MOUNT_OPTIONS}"
   echo "  Mount: nemo_rl → /opt/nemo-rl/nemo_rl"
 fi
 if [[ -d "${OVERLAY_SOURCE}/examples/configs" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs"
+  _append_mount "${OVERLAY_SOURCE}/examples/configs:/opt/nemo-rl/examples/configs${OVERLAY_MOUNT_OPTIONS}"
   echo "  Mount: configs → /opt/nemo-rl/examples/configs"
 fi
 if [[ -d "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano:/opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
+  _append_mount "${OVERLAY_SOURCE}/examples/nemo_gym/nemotron-3.5-nano:/opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano${OVERLAY_MOUNT_OPTIONS}"
   echo "  Mount: Nano 3.5 recipes → /opt/nemo-rl/examples/nemo_gym/nemotron-3.5-nano"
 fi
+if [[ -n "${SINGLE_CONTROLLER_ENTRYPOINT_SHA256}" ]]; then
+  _append_mount "${OVERLAY_SOURCE}/${SINGLE_CONTROLLER_ENTRYPOINT_REL}:/opt/nemo-rl/${SINGLE_CONTROLLER_ENTRYPOINT_REL}:ro"
+  echo "  Mount: SingleController entrypoint → /opt/nemo-rl/${SINGLE_CONTROLLER_ENTRYPOINT_REL} (read-only, sha256=${SINGLE_CONTROLLER_ENTRYPOINT_SHA256})"
+fi
+if [[ "${STRICT_PREBUILT_SNAPSHOT}" == "1" && \
+      ( -L "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" || \
+        ! -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ) ]]; then
+  echo "ERROR: strict prebuilt snapshot is missing its authenticated Reasoning Gym gitlink contents." >&2
+  exit 1
+fi
 if [[ -d "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym" ]]; then
-  _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+  _append_mount "${OVERLAY_SOURCE}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym${OVERLAY_MOUNT_OPTIONS}"
   echo "  Mount: Gym → /opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 fi
 
 if [[ "${USE_SNAPSHOT}" == "1" ]]; then
-  _append_mount "${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
+  _append_mount "${SNAPSHOT_DIR}:${SNAPSHOT_DIR}${OVERLAY_MOUNT_OPTIONS}"
 fi
 
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
@@ -721,6 +948,12 @@ fi
 BATCH_SCRIPT="${BATCH_SCRIPT:-${RAY_SUB}}"
 if [[ ! -f "${BATCH_SCRIPT}" ]]; then
   echo "ERROR: batch script not found at ${BATCH_SCRIPT}" >&2
+  exit 1
+fi
+if [[ "${STRICT_PREBUILT_SNAPSHOT}" == "1" && \
+      ( "${RAY_SUB}" != "${BATCH_SCRIPT}" || \
+        "${BATCH_SCRIPT}" != "${STRICT_PAIR_JOB_WRAPPER:?strict prebuilt mode requires STRICT_PAIR_JOB_WRAPPER}" ) ]]; then
+  echo "ERROR: strict prebuilt mode requires RAY_SUB and BATCH_SCRIPT to be the authenticated job wrapper." >&2
   exit 1
 fi
 export RAY_SUB
@@ -891,12 +1124,26 @@ echo ""
 # =============================================================================
 {
   echo "timestamp: $(date -Iseconds)"
-  echo "branch: $(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-  echo "commit: $(git -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
-  echo "dirty: $(git -C "${PROJECT_ROOT}" status --porcelain 2>/dev/null | head -20)"
+  if [[ "${STRICT_PREBUILT_SNAPSHOT}" == "1" ]]; then
+    echo "branch: authenticated-parent-snapshot"
+    echo "commit: recorded-in-pair-manifest"
+    echo "dirty: false (exact snapshot inventory authenticated)"
+    echo "strict_pair_manifest: ${STRICT_PAIR_MANIFEST_PATH:?strict prebuilt mode requires STRICT_PAIR_MANIFEST_PATH}"
+    echo "strict_prebuilt_snapshot_manifest_sha256: ${EXPECTED_STRICT_PREBUILT_SNAPSHOT_MANIFEST_SHA256}"
+    echo "strict_pair_job_wrapper: ${BATCH_SCRIPT}"
+    echo "strict_pair_job_wrapper_sha256: ${EXPECTED_STRICT_PAIR_JOB_WRAPPER_SHA256:?strict prebuilt mode requires job-wrapper SHA-256}"
+  else
+    echo "branch: $(git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+    echo "commit: $(git -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "dirty: $(git -C "${PROJECT_ROOT}" status --porcelain 2>/dev/null | head -20)"
+  fi
   echo "snapshot: ${USE_SNAPSHOT}"
   if [[ "${USE_SNAPSHOT}" == "1" ]]; then
     echo "snapshot_dir: ${SNAPSHOT_DIR}"
+  fi
+  if [[ -n "${SINGLE_CONTROLLER_ENTRYPOINT_SHA256}" ]]; then
+    echo "single_controller_entrypoint_sha256: ${SINGLE_CONTROLLER_ENTRYPOINT_SHA256}"
+    echo "single_controller_entrypoint_manifest: ${SINGLE_CONTROLLER_ENTRYPOINT_MANIFEST:-live-tree-no-manifest}"
   fi
   echo "container: ${CONTAINER}"
   echo "config: ${CONFIG_PATH}"

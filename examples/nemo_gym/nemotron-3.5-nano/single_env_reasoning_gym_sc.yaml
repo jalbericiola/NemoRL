@@ -1,0 +1,267 @@
+# =============================================================================
+# Nemotron 3.5 Nano — strict live Reasoning Gym shared-prefix A/B
+# =============================================================================
+# This is deliberately not runnable by itself.  The two shared-prefix selector
+# fields are mandatory so an invocation that bypasses nano35_single_env_pair.sh
+# fails during config resolution instead of silently choosing an A/B arm.
+defaults: rlvr_sc.yaml
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+  segment_size: 1
+
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 4
+  num_val_generations_per_prompt: 1
+  max_num_epochs: 20
+  max_num_steps: 100
+  # Keep the Pipeclean GRPO estimator contract explicit.  These operate after
+  # the three logged Gym reward boundaries and must never be reported as the
+  # raw task score.
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  seed: 42
+  overlong_filtering: false
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  calculate_advantages_on_gpu: false
+  seq_logprob_error_threshold: 2
+  skip_reference_policy_logprobs_calculation: true
+  # SingleController reads this nested estimator block; the legacy top-level
+  # normalize/baseline fields above are retained for Pipeclean config parity.
+  adv_estimator:
+    name: grpo
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+    reward_weights: null
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: null
+  val_batch_size: 1
+  advantage_clip_low: -20
+  advantage_clip_high: 20
+  penalize_invalid_tool_call: true
+  # SingleController owns asynchronous rollout scheduling.
+  async_grpo: null
+  # SingleController consumes the message-level token mask, so retain the
+  # flagship invalid-tool penalty instead of inheriting sync-GRPO constraints.
+  invalid_tool_call_advantage: -5.0
+  malformed_thinking_advantage: null
+  reward_shaping:
+    enabled: false
+    max_response_length: 768
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1.0
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+# Exact DAPO-style policy-loss controls from the Pipeclean flagship.  Reward
+# shaping/scaling above are disabled; asymmetric ratio clipping and token-level
+# loss remain enabled and are distinct from the normalized advantage clip.
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+  use_kl_in_reward: false
+
+checkpointing:
+  enabled: false
+  metric_name: null
+
+policy:
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  generation_batch_size: 4
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  logprob_chunk_size: 256
+  make_sequence_length_divisible_by: 128
+  quant_cfg: null
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+
+  megatron_cfg:
+    enabled: true
+    activation_checkpointing: true
+
+    # Four-rank training topology.
+    tensor_model_parallel_size: 2
+    context_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    sequence_parallel: true
+
+    # Train all five repeated MTP heads without allowing their gradients to
+    # alter the main-model gradients.
+    mtp_num_layers: 5
+    mtp_use_repeated_layer: true
+    mtp_detach_heads: true
+    mtp_loss_scaling_factor: 0.3
+
+    # Pin the exact Nano recompute path instead of inheriting provider defaults.
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    cuda_graph_impl: none
+
+    # Exact deterministic-execution contract shared by the observe and train
+    # arms.  Validation rejects missing or drifted values before workers start.
+    env_vars:
+      MAMBA_DETERMINISTIC: "1"
+      NVTE_ALLOW_NONDETERMINISTIC_ALGO: "0"
+      CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+      NCCL_ALGO: "Ring"
+    model_overrides:
+      deterministic_mode: true
+      cross_entropy_loss_fusion: false
+      tp_comm_overlap: false
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+
+  shared_prefix_training:
+    mode: ???
+    require_deterministic_execution: ???
+
+  generation:
+    backend: vllm
+    nemo_gym_add_seed_per_rollout: true
+    nemo_gym_per_rollout_seed_base: 42
+    max_new_tokens: 768
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    val_temperature: 1.0
+    val_top_p: 1.0
+    val_top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    refit_transport: null
+    vllm_cfg:
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      max_model_len: 2048
+      http_server_serving_chat_kwargs:
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      max_num_seqs: 4
+      compilation_config:
+        cudagraph_capture_sizes: [1, 2, 4]
+    colocated:
+      enabled: true
+      resources:
+        num_nodes: 1
+        gpus_per_node: 4
+
+  draft:
+    enabled: false
+
+# Replace the stale rlvr_sc.yaml async_rl block so the strict recipe uses the
+# current SingleController schema (stall_watchdog, not the retired watchdog).
+async_rl:
+  _override_: true
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  recompute_kv_cache_after_weight_updates: false
+  min_groups_for_streaming_train: 1
+  max_inflight_prompts: 1
+  max_buffered_rollouts: 2
+  rollout_failure:
+    max_infra_attempts_per_prompt: 1
+    max_data_attempts_per_prompt: 1
+    backoff_base_s: 1.0
+    max_backoff_s: 10.0
+    max_consecutive_dropped_prompts: 0
+    max_skipped_prompts: 0
+    on_dropped_prompt: shrink
+    max_replacement_attempts: 0
+    replacement_reserve_prompts: 0
+    min_step_batch_fraction: 1.0
+    nemo_gym:
+      rollout_timeout_s: 900.0
+      max_row_attempts: 1
+  stall_watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 1200.0
+    stall_action: abort
+    gym_subprocess_check: true
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+
+data:
+  shuffle: false
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  # Gym's mask_sample signal is retained in sample_mask for the loss while the
+  # same rows still participate in the prompt-group advantage baseline.
+  should_mask_flagged_samples: true
+  nemo_gym:
+    # This run is live and single-environment: no replay cache, and only the two
+    # listed Gym configs are loaded even though the flagship base carries
+    # dormant resource-server definitions for its multi-environment blend.
+    num_gpu_nodes: 0
+    effort_levels:
+      low_string: "{reasoning effort: efficient}"
+      low_weight: 0.1
+      low_penalty: 1
+      low_ub: 15000
+    run_response_cache_enabled: false
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
+
+# Pipeclean applies these four Gym-result penalties before the effective reward
+# reaches GRPO.  The source instrumentation logs raw task score, post-effort /
+# pre-penalty reward, and post-penalty effective reward as separate series.
+reward_penalties:
+  penalize_duplicated_reasoning: true
+  penalize_empty_final_answer: true
+  penalize_unwanted_tokens: true
+  penalize_malformed_think_tag: true
+  token_ids:
+    unwanted: [2]
+    think_open: 12
+    think_close: 13
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: false
+  monitor_gpus: true
+  wandb:
+    entity: nvidia
+    project: nano35-rlvr-convergence
+    log_nemo_gym_full_result_tables: false
