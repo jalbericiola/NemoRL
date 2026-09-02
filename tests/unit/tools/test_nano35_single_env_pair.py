@@ -1466,11 +1466,41 @@ def test_strict_pair_config_composes_for_both_arms(mode: str) -> None:
     assert not master_config.logger["tensorboard_enabled"]
     assert master_config.logger["wandb"]["entity"] == "nvidia"
     assert master_config.logger["wandb"]["project"] == "nano35-rlvr-convergence"
-    assert master_config.env["nemo_gym"]["config_paths"] == [
+    nemo_gym = master_config.env["nemo_gym"]
+    assert nemo_gym["config_paths"] == [
         "responses_api_models/vllm_model/configs/vllm_model_for_training.yaml",
         "resources_servers/reasoning_gym/configs/reasoning_gym.yaml",
     ]
-    assert not master_config.env["nemo_gym"]["run_response_cache_enabled"]
+    assert nemo_gym["skip_venv_if_present"] is True
+    assert nemo_gym["port_range_low"] == 5000
+    assert nemo_gym["port_range_high"] == 5999
+    assert nemo_gym["gzip_responses_enabled"] is True
+    assert nemo_gym["global_aiohttp_connector_limit"] == 4096
+    assert nemo_gym["global_aiohttp_connector_limit_per_host"] == 4096
+    assert not nemo_gym["run_response_cache_enabled"]
+    service_config_kinds = {
+        "responses_api_models",
+        "responses_api_agents",
+        "resources_servers",
+    }
+    embedded_service_names = {
+        name
+        for name, value in nemo_gym.items()
+        if isinstance(value, dict) and service_config_kinds.intersection(value)
+    }
+    assert embedded_service_names == {"policy_model"}
+    assert {
+        "policy_model_reasoning_off",
+        "safety_judge_model",
+        "nl2bash_judge_model",
+        "genrm_model",
+    }.isdisjoint(nemo_gym)
+    # The two authenticated Gym configs add the resource server and its agent;
+    # the only embedded service is the policy-model overlay above.
+    assert embedded_service_names | {
+        "reasoning_gym",
+        "reasoning_gym_simple_agent",
+    } == {"policy_model", "reasoning_gym", "reasoning_gym_simple_agent"}
     assert master_config.env["should_mask_flagged_samples"] is True
     assert master_config.reward_penalties.model_dump() == {
         "penalize_duplicated_reasoning": True,
