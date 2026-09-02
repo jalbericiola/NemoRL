@@ -15,7 +15,7 @@
 from collections.abc import Mapping
 from typing import Any, Literal, NotRequired, TypedDict, Union, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
 from nemo_rl.data.packing.shared_prefix_tensors import (
     resolve_shared_prefix_parallel_topology,
@@ -233,7 +233,7 @@ class SequencePackingConfig(TypedDict):
     microbatch_order: NotRequired[Literal["packer", "largest_first"]]
 
 
-class SharedPrefixTrainingConfig(BaseModel, extra="allow"):
+class SharedPrefixTrainingConfig(BaseModel, extra="forbid"):
     """Controls prompt-prefix sharing in policy training forwards.
 
     ``disabled`` preserves the existing packing and model execution. ``observe``
@@ -246,7 +246,7 @@ class SharedPrefixTrainingConfig(BaseModel, extra="allow"):
     """
 
     mode: Literal["disabled", "observe", "train"] = "disabled"
-    require_deterministic_execution: bool = False
+    require_deterministic_execution: StrictBool = False
 
 
 class RewardModelConfig(TypedDict):

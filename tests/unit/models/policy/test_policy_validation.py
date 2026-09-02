@@ -233,6 +233,31 @@ def test_shared_prefix_observe_mode_is_backend_neutral() -> None:
     assert resolved_config.mode == "observe"
 
 
+def test_shared_prefix_config_rejects_misspelled_determinism_flag() -> None:
+    config = create_megatron_config("test-model", tp=1)
+    config["shared_prefix_training"] = {
+        "mode": "observe",
+        "require_determinstic_execution": True,
+    }
+
+    with pytest.raises(ValueError, match="require_determinstic_execution"):
+        validate_shared_prefix_training_config(config)
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", "true"])
+def test_shared_prefix_config_rejects_coerced_determinism_flag(
+    value: object,
+) -> None:
+    config = create_megatron_config("test-model", tp=1)
+    config["shared_prefix_training"] = {
+        "mode": "observe",
+        "require_deterministic_execution": value,
+    }
+
+    with pytest.raises(ValueError, match="require_deterministic_execution"):
+        validate_shared_prefix_training_config(config)
+
+
 def test_shared_prefix_disabled_mode_rejects_deterministic_execution_opt_in() -> None:
     config = create_dtensor_config("test-model", tp=1)
     config["shared_prefix_training"] = {
