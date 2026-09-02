@@ -12,6 +12,11 @@ readonly BASE_DEPLOYMENT="/lustre/fs1/portfolios/llmservice/projects/llmservice_
 readonly BASE_READY="441548f85b9779788d458a0d4deeefcca789ed8b46810a1f6a929492cd27d4cf"
 readonly SOURCE_DEPLOYMENT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/non_acceptance_overlays/NON_ACCEPTANCE_fast_mtp_runtime_4ab5167b_ebad1b2b_8ca0abaa"
 readonly SOURCE_READY="0406f4fcf57f37de7fb9506a9218df5b3488230d58e531eb68ce8d057d3e5cb1"
+readonly RUNTIME_PATCH="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/non_acceptance_overlays/NON_ACCEPTANCE_nemorl_mtp_refit_ownership_4c313164_7866c1fb"
+readonly RUNTIME_PATCH_READY="7866c1fb8a855356870696c5bbd029d3e507d83d34145ebe71181fb1b69b7b07"
+readonly RUNTIME_PATCH_FILE_SHA256="4bae14a7c405605998d54b096032c6e3bc719ab7f5f6bbf1835be058bf936c01"
+readonly RUNTIME_PATCH_NEMO_HEAD="4c313164da396f775a6d09eaa2d8823a9ac05172"
+readonly RUNTIME_PATCH_NEMO_TREE="0628c81bad84b73b956d73578e9a66e2e7280c71"
 readonly SOURCE_READY_FILE_SHA256="05fec7c7dc9a0fcf59220634d4031c456f1d27bfd99f19fa86da69806be996f4"
 readonly SOURCE_DEPLOYMENT_MANIFEST_SHA256="0406f4fcf57f37de7fb9506a9218df5b3488230d58e531eb68ce8d057d3e5cb1"
 readonly NEMO_RUNNABLE_MANIFEST_SHA256="159e61c46b20cecf486b3fedcbaee29f7bfbfe8b91d0deb51e089766611f177b"
@@ -170,6 +175,7 @@ assert_exact_reasoning_gym_services() {
 }
 
 for required_dir in "${BASE_DEPLOYMENT}" "${SOURCE_DEPLOYMENT}" \
+  "${RUNTIME_PATCH}" \
   "${NEMO_ROOT}" "${BRIDGE_ROOT}" "${MCORE_ROOT}" "${GYM_ROOT}" \
   "${AUTOMODEL_ROOT}" "${MODEL_PATH}"; do
   [[ -d "${required_dir}" && ! -L "${required_dir}" ]] || {
@@ -178,6 +184,9 @@ for required_dir in "${BASE_DEPLOYMENT}" "${SOURCE_DEPLOYMENT}" \
   }
 done
 for required_file in "${BASE_DEPLOYMENT}/READY" "${SOURCE_DEPLOYMENT}/READY" \
+  "${RUNTIME_PATCH}/READY" "${RUNTIME_PATCH}/NON_ACCEPTANCE" \
+  "${RUNTIME_PATCH}/PAYLOAD.sha256" "${RUNTIME_PATCH}/PROVENANCE.json" \
+  "${RUNTIME_PATCH}/vllm_backend.py" \
   "${SOURCE_DEPLOYMENT}/NON_ACCEPTANCE" \
   "${SOURCE_DEPLOYMENT}/DEPLOYMENT.sha256" \
   "${SOURCE_DEPLOYMENT}/NemoRL.runnable.sha256" \
@@ -199,6 +208,11 @@ unset required_dir required_file
 [[ "$(< "${BASE_DEPLOYMENT}/READY")" == "${BASE_READY}" ]]
 [[ "$(< "${SOURCE_DEPLOYMENT}/READY")" == "${SOURCE_READY}" ]]
 [[ "$(< "${SOURCE_DEPLOYMENT}/NON_ACCEPTANCE")" == "scientific_acceptance=false" ]]
+[[ "$(< "${RUNTIME_PATCH}/READY")" == "${RUNTIME_PATCH_READY}" ]]
+[[ "$(< "${RUNTIME_PATCH}/NON_ACCEPTANCE")" == "scientific_acceptance=false" ]]
+[[ "$(sha256_file "${RUNTIME_PATCH}/PAYLOAD.sha256")" == "${RUNTIME_PATCH_READY}" ]]
+[[ "$(sha256_file "${RUNTIME_PATCH}/vllm_backend.py")" == "${RUNTIME_PATCH_FILE_SHA256}" ]]
+(cd "${RUNTIME_PATCH}" && /usr/bin/sha256sum -c PAYLOAD.sha256 >/dev/null)
 [[ "$(sha256_file "${SOURCE_DEPLOYMENT}/READY")" == "${SOURCE_READY_FILE_SHA256}" ]]
 [[ "$(sha256_file "${SOURCE_DEPLOYMENT}/DEPLOYMENT.sha256")" == "${SOURCE_DEPLOYMENT_MANIFEST_SHA256}" ]]
 [[ "$(sha256_file "${SOURCE_DEPLOYMENT}/NemoRL.runnable.sha256")" == "${NEMO_RUNNABLE_MANIFEST_SHA256}" ]]
@@ -233,13 +247,17 @@ assert_exact_reasoning_gym_services "${NEMO_ROOT}/${CONFIG_PATH}"
 # the runtime-critical file hashes above, and leave the full re-verification to
 # the separately running acceptance-deployment lane.
 [[ "$(/usr/bin/stat -c '%a' -- "${SOURCE_DEPLOYMENT}")" == "555" ]]
+[[ "$(/usr/bin/stat -c '%a' -- "${RUNTIME_PATCH}")" == "555" ]]
+[[ "$(/usr/bin/stat -c '%a' -- "${RUNTIME_PATCH}/vllm_backend.py")" == "444" ]]
 [[ "$(/usr/bin/stat -c '%a' -- "${NEMO_ROOT}")" == "555" ]]
 [[ "$(/usr/bin/stat -c '%a' -- "${BRIDGE_ROOT}")" == "555" ]]
 [[ "$(/usr/bin/stat -c '%a' -- "${MCORE_ROOT}")" == "555" ]]
 
-printf 'EXPLORATORY_RGY2_MTP_RUNTIME_PRECHECK_GREEN acceptance=false inventory_rehash=false source_ready=%s nemo=%s bridge=%s mcore=%s fixture=%s nodes_per_arm=1 gpus_per_arm=4 steps=2 vllm_gpu_memory_utilization=%s\n' \
-  "${SOURCE_READY}" "${EXPECTED_NEMO_HEAD}" "${EXPECTED_BRIDGE_HEAD}" \
-  "${EXPECTED_MCORE_HEAD}" "${EXPECTED_FIXTURE_SHA256}" \
+printf 'EXPLORATORY_RGY2_MTP_RUNTIME_PRECHECK_GREEN acceptance=false inventory_rehash=false source_ready=%s nemo=%s runtime_patch_nemo=%s runtime_patch=%s bridge=%s mcore=%s fixture=%s nodes_per_arm=1 gpus_per_arm=4 steps=2 vllm_gpu_memory_utilization=%s\n' \
+  "${SOURCE_READY}" "${EXPECTED_NEMO_HEAD}" \
+  "${RUNTIME_PATCH_NEMO_HEAD}" "${RUNTIME_PATCH_READY}" \
+  "${EXPECTED_BRIDGE_HEAD}" "${EXPECTED_MCORE_HEAD}" \
+  "${EXPECTED_FIXTURE_SHA256}" \
   "${VLLM_GPU_MEMORY_UTILIZATION}"
 if [[ "${launch_mode}" == "--check" ]]; then
   exit 0
@@ -251,7 +269,7 @@ fi
 }
 umask 077
 readonly pair_nonce="$(/cm/local/apps/python3/bin/python3 -I -B -c 'import secrets; print(secrets.token_hex(8))')"
-readonly pair_id="exploratory-rgy2-mtp-runtime-mem60-NON-ACCEPTANCE-$(date -u +%Y%m%dT%H%M%SZ)-${pair_nonce}"
+readonly pair_id="exploratory-rgy2-mtp-runtime-mem60-ownfix-NON-ACCEPTANCE-$(date -u +%Y%m%dT%H%M%SZ)-${pair_nonce}"
 readonly pair_root="${STATE_ROOT}/${pair_id}"
 mkdir -p -- "${pair_root}/off" "${pair_root}/on"
 
@@ -260,6 +278,10 @@ mkdir -p -- "${pair_root}/off" "${pair_root}/on"
   printf 'purpose=surface_runtime_generation_reward_mtp_backward_breakage\n'
   printf 'pair_id=%s\nsource_deployment=%s\nsource_ready=%s\n' \
     "${pair_id}" "${SOURCE_DEPLOYMENT}" "${SOURCE_READY}"
+  printf 'runtime_patch=%s\nruntime_patch_ready=%s\nruntime_patch_nemo_head=%s\nruntime_patch_nemo_tree=%s\nruntime_patch_file_sha256=%s\n' \
+    "${RUNTIME_PATCH}" "${RUNTIME_PATCH_READY}" \
+    "${RUNTIME_PATCH_NEMO_HEAD}" "${RUNTIME_PATCH_NEMO_TREE}" \
+    "${RUNTIME_PATCH_FILE_SHA256}"
   printf 'nemo_head=%s\nnemo_tree=%s\nbridge_head=%s\nbridge_tree=%s\nmcore_head=%s\nmcore_tree=%s\npair_launcher_path=%s\npair_launcher_sha256=%s\npair_helper_sha256=%s\nnano_launcher_sha256=%s\nconfig_sha256=%s\n' \
     "${EXPECTED_NEMO_HEAD}" "${EXPECTED_NEMO_TREE}" \
     "${EXPECTED_BRIDGE_HEAD}" "${EXPECTED_BRIDGE_TREE}" \
@@ -285,7 +307,7 @@ launch_arm() {
   local receipt_root="${arm_root}/runtime_receipts"
   local extra_mounts
   mkdir -p -- "${cache_root}" "${receipt_root}"
-  extra_mounts="${BASE_DEPLOYMENT}:${BASE_DEPLOYMENT}:ro,${SOURCE_DEPLOYMENT}:${SOURCE_DEPLOYMENT}:ro,${AUTOMODEL_ROOT}:/opt/nemo-rl/3rdparty/Automodel-workspace/Automodel:ro,${BRIDGE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:ro,${MCORE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:ro,${GYM_ROOT}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:ro,${MODEL_PATH}:${MODEL_PATH}:ro"
+  extra_mounts="${BASE_DEPLOYMENT}:${BASE_DEPLOYMENT}:ro,${SOURCE_DEPLOYMENT}:${SOURCE_DEPLOYMENT}:ro,${AUTOMODEL_ROOT}:/opt/nemo-rl/3rdparty/Automodel-workspace/Automodel:ro,${BRIDGE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:ro,${MCORE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:ro,${GYM_ROOT}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:ro,${MODEL_PATH}:${MODEL_PATH}:ro,${RUNTIME_PATCH}/vllm_backend.py:/opt/nemo-rl/nemo_rl/models/generation/vllm/vllm_backend.py:ro"
 
   export PATH="${HOST_PATH}" SLURM_CONF="${SLURM_CONF_PATH}"
   export EXP_NAME="x-rgy2-mtp-${pair_nonce}-${arm}"
