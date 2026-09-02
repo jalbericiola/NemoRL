@@ -1,6 +1,9 @@
 #!/bin/bash
 # Submit a bounded one-node-per-arm Reasoning-Gym OFF/ON GPU smoke from one
-# complete immutable NeMo-RL 4c313 source overlay.
+# complete immutable NeMo-RL 4c313 source overlay, with the unquantized MoE
+# backend pinned to Triton.  This calibration bypasses the independently
+# diagnosed FlashInfer/TRTLLM post-load-layout refit failure; it is not
+# evidence that the production FlashInfer path is fixed.
 #
 # This launcher is deliberately NON-ACCEPTANCE evidence.  It exists to expose
 # integration, generation, reward, MTP, and backward failures before the
@@ -43,7 +46,7 @@ readonly FIXTURE_PATH="${BASE_RUNNABLE}/single_env_ab/data/reasoning_gym_example
 readonly MODEL_PATH="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/venkats/nemo-evaluator-rundirs/nano_v35_sft/conversions/upsampled-iter6000/hf"
 readonly CONTAINER="/lustre/fs1/portfolios/llmservice/projects/llmservice_nemotron_ultra/users/sauramishra/containers/rl-gym.63635108.sqsh"
 readonly SANDBOX_CONTAINER="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/geshen/mopd_nano_fast/images/nemo-skills-sandbox-no-sync.sqsh"
-readonly STATE_ROOT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/exploratory_rgy2_full_nemorl_4c313_NON_ACCEPTANCE"
+readonly STATE_ROOT="/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/jalbericiola/rlvr41_spfx_validation/exploratory_rgy2_triton_moe_4c313_NON_ACCEPTANCE"
 
 readonly EXPECTED_NEMO_HEAD="4c313164da396f775a6d09eaa2d8823a9ac05172"
 readonly EXPECTED_NEMO_TREE="0628c81bad84b73b956d73578e9a66e2e7280c71"
@@ -263,7 +266,7 @@ for immutable_nemo_file in "${NEMO_ROOT}/${CONFIG_PATH}" \
 done
 unset immutable_nemo_file
 
-printf 'EXPLORATORY_RGY2_FULL_NEMO_PRECHECK_GREEN acceptance=false inventory_rehash=false nemo_ready=%s component_ready=%s nemo=%s backend=%s bridge=%s mcore=%s fixture=%s nodes_per_arm=1 gpus_per_arm=4 steps=2 vllm_gpu_memory_utilization=%s\n' \
+printf 'EXPLORATORY_RGY2_TRITON_MOE_PRECHECK_GREEN acceptance=false inventory_rehash=false moe_backend=triton nemo_ready=%s component_ready=%s nemo=%s backend=%s bridge=%s mcore=%s fixture=%s nodes_per_arm=1 gpus_per_arm=4 steps=2 vllm_gpu_memory_utilization=%s\n' \
   "${NEMO_READY}" "${COMPONENT_READY}" "${EXPECTED_NEMO_HEAD}" \
   "${EXPECTED_VLLM_BACKEND_SHA256}" \
   "${EXPECTED_BRIDGE_HEAD}" "${EXPECTED_MCORE_HEAD}" \
@@ -279,13 +282,14 @@ fi
 }
 umask 077
 readonly pair_nonce="$(/cm/local/apps/python3/bin/python3 -I -B -c 'import secrets; print(secrets.token_hex(8))')"
-readonly pair_id="exploratory-rgy2-full-nemo-4c313-mem60-NON-ACCEPTANCE-$(date -u +%Y%m%dT%H%M%SZ)-${pair_nonce}"
+readonly pair_id="exploratory-rgy2-triton-moe-4c313-mem60-NON-ACCEPTANCE-$(date -u +%Y%m%dT%H%M%SZ)-${pair_nonce}"
 readonly pair_root="${STATE_ROOT}/${pair_id}"
 mkdir -p -- "${pair_root}/off" "${pair_root}/on"
 
 {
   printf 'status=EXPLORATORY_NON_ACCEPTANCE\nscientific_acceptance=false\n'
-  printf 'purpose=surface_full_nemorl_runtime_generation_reward_mtp_backward_breakage\n'
+  printf 'purpose=surface_runtime_generation_reward_mtp_backward_after_bypassing_flashinfer_moe_layout_refit_failure\n'
+  printf 'moe_backend=triton\nproduction_flashinfer_refit_fixed=false\n'
   printf 'pair_id=%s\nnemo_deployment=%s\nnemo_ready=%s\ncomponent_deployment=%s\ncomponent_ready=%s\n' \
     "${pair_id}" "${NEMO_DEPLOYMENT}" "${NEMO_READY}" \
     "${COMPONENT_DEPLOYMENT}" "${COMPONENT_READY}"
@@ -380,7 +384,7 @@ launch_arm() {
   export UV_CACHE_DIR_OVERRIDE= MOUNTS="${arm_root}:${arm_root}"
   export EXTRA_MOUNTS="${extra_mounts}"
   export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.ignoreSubmodules GIT_CONFIG_VALUE_0=all
-  export SLURM_COMMENT='{"purpose":"EXPLORATORY_NON_ACCEPTANCE_RGY2_FULL_NEMO_4C313","owner":"jalbericiola"}'
+  export SLURM_COMMENT='{"purpose":"EXPLORATORY_NON_ACCEPTANCE_RGY2_TRITON_MOE_4C313","owner":"jalbericiola"}'
 
   # nano35_launch.sh concatenates overrides into a shell command. Preserve
   # the YAML quotes through that second shell parse so Hydra receives a
@@ -393,6 +397,7 @@ launch_arm() {
     '++policy.megatron_cfg.env_vars.NEMORL_SHARED_PREFIX_RUNTIME_TRACE=\"1\"' \
     ++policy.generation.vllm_cfg.enforce_eager=true \
     ++policy.generation.vllm_cfg.enable_prefix_caching=false \
+    ++policy.generation.vllm_kwargs.moe_backend=triton \
     "policy.generation.vllm_cfg.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION}" \
     '~policy.generation.vllm_kwargs.compilation_config' \
     logger.wandb_enabled=true logger.tensorboard_enabled=false \
@@ -421,5 +426,5 @@ readonly on_job_id="$(sed -n 's/^Submitted batch job \([1-9][0-9]*\)$/\1/p' "${p
   printf 'ERROR: could not parse both candidate job IDs; pair_root=%s\n' "${pair_root}" >&2
   exit 1
 }
-printf 'EXPLORATORY_RGY2_FULL_NEMO_PAIR_SUBMITTED acceptance=false pair_id=%s off_candidate_job=%s on_candidate_job=%s pair_root=%s wandb_group=%s\n' \
+printf 'EXPLORATORY_RGY2_TRITON_MOE_PAIR_SUBMITTED acceptance=false moe_backend=triton pair_id=%s off_candidate_job=%s on_candidate_job=%s pair_root=%s wandb_group=%s\n' \
   "${pair_id}" "${off_job_id}" "${on_job_id}" "${pair_root}" "${pair_id}"
