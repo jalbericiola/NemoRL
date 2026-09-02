@@ -38,6 +38,7 @@ _IMPORT_TIME_DETERMINISM_ENV = {
         "CUBLAS_WORKSPACE_CONFIG",
         "MAMBA_DETERMINISTIC",
         "NCCL_ALGO",
+        "NRL_SP_DETERMINISTIC_BACKWARD",
         "NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
         "RESULTS_DIR",
@@ -200,6 +201,7 @@ def test_initializer_receives_worker_import_time_determinism_environment() -> No
         "HF_HOME": "/tmp/hf",
         "MAMBA_DETERMINISTIC": "1",
         "NCCL_ALGO": "Ring",
+        "NRL_SP_DETERMINISTIC_BACKWARD": "1",
         "NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR": (
             "/tmp/results/shared_prefix_determinism_receipts/123-0"
         ),
@@ -217,6 +219,7 @@ def test_initializer_receives_worker_import_time_determinism_environment() -> No
         "HF_HOME": "/tmp/hf",
         "MAMBA_DETERMINISTIC": "1",
         "NCCL_ALGO": "Ring",
+        "NRL_SP_DETERMINISTIC_BACKWARD": "1",
         "NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR": (
             "/tmp/results/shared_prefix_determinism_receipts/123-0"
         ),
@@ -270,6 +273,7 @@ def test_initializer_cold_import_receives_determinism_env_only_when_strict(
         "CUBLAS_WORKSPACE_CONFIG",
         "MAMBA_DETERMINISTIC",
         "NCCL_ALGO",
+        "NRL_SP_DETERMINISTIC_BACKWARD",
         "NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
         "RESULTS_DIR",
@@ -286,6 +290,7 @@ def test_initializer_cold_import_receives_determinism_env_only_when_strict(
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "MAMBA_DETERMINISTIC": configured_mamba,
         "NCCL_ALGO": "Ring",
+        "NRL_SP_DETERMINISTIC_BACKWARD": "1",
         "NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR": (
             "/tmp/results/shared_prefix_determinism_receipts/123-0"
         ),

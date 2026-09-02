@@ -131,6 +131,7 @@ policy:
     # arms.  Validation rejects missing or drifted values before workers start.
     env_vars:
       MAMBA_DETERMINISTIC: "1"
+      NRL_SP_DETERMINISTIC_BACKWARD: "1"
       NVTE_ALLOW_NONDETERMINISTIC_ALGO: "0"
       CUBLAS_WORKSPACE_CONFIG: ":4096:8"
       NCCL_ALGO: "Ring"

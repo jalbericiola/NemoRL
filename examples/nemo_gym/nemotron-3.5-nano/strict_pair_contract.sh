@@ -906,8 +906,9 @@ import sys
 def determinism_marker(mode: str) -> str:
     return (
         "SHARED_PREFIX_DETERMINISM_ATTESTED "
-        f"mode={mode} env_controls=4 triton_autotune=absent "
-        "model_overrides=3 torch_deterministic=true total_controls=8"
+        f"mode={mode} env_controls=5 triton_autotune=absent "
+        "model_overrides=3 torch_deterministic=true mcore_backward=true "
+        "total_controls=9"
     )
 
 

@@ -72,6 +72,13 @@ def _set_deterministic_worker_environment(monkeypatch, tmp_path):
         str(receipt_dir),
     )
     monkeypatch.setenv("RANK", "0")
+    monkeypatch.setattr(
+        worker_module,
+        "import_module",
+        lambda _name: SimpleNamespace(
+            is_shared_prefix_deterministic_backward_enabled=lambda: True
+        ),
+    )
     return worker_module
 
 
@@ -128,9 +135,9 @@ def test_shared_prefix_worker_enables_torch_determinism_before_cuda(
     log_info.assert_called_once_with(
         "%s",
         "SHARED_PREFIX_DETERMINISM_ATTESTED "
-        f"mode={shared_prefix_config['mode']} env_controls=4 "
+        f"mode={shared_prefix_config['mode']} env_controls=5 "
         "triton_autotune=absent model_overrides=3 torch_deterministic=true "
-        "total_controls=8",
+        "mcore_backward=true total_controls=9",
     )
     receipt_path = (
         tmp_path
@@ -140,6 +147,60 @@ def test_shared_prefix_worker_enables_torch_determinism_before_cuda(
         / f"shared_prefix_determinism.{shared_prefix_config['mode']}.rank-0.receipt"
     )
     assert receipt_path.read_text() == log_info.call_args.args[1]
+
+
+@pytest.mark.parametrize(
+    ("mcore_module", "expected_error"),
+    [
+        (
+            SimpleNamespace(),
+            "is_shared_prefix_deterministic_backward_enabled.*support",
+        ),
+        (
+            SimpleNamespace(
+                is_shared_prefix_deterministic_backward_enabled=lambda: False
+            ),
+            "resolve deterministic FlashAttention backward.*False",
+        ),
+    ],
+)
+def test_shared_prefix_worker_rejects_unattested_mcore_before_torch_or_receipt(
+    monkeypatch,
+    tmp_path,
+    mcore_module,
+    expected_error,
+) -> None:
+    worker_module = _set_deterministic_worker_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(worker_module, "import_module", lambda _name: mcore_module)
+    enable_determinism = MagicMock()
+    monkeypatch.setattr(
+        worker_module.torch,
+        "use_deterministic_algorithms",
+        enable_determinism,
+    )
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        worker_module._enable_shared_prefix_deterministic_execution(
+            _deterministic_worker_config(worker_module, {"mode": "train"})
+        )
+
+    enable_determinism.assert_not_called()
+    receipt_dir = Path(
+        os.environ[worker_module.SHARED_PREFIX_DETERMINISM_RECEIPT_DIR_ENV_VAR_NAME]
+    )
+    assert list(receipt_dir.iterdir()) == []
+
+
+def test_shared_prefix_worker_rejects_missing_mcore_module(monkeypatch) -> None:
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    def fail_import(_name):
+        raise ImportError("missing test module")
+
+    monkeypatch.setattr(worker_module, "import_module", fail_import)
+
+    with pytest.raises(RuntimeError, match="requires an MCore shared-prefix implementation"):
+        worker_module._attest_mcore_shared_prefix_deterministic_backward("train")
 
 
 def test_worker_constructor_attests_determinism_before_any_other_action() -> None:

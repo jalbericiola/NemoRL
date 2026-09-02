@@ -902,8 +902,9 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         mode = {"off": "observe", "on": "train"}[arm]
         marker = (
             "SHARED_PREFIX_DETERMINISM_ATTESTED "
-            f"mode={mode} env_controls=4 triton_autotune=absent "
-            "model_overrides=3 torch_deterministic=true total_controls=8"
+            f"mode={mode} env_controls=5 triton_autotune=absent "
+            "model_overrides=3 torch_deterministic=true mcore_backward=true "
+            "total_controls=9"
         )
         attestation = runtime_attestation["lines"][arm]
         assert attestation["mode"] == mode

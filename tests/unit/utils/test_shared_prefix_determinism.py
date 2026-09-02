@@ -38,8 +38,9 @@ def test_publish_determinism_receipt_is_exact_immutable_evidence(
 
     expected_marker = (
         "SHARED_PREFIX_DETERMINISM_ATTESTED "
-        f"mode={mode} env_controls=4 triton_autotune=absent "
-        "model_overrides=3 torch_deterministic=true total_controls=8"
+        f"mode={mode} env_controls=5 triton_autotune=absent "
+        "model_overrides=3 torch_deterministic=true mcore_backward=true "
+        "total_controls=9"
     )
     receipt_path = receipt_dir / f"shared_prefix_determinism.{mode}.rank-2.receipt"
     assert marker == expected_marker

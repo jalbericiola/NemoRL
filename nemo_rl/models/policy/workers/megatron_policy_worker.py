@@ -22,6 +22,7 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
+from importlib import import_module
 from typing import Any, Iterable, Iterator, Literal, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
@@ -158,6 +159,40 @@ def _compose_mtp_grad_scale(
     return main_grad_scale_func(normalization_scale)
 
 
+def _attest_mcore_shared_prefix_deterministic_backward(mode: str) -> None:
+    """Require MCore to report the resolved deterministic-backward setting.
+
+    The setting is consumed when MCore's fused shared-prefix module is imported.
+    Checking MCore's resolved value catches both an old MCore revision that ignores
+    the launcher environment and an import that occurred before the environment was
+    installed.
+    """
+
+    module_name = "megatron.core.models.hybrid.shared_prefix_fused"
+    try:
+        shared_prefix_fused = import_module(module_name)
+    except ImportError as error:
+        raise RuntimeError(
+            f"shared-prefix mode={mode} deterministic worker requires an MCore "
+            "shared-prefix implementation with deterministic-backward attestation"
+        ) from error
+
+    accessor_name = "is_shared_prefix_deterministic_backward_enabled"
+    accessor = getattr(shared_prefix_fused, accessor_name, None)
+    if not callable(accessor):
+        raise RuntimeError(
+            f"shared-prefix mode={mode} deterministic worker requires MCore "
+            f"{module_name}.{accessor_name}() support"
+        )
+    resolved_value = accessor()
+    if resolved_value is not True:
+        raise RuntimeError(
+            f"shared-prefix mode={mode} deterministic worker requires MCore to "
+            "resolve deterministic FlashAttention backward before import; got "
+            f"{resolved_value!r}"
+        )
+
+
 def _enable_shared_prefix_deterministic_execution(config: PolicyConfig) -> None:
     """Attest and enable determinism before this worker first touches CUDA.
 
@@ -194,6 +229,8 @@ def _enable_shared_prefix_deterministic_execution(config: PolicyConfig) -> None:
                 f"import-time environment {name}={expected_value!r}; got "
                 f"{actual_value!r}."
             )
+
+    _attest_mcore_shared_prefix_deterministic_backward(mode)
 
     try:
         model_overrides = config["megatron_cfg"]["model_overrides"]

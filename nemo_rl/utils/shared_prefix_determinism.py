@@ -24,6 +24,7 @@ from types import MappingProxyType
 SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES: Mapping[str, str] = MappingProxyType(
     {
         "MAMBA_DETERMINISTIC": "1",
+        "NRL_SP_DETERMINISTIC_BACKWARD": "1",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "NCCL_ALGO": "Ring",
@@ -50,9 +51,9 @@ SHARED_PREFIX_DETERMINISM_RECEIPT_PATH_ENV_VAR_NAMES = (
     SHARED_PREFIX_DETERMINISM_RECEIPT_DIR_ENV_VAR_NAME,
 )
 SHARED_PREFIX_DETERMINISM_ATTESTATION_TEMPLATE = (
-    "SHARED_PREFIX_DETERMINISM_ATTESTED mode={mode} env_controls=4 "
+    "SHARED_PREFIX_DETERMINISM_ATTESTED mode={mode} env_controls=5 "
     "triton_autotune=absent model_overrides=3 torch_deterministic=true "
-    "total_controls=8"
+    "mcore_backward=true total_controls=9"
 )
 
 _SHARED_PREFIX_DETERMINISTIC_MODES = frozenset({"observe", "train"})

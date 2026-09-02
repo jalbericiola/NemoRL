@@ -176,7 +176,7 @@ else
 fi
 strict_pair_verify_snapshot "${ARM}" "${ARM_SNAPSHOT_DIR}"
 LAUNCHER="${ARM_SNAPSHOT_DIR}/${LAUNCHER_REL}"
-EXPECTED_DETERMINISM_ATTESTATION="SHARED_PREFIX_DETERMINISM_ATTESTED mode=${SHARED_PREFIX_MODE} env_controls=4 triton_autotune=absent model_overrides=3 torch_deterministic=true total_controls=8"
+EXPECTED_DETERMINISM_ATTESTATION="SHARED_PREFIX_DETERMINISM_ATTESTED mode=${SHARED_PREFIX_MODE} env_controls=5 triton_autotune=absent model_overrides=3 torch_deterministic=true mcore_backward=true total_controls=9"
 EXPECTED_DETERMINISM_ATTESTATION_SHA256="$(
   strict_pair_sha256_text "${EXPECTED_DETERMINISM_ATTESTATION}"
 )"

@@ -185,6 +185,7 @@ def _add_shared_prefix_determinism_contract(config: PolicyConfig) -> PolicyConfi
     megatron_config = cast(dict[str, Any], config["megatron_cfg"])
     megatron_config["env_vars"] = {
         "MAMBA_DETERMINISTIC": "1",
+        "NRL_SP_DETERMINISTIC_BACKWARD": "1",
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "NCCL_ALGO": "Ring",
@@ -362,6 +363,8 @@ def test_shared_prefix_strict_observe_rejects_determinism_contract_drift(
     [
         ("MAMBA_DETERMINISTIC", None),
         ("MAMBA_DETERMINISTIC", "0"),
+        ("NRL_SP_DETERMINISTIC_BACKWARD", None),
+        ("NRL_SP_DETERMINISTIC_BACKWARD", "0"),
         ("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1"),
         ("CUBLAS_WORKSPACE_CONFIG", ":16:8"),
         ("NCCL_ALGO", "Tree"),
