@@ -20,9 +20,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-LAUNCHER = (
-    REPO_ROOT / "examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh"
-)
+LAUNCHER = REPO_ROOT / "examples/nemo_gym/nemotron-3.5-nano/nano35_launch.sh"
 
 
 def _run_nano_launcher(*hydra_overrides: str, **env_overrides: str):
@@ -186,9 +184,7 @@ class Nano35LaunchContractTest(unittest.TestCase):
         result = _run_nano_launcher(COLOCATED_GENERATION="true")
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn(
-            "COLOCATED_GENERATION must be exactly 0 or 1", result.stderr
-        )
+        self.assertIn("COLOCATED_GENERATION must be exactly 0 or 1", result.stderr)
 
 
 if __name__ == "__main__":
