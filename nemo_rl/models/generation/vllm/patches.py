@@ -12,9 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
+import stat
+import sys
+import tempfile
 from contextlib import contextmanager
+from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
+
+
+_NAMESPACE_TOOL_COMPAT_VLLM_VERSION = "0.25.1"
+_namespace_tool_compat_installed_path: str | None = None
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -48,7 +57,7 @@ def _get_vllm_file(relative_path: str) -> str:
 
 @contextmanager
 def _locked_file_patch(file_path: str):
-    """Yield (content, writer) under an exclusive file lock."""
+    """Yield (content, atomic writer) under an exclusive file lock."""
     import fcntl
 
     lock_path = file_path + ".patch_lock"
@@ -56,12 +65,29 @@ def _locked_file_patch(file_path: str):
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             content = f.read()
 
         def write_back(new_content: str):
-            with open(file_path, "w") as f:
-                f.write(new_content)
+            directory = os.path.dirname(file_path)
+            source_mode = stat.S_IMODE(os.stat(file_path).st_mode)
+            descriptor, temporary_path = tempfile.mkstemp(
+                dir=directory,
+                prefix=f".{os.path.basename(file_path)}.patch-",
+            )
+            try:
+                os.fchmod(descriptor, source_mode)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    descriptor = -1
+                    stream.write(new_content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary_path, file_path)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                if os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
 
         yield content, write_back
     finally:
@@ -184,7 +210,7 @@ def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
     logger.info("Successfully patched llama_eagle3 lm_head ownership.")
 
 
-def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
+def _patch_vllm_tool_parser_namespace_tool(logger) -> bool:
     """Guard vLLM's NamespaceTool import for openai < 2.25.
 
     vLLM 0.25 imports ``openai.types.responses.NamespaceTool`` (added in
@@ -198,10 +224,8 @@ def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
     try:
         file_to_patch = _get_vllm_file("tool_parsers/utils.py")
     except RuntimeError:
-        logger.warning(
-            "Could not locate tool_parsers/utils.py for openai compat patch."
-        )
-        return
+        logger.error("Could not locate tool_parsers/utils.py for openai compat patch.")
+        return False
 
     old_snippet = (
         "from openai.types.responses import (\n"
@@ -227,23 +251,73 @@ def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
     )
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
-        if "except ImportError:  # openai < 2.25.0 predates namespace tools" in content:
+        if new_snippet in content:
             logger.info("vLLM NamespaceTool openai compat patch already applied.")
-            return
+            return True
 
         if old_snippet not in content:
-            logger.warning(
+            logger.error(
                 "Could not apply NamespaceTool openai compat patch: "
                 "expected import block not found in %s. "
                 "The vLLM version may have changed.",
                 file_to_patch,
             )
-            return
+            return False
 
         content = content.replace(old_snippet, new_snippet, 1)
         write_back(content)
 
     logger.info("Successfully patched vLLM NamespaceTool import for openai compat.")
+    return True
+
+
+def _ensure_vllm_tool_parser_namespace_tool() -> logging.Logger:
+    """Install the OpenAI compatibility guard before importing any vLLM module.
+
+    Importing even a seemingly lightweight module such as ``vllm.logger`` or
+    ``vllm.envs`` executes vLLM package initialization. That import can reach
+    ``tool_parsers/utils.py``, so applying the source patch afterwards is too
+    late for the current process. Use only stdlib facilities until the patch is
+    confirmed in place, and fail closed when the pinned source anchor moves.
+    """
+    global _namespace_tool_compat_installed_path
+
+    patch_logger = logging.getLogger("vllm_patch")
+    try:
+        installed_version = version("vllm")
+    except PackageNotFoundError as error:
+        raise RuntimeError(
+            "The vLLM distribution is unavailable; cannot verify the required "
+            "NamespaceTool compatibility patch target."
+        ) from error
+    if installed_version != _NAMESPACE_TOOL_COMPAT_VLLM_VERSION:
+        raise RuntimeError(
+            "The NamespaceTool compatibility patch is pinned to vLLM "
+            f"{_NAMESPACE_TOOL_COMPAT_VLLM_VERSION}, but found {installed_version}."
+        )
+    loaded_tool_parser = sys.modules.get("vllm.tool_parsers.utils")
+    if loaded_tool_parser is not None:
+        loaded_path = getattr(loaded_tool_parser, "__file__", None)
+        if (
+            _namespace_tool_compat_installed_path is None
+            or loaded_path is None
+            or os.path.realpath(loaded_path) != _namespace_tool_compat_installed_path
+        ):
+            raise RuntimeError(
+                "vllm.tool_parsers.utils was imported before the required "
+                "NamespaceTool compatibility patch or from an unverified path."
+            )
+        return patch_logger
+    if not _patch_vllm_tool_parser_namespace_tool(patch_logger):
+        raise RuntimeError(
+            "The required vLLM NamespaceTool compatibility patch could not be "
+            "installed before importing vLLM. Refusing to continue with an "
+            "unverified vLLM/OpenAI source combination."
+        )
+    _namespace_tool_compat_installed_path = os.path.realpath(
+        _get_vllm_file("tool_parsers/utils.py")
+    )
+    return patch_logger
 
 
 def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
@@ -575,10 +649,7 @@ def ensure_vllm_source_compat() -> None:
     first ``import vllm`` submodule that pulls in ``vllm.tool_parsers``.
     Worker processes get this via ``_apply_vllm_patches`` at init.
     """
-    from vllm.logger import init_logger
-
-    patch_logger = init_logger("vllm_patch")
-    _patch_vllm_tool_parser_namespace_tool(patch_logger)
+    patch_logger = _ensure_vllm_tool_parser_namespace_tool()
     _patch_vllm_radio_layerscale_loader(patch_logger)
 
 
@@ -587,6 +658,11 @@ def _apply_vllm_patches(
     *,
     extra_env_vars: list[str] | None = None,
 ) -> None:
+    # This source patch must run before *any* vLLM import. Importing vllm.envs
+    # first is already too late because package initialization can reach the
+    # tool parser that imports NamespaceTool.
+    _ensure_vllm_tool_parser_namespace_tool()
+
     # Import lazily so importing the worker module does not import vLLM.
     import vllm.envs as envs
     from vllm.logger import init_logger
@@ -630,7 +706,6 @@ def _apply_vllm_patches(
         )
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
-    _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
