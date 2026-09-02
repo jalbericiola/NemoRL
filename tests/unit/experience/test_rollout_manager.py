@@ -136,6 +136,7 @@ class _FakeBuffer:
         self.reserve_calls: list[int] = []  # weight_versions passed to reserve
         self.commit_calls: list[tuple[str, object, int, int]] = []
         self.remove_calls: list[str] = []
+        self.remove_in_dp_calls: list[bool] = []
         # reserve(weight_version=X) -> group_id; commit fills the slot.
         self._slots: list[str] = []
 
@@ -164,9 +165,13 @@ class _FakeBuffer:
         )
         return record
 
+    def replace_committed_rollout_metrics(self, group_id: str, rollout_metrics):
+        assert self.commit_calls[-1][0] == group_id
+        self.commit_calls[-1][1].rollout_metrics = dict(rollout_metrics)
+
     async def remove_group(self, group_id: str, *, remove_in_dp: bool = False) -> int:
-        del remove_in_dp
         self.remove_calls.append(group_id)
+        self.remove_in_dp_calls.append(remove_in_dp)
         self._slots.remove(group_id)
         return 1
 
@@ -359,7 +364,7 @@ class TestGenerateAndPushFlow:
             backoff_base_s=0.0,
         )
         mgr = _make_manager(buf, impl, retry_policy=policy)
-        wall_timestamps = iter((100.0, 115.0))
+        wall_timestamps = iter((100.0, 115.0, 120.0))
         work_timestamps = iter((1.0, 4.0, 5.0, 10.0))
         monkeypatch.setattr(
             "nemo_rl.experience.rollout_manager.time.time",
@@ -374,10 +379,39 @@ class TestGenerateAndPushFlow:
 
         _, committed, _, _ = buf.commit_calls[0]
         assert committed.rollout_metrics["cohort/rollout_started_at_s"] == 100.0
-        assert committed.rollout_metrics["cohort/rollout_finished_at_s"] == 115.0
+        assert committed.rollout_metrics["cohort/rollout_finished_at_s"] == 120.0
         # Two attempts took 3s and 5s.  The 7s between them is lifecycle/backoff,
         # represented by the wall interval but excluded from attempt work.
         assert committed.rollout_metrics["timing/rollout/total"] == 8.0
+
+    def test_post_commit_receipt_failure_clears_materialized_rows(self):
+        class _RejectingReceiptBuffer(_FakeBuffer):
+            def replace_committed_rollout_metrics(
+                self, group_id: str, rollout_metrics
+            ) -> None:
+                del group_id, rollout_metrics
+                raise RuntimeError("injected receipt replacement failure")
+
+        record = PromptGroupRecord(
+            prompt_idx=0,
+            prompt=[],
+            extra_env_info=None,
+            metadata={},
+            completions=[],
+            rollout_metrics={
+                "cohort/rollout_started_at_s": 8.0,
+                "cohort/rollout_finished_at_s": 9.0,
+                "timing/rollout/total": 1.0,
+            },
+        )
+        buf = _RejectingReceiptBuffer()
+        mgr = _make_manager(buf, _FakeImpl(record=record))
+
+        with pytest.raises(RuntimeError, match="receipt replacement failure"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert buf.remove_calls == [buf.commit_calls[0][0]]
+        assert buf.remove_in_dp_calls == [True]
 
     def test_start_weight_version_pinned_at_reserve_time(self):
         """If set_weight_version is called mid-rollout, start != end."""

@@ -317,6 +317,37 @@ class TestTQReplayBufferReserveCommit:
             {**_rollout_receipt(), "reward": 1.5, "samples": 2}
         ]
 
+    def test_replace_committed_rollout_metrics_closes_ready_receipt(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+        _run(
+            buf.commit(
+                group_id,
+                _make_record(),
+                start_weight_version=3,
+                end_weight_version=3,
+            )
+        )
+
+        updated = _rollout_receipt(
+            **{
+                "cohort/rollout_finished_at_s": 12.5,
+                "timing/rollout/total": 2.0,
+            }
+        )
+        buf.replace_committed_rollout_metrics(group_id, updated)
+
+        assert buf.rollout_metrics_list == [updated]
+
+    def test_replace_committed_rollout_metrics_rejects_unready_slot(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+
+        with pytest.raises(RuntimeError, match="only be replaced after"):
+            buf.replace_committed_rollout_metrics(group_id, _rollout_receipt())
+
     @pytest.mark.parametrize("nonfinite", [float("nan"), float("inf")])
     def test_commit_rejects_nonfinite_rollout_metrics_before_tq_write(self, nonfinite):
         dp = FakeDataPlaneClient()

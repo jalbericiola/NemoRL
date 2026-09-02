@@ -1203,6 +1203,36 @@ class TQReplayBuffer:
                 )
             raise
 
+    def replace_committed_rollout_metrics(
+        self,
+        group_id: str,
+        rollout_metrics: Mapping[str, Any],
+    ) -> None:
+        """Atomically replace a ready slot's scalar rollout receipt.
+
+        ``generate_and_push`` uses this immediately after the successful async
+        commit to close the prompt lifecycle interval *after* DataPlane
+        materialization.  The method is synchronous on purpose: no sampler or
+        checkpoint coroutine can observe the ready slot between ``commit``
+        returning and this receipt replacement.
+        """
+        if group_id not in self._group_ids:
+            raise ValueError(
+                f"cannot replace rollout metrics for unknown group_id={group_id!r}"
+            )
+        idx = self._group_ids.index(group_id)
+        if not self.ready_list[idx] or self.meta_list[idx] is None:
+            raise RuntimeError(
+                "rollout metrics can only be replaced after a successful commit; "
+                f"group_id={group_id!r} is not ready"
+            )
+        scalar_rollout_metrics = _scalar_rollout_metrics(rollout_metrics)
+        _validate_rollout_metric_receipt(
+            scalar_rollout_metrics,
+            expected_samples=self.meta_list[idx].size,
+        )
+        self.rollout_metrics_list[idx] = scalar_rollout_metrics
+
     async def remove_group(self, group_id: str, *, remove_in_dp: bool = False) -> int:
         """Remove the live slot identified by ``group_id``.
 

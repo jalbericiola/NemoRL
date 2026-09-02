@@ -1626,6 +1626,7 @@ class RolloutManager:
             group_id = self._tq_buffer.reserve(
                 weight_version=start_version, target_step=target_step
             )
+            commit_succeeded = False
             try:
                 # Registered per ATTEMPT, not per prompt: each retry reserves a fresh
                 # group_id, so the controller's registry must follow the attempt that
@@ -1670,12 +1671,25 @@ class RolloutManager:
                     start_weight_version=start_version,
                     end_weight_version=end_version,
                 )
+                commit_succeeded = True
+                if isinstance(record, PromptGroupRecord):
+                    # The cohort interval represents prompt-to-ready latency,
+                    # so close it after the successful DataPlane commit.  A
+                    # failed commit was already part of the retry lifecycle;
+                    # excluding only the successful commit would make the same
+                    # latency count on failure but disappear on success.
+                    record.rollout_metrics["cohort/rollout_finished_at_s"] = time.time()
+                    self._tq_buffer.replace_committed_rollout_metrics(
+                        group_id, record.rollout_metrics
+                    )
             except Exception as error:
                 # A failed rollout must not leave an unready slot that can block an
                 # in-order sampler. commit() rolls back any DataPlane rows it wrote.
                 # Cleanup failure must not mask the error that caused it.
                 try:
-                    await self._tq_buffer.remove_group(group_id)
+                    await self._tq_buffer.remove_group(
+                        group_id, remove_in_dp=commit_succeeded
+                    )
                 except Exception as cleanup_exc:
                     print(
                         f"  warn: remove_group({group_id}) cleanup failed: {cleanup_exc!r}",
@@ -1727,7 +1741,9 @@ class RolloutManager:
             except BaseException:
                 # Cancellation and other non-Exception exits: clean up, never retry.
                 try:
-                    await self._tq_buffer.remove_group(group_id)
+                    await self._tq_buffer.remove_group(
+                        group_id, remove_in_dp=commit_succeeded
+                    )
                 except Exception as cleanup_exc:
                     print(
                         f"  warn: remove_group({group_id}) cleanup failed: {cleanup_exc!r}",
