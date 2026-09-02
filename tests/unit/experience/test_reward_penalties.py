@@ -108,6 +108,17 @@ class TestExtractMaskSampleFlags:
             mask_sample, torch.tensor([True, False, False, False, False])
         )
 
+    @pytest.mark.parametrize("value", [1, "true", torch.tensor(True)])
+    def test_rejects_non_boolean_mask_sample(self, value):
+        with pytest.raises(TypeError, match="mask_sample must be a bool"):
+            _extract_mask_sample_flags(
+                [{"full_result": {"instance_config": {"mask_sample": value}}}]
+            )
+
+    def test_rejects_non_mapping_instance_config(self):
+        with pytest.raises(TypeError, match="instance_config must be a mapping"):
+            _extract_mask_sample_flags([{"full_result": {"instance_config": ["mask"]}}])
+
 
 class TestShouldMaskFlaggedSamples:
     def test_reads_env_should_mask_flagged_samples(self):
@@ -167,6 +178,42 @@ class TestMaskEnvFlaggedSamplesBatchedGate:
 
     def test_gate_off_omits_mask_sample(self):
         assert "mask_sample" not in self._final_batch(False)
+
+
+def test_batched_reward_boundaries_survive_in_place_penalty_mutation():
+    result = _gate_result(False)
+    result["full_result"]["response"] = {
+        "output": [
+            _reasoning_item("same"),
+            _message_item("same"),
+        ]
+    }
+    rollout_result = _postprocess_single_nemo_gym_group(
+        nemo_gym_rows=[{"agent_ref": {"name": "agent"}}],
+        results=[result],
+        timer=Timer(),
+        timer_prefix="timing/test",
+        policy_generation=_FakeGeneration(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(1)}),
+        tokenizer=_FakeTokenizer(),
+        log_full_result_tables=False,
+        reward_penalty_config={"penalize_duplicated_reasoning": True},
+    )
+
+    final_batch = rollout_result.final_batch
+    metrics = rollout_result.rollout_metrics
+    assert result["full_result"]["reward"] == 0.0
+    assert final_batch["raw_environment_reward"].tolist() == [1.0]
+    assert final_batch["pre_penalty_reward"].tolist() == [1.0]
+    assert final_batch["total_reward"].tolist() == [0.0]
+    assert metrics["raw_environment_reward/mean"] == 1.0
+    assert metrics["pre_penalty_environment_reward/mean"] == 1.0
+    assert metrics["total_reward/mean"] == 0.0
+
+    result["full_result"]["reward"] = 99.0
+    assert final_batch["raw_environment_reward"].tolist() == [1.0]
+    assert final_batch["pre_penalty_reward"].tolist() == [1.0]
+    assert final_batch["total_reward"].tolist() == [0.0]
 
 
 # =====================================================================

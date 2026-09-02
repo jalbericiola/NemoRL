@@ -38,9 +38,12 @@ from nemo_rl.experience.interfaces import (
     INVALID_TOOL_CALL_TOKEN_MASK,
     MALFORMED_THINKING_MESSAGE_COUNT,
     MALFORMED_THINKING_TOKEN_MASK,
+    PRE_PENALTY_REWARD,
+    RAW_ENVIRONMENT_REWARD,
     RESPONSE_TOKEN_LENGTHS,
     ROLLOUT_TRUNCATED,
     PromptGroupRecord,
+    completion_reward_boundaries,
 )
 
 
@@ -290,8 +293,15 @@ def record_to_train_batch(
         pad_value_dict=dict(pad_value_dict),  # type: ignore
     )
 
+    reward_boundaries = [completion_reward_boundaries(c) for c in completions]
+    raw_environment_reward = torch.tensor(
+        [values[0] for values in reward_boundaries], dtype=torch.float32
+    )
+    pre_penalty_reward = torch.tensor(
+        [values[1] for values in reward_boundaries], dtype=torch.float32
+    )
     total_reward = torch.tensor(
-        [float(c.reward) for c in completions], dtype=torch.float32
+        [values[2] for values in reward_boundaries], dtype=torch.float32
     )
     sample_mask = torch.tensor(
         [
@@ -308,6 +318,8 @@ def record_to_train_batch(
         "token_mask": flat["token_loss_mask"],
         "sample_mask": sample_mask,
         "prompt_ids_for_adv": prompt_flat["token_ids"],
+        RAW_ENVIRONMENT_REWARD: raw_environment_reward,
+        PRE_PENALTY_REWARD: pre_penalty_reward,
         "total_reward": total_reward,
         **advantage_penalty_fields,
     }

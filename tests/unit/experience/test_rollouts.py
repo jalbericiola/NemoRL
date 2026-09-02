@@ -2099,6 +2099,8 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     )
 
     assert rollout_result.task_index == 42
+    assert rollout_result.final_batch["raw_environment_reward"].tolist() == [1.0, 2.0]
+    assert rollout_result.final_batch["pre_penalty_reward"].tolist() == [1.0, 2.0]
     assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
@@ -2409,6 +2411,8 @@ def test_run_async_nemo_gym_rollout(
             "length": torch.tensor([3080, 3048]),
             "loss_multiplier": torch.tensor([1.0, 1.0]),
             "mask_sample": torch.tensor([False, False]),
+            "raw_environment_reward": torch.tensor([0.0, 0.0]),
+            "pre_penalty_reward": torch.tensor([0.0, 0.0]),
             "total_reward": torch.tensor([0.0, 0.0]),
             "truncated": torch.tensor([False, False]),
         },
@@ -2450,6 +2454,18 @@ def test_run_async_nemo_gym_rollout(
             "max_gen_tokens_per_turn/stddev": None,
             "max_gen_tokens_per_turn/histogram": None,
             "max_gen_tokens_per_turn/p95": None,
+            "raw_environment_reward/mean": 0.0,
+            "raw_environment_reward/max": 0.0,
+            "raw_environment_reward/min": 0.0,
+            "raw_environment_reward/median": 0.0,
+            "raw_environment_reward/stddev": 0.0,
+            "raw_environment_reward/histogram": None,
+            "pre_penalty_environment_reward/mean": 0.0,
+            "pre_penalty_environment_reward/max": 0.0,
+            "pre_penalty_environment_reward/min": 0.0,
+            "pre_penalty_environment_reward/median": 0.0,
+            "pre_penalty_environment_reward/stddev": 0.0,
+            "pre_penalty_environment_reward/histogram": None,
             "total_reward/mean": 0.0,
             "total_reward/max": 0.0,
             "total_reward/min": 0.0,
@@ -2496,6 +2512,10 @@ def test_run_async_nemo_gym_rollout(
     def _standardize(d: dict) -> dict:
         final_batch = d["final_batch"].copy()
         final_batch.pop("message_log", None)
+        final_batch["raw_environment_reward"] = final_batch[
+            "raw_environment_reward"
+        ].tolist()
+        final_batch["pre_penalty_reward"] = final_batch["pre_penalty_reward"].tolist()
         final_batch["total_reward"] = final_batch["total_reward"].tolist()
         final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
         final_batch["length"] = final_batch["length"].tolist()

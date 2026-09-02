@@ -31,6 +31,8 @@ from nemo_rl.experience.interfaces import (
     INVALID_TOOL_CALL_TOKEN_MASK,
     MALFORMED_THINKING_MESSAGE_COUNT,
     MALFORMED_THINKING_TOKEN_MASK,
+    PRE_PENALTY_REWARD,
+    RAW_ENVIRONMENT_REWARD,
     RESPONSE_TOKEN_LENGTHS,
     ROLLOUT_TRUNCATED,
 )
@@ -383,6 +385,26 @@ def test_record_to_train_batch_preserves_base_loss_multiplier() -> None:
     assert train_batch["sample_mask"].tolist() == [0.25]
 
 
+def test_record_to_train_batch_preserves_independent_reward_boundaries() -> None:
+    completion = _completion(route_start=10, reward=0.0)
+    completion.env_extras = {"reward": 0.0}
+    completion.raw_environment_reward = 1.0
+    completion.pre_penalty_reward = 1.9
+
+    train_batch = record_to_train_batch(
+        _record([completion]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+    )
+
+    completion.env_extras["reward"] = 99.0
+    completion.raw_environment_reward = 99.0
+    completion.pre_penalty_reward = 99.0
+    completion.reward = 99.0
+    assert train_batch[RAW_ENVIRONMENT_REWARD].tolist() == [1.0]
+    assert train_batch[PRE_PENALTY_REWARD].tolist() == pytest.approx([1.9])
+    assert train_batch["total_reward"].tolist() == [0.0]
+
+
 def test_shared_prefix_payload_metadata_is_explicitly_opt_in() -> None:
     # Keep the optional TransferQueue runtime out of payload-test collection.
     from nemo_rl.data_plane.adapters.transfer_queue import (
@@ -408,6 +430,8 @@ def test_shared_prefix_payload_metadata_is_explicitly_opt_in() -> None:
         "token_mask",
         "sample_mask",
         "prompt_ids_for_adv",
+        RAW_ENVIRONMENT_REWARD,
+        PRE_PENALTY_REWARD,
         "total_reward",
         "routed_experts",
     }

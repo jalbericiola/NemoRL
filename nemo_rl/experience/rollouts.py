@@ -61,6 +61,8 @@ from nemo_rl.environments.nemo_gym import (
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_RESERVED_KEY_PREFIX,
     NEMO_GYM_TASK_INDEX_KEY,
+    PRE_PENALTY_REWARD,
+    RAW_ENVIRONMENT_REWARD,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
@@ -266,14 +268,34 @@ def _add_r3_fallback_metrics(
     )
 
 
+def resolve_nemo_gym_env_mask(
+    full_result: Mapping[str, Any], *, masking_enabled: bool
+) -> bool:
+    """Resolve Gym's exact-bool mask flag without mutating its raw result."""
+    instance_config = full_result.get("instance_config")
+    if instance_config is None:
+        return False
+    if not isinstance(instance_config, Mapping):
+        raise TypeError(
+            "NeMo-Gym full_result.instance_config must be a mapping, "
+            f"got {type(instance_config).__name__}"
+        )
+    value = instance_config.get("mask_sample", False)
+    if type(value) is not bool:
+        raise TypeError(
+            "NeMo-Gym full_result.instance_config.mask_sample must be a bool, "
+            f"got {type(value).__name__}"
+        )
+    return masking_enabled and value
+
+
 def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
-    """Return True for samples the environment asks GRPO to mask from loss."""
+    """Return exact Gym mask flags for the batched rollout path."""
     return torch.tensor(
         [
-            bool(
-                (result["full_result"].get("instance_config") or {}).get(
-                    "mask_sample", False
-                )
+            resolve_nemo_gym_env_mask(
+                result["full_result"],
+                masking_enabled=True,
             )
             for result in results
         ],
@@ -2624,12 +2646,18 @@ def _postprocess_single_nemo_gym_group(
     mask_env_flagged_samples: bool = True,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
+    # Snapshot scalars before either shaping stage mutates full_result in place.
+    # Keeping them outside full_result avoids aliasing provenance with the mutable
+    # effective reward consumed by the optimizer.
+    raw_environment_rewards = [float(r["full_result"]["reward"]) for r in results]
+
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
     length_rewards_low = shaping.length_rewards_low
     rewards_low = shaping.rewards_low
     low_lengths = shaping.low_lengths
     high_lengths = shaping.high_lengths
+    pre_penalty_rewards = [float(r["full_result"]["reward"]) for r in results]
 
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
@@ -2688,6 +2716,16 @@ def _postprocess_single_nemo_gym_group(
         ]
 
         rollout_metrics = {
+            **calculate_single_metric(
+                raw_environment_rewards,
+                batch_size,
+                "raw_environment_reward",
+            ),
+            **calculate_single_metric(
+                pre_penalty_rewards,
+                batch_size,
+                "pre_penalty_environment_reward",
+            ),
             **calculate_single_metric(
                 turn_counts,
                 batch_size,
@@ -2799,6 +2837,8 @@ def _postprocess_single_nemo_gym_group(
             # task_name: NotRequired[str]
             # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
             # Extra information not in the DatumSpec used by the GRPO algorithm
+            RAW_ENVIRONMENT_REWARD: torch.tensor(raw_environment_rewards),
+            PRE_PENALTY_REWARD: torch.tensor(pre_penalty_rewards),
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
             # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
             "truncated": torch.tensor(

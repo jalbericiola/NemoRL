@@ -21,6 +21,10 @@ real Ray / vLLM / TQ.
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
+
+import pytest
+import torch
 
 
 def test_sync_utils_module_imports() -> None:
@@ -35,6 +39,143 @@ def test_sync_utils_module_imports() -> None:
     # ``__name__`` attribute. Check via ``repr`` instead.
     assert "SyncRolloutActor" in repr(SyncRolloutActor)
     assert callable(kv_first_write)
+
+
+def test_sync_rollout_actor_resolves_exact_training_sample_mask() -> None:
+    from nemo_rl.experience.sync_rollout_actor import _resolve_training_sample_mask
+
+    loss_multiplier = torch.tensor([1.0, 0.5, 0.0])
+    resolved = _resolve_training_sample_mask(
+        loss_multiplier,
+        torch.tensor([False, True, True]),
+    )
+
+    assert resolved.tolist() == [1.0, 0.0, 0.0]
+    assert loss_multiplier.tolist() == [1.0, 0.5, 0.0]
+    assert resolved.data_ptr() != loss_multiplier.data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("mask_sample", "error_type", "match"),
+    [
+        (torch.tensor([0, 1]), TypeError, "dtype bool"),
+        (torch.tensor([[False, True]]), ValueError, "shape must match"),
+    ],
+)
+def test_sync_rollout_actor_rejects_invalid_gym_mask(
+    mask_sample: torch.Tensor,
+    error_type: type[Exception],
+    match: str,
+) -> None:
+    from nemo_rl.experience.sync_rollout_actor import _resolve_training_sample_mask
+
+    with pytest.raises(error_type, match=match):
+        _resolve_training_sample_mask(torch.ones(2), mask_sample)
+
+
+@pytest.mark.parametrize(("gate_enabled", "expected_mask"), [(True, 0.0), (False, 0.5)])
+def test_sync_rollout_actor_writes_one_resolved_mask_and_reward_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    gate_enabled: bool,
+    expected_mask: float,
+) -> None:
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+    import nemo_rl.experience.sync_rollout_actor as actor_mod
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    actor_cls = actor_mod.SyncRolloutActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor.policy_generation = None
+    actor.tokenizer = SimpleNamespace(pad_token_id=0)
+    actor.task_to_env = {}
+    actor._dp_client = object()
+    actor.master_config = SimpleNamespace(
+        policy={
+            "generation": {},
+            "make_sequence_length_divisible_by": 1,
+            "router_replay": {"enabled": False},
+        },
+        env={
+            "should_mask_flagged_samples": gate_enabled,
+            "nemo_gym": {},
+        },
+        grpo=SimpleNamespace(
+            deduplicate_multimodal_data=True,
+            debug_payload_metrics=False,
+        ),
+        logger={"wandb_enabled": False, "wandb": {}},
+        reward_penalties=None,
+    )
+
+    raw_extras = {"instance_config": {"mask_sample": True}}
+    captured: dict[str, object] = {}
+
+    def fake_run_nemo_gym_rollout_sync(**kwargs):
+        captured["gate"] = kwargs["mask_env_flagged_samples"]
+        final_data = {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "prompt",
+                        "token_ids": torch.tensor([1]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2, 3]),
+                        "generation_logprobs": torch.tensor([-0.1, -0.2]),
+                    },
+                ]
+            ],
+            "length": torch.tensor([1]),
+            "loss_multiplier": torch.tensor([0.5]),
+            "raw_environment_reward": torch.tensor([1.0]),
+            "pre_penalty_reward": torch.tensor([0.8]),
+            "total_reward": torch.tensor([0.0]),
+            "truncated": torch.tensor([False]),
+            "extra_env_info": [raw_extras],
+        }
+        if kwargs["mask_env_flagged_samples"]:
+            final_data["mask_sample"] = torch.tensor([True])
+        return SimpleNamespace(
+            final_batch=BatchedDataDict(final_data),
+            rollout_metrics={},
+        )
+
+    def fake_first_write(data, **kwargs):
+        captured["bulk"] = data
+        return SimpleNamespace(sample_ids=kwargs["sample_ids"])
+
+    monkeypatch.setattr(nemo_gym_mod, "should_use_nemo_gym", lambda _cfg: True)
+    monkeypatch.setattr(
+        actor_mod,
+        "run_nemo_gym_rollout_sync",
+        fake_run_nemo_gym_rollout_sync,
+    )
+    monkeypatch.setattr(actor_mod, "get_nemo_gym_thinking_tags", lambda _env: [])
+    monkeypatch.setattr(
+        actor_mod,
+        "get_shared_prefix_training_config",
+        lambda _policy: SimpleNamespace(mode="off"),
+    )
+    monkeypatch.setattr(actor_mod, "trace_rollout_payload", lambda **_kwargs: None)
+    monkeypatch.setattr(actor_mod, "kv_first_write", fake_first_write)
+
+    _, driver_carry, _, _ = actor.rollout_to_tq(
+        BatchedDataDict({"row": [0]}),
+        partition_id="train",
+    )
+
+    bulk = captured["bulk"]
+    assert captured["gate"] is gate_enabled
+    assert bulk["sample_mask"].tolist() == [expected_mask]
+    assert driver_carry["loss_multiplier"].tolist() == [expected_mask]
+    assert bulk["raw_environment_reward"].tolist() == [1.0]
+    assert bulk["pre_penalty_reward"].tolist() == pytest.approx([0.8])
+    assert bulk["total_reward"].tolist() == [0.0]
+    assert bulk["extra_env_info"].tolist() == [raw_extras]
+    assert raw_extras["instance_config"]["mask_sample"] is True
 
 
 def test_sync_rollout_actor_registered_under_vllm_tier() -> None:

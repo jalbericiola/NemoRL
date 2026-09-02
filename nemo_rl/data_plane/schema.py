@@ -23,6 +23,8 @@ from nemo_rl.experience.interfaces import (
     INVALID_AND_MALFORMED_MESSAGE_COUNT,
     INVALID_TOOL_CALL_MESSAGE_COUNT,
     MALFORMED_THINKING_MESSAGE_COUNT,
+    PRE_PENALTY_REWARD,
+    RAW_ENVIRONMENT_REWARD,
     RESPONSE_TOKEN_LENGTHS,
     ROLLOUT_TRUNCATED,
 )
@@ -54,6 +56,15 @@ DP_TRAIN_FIELDS = (
     "advantages",
     "token_mask",
     "sample_mask",
+)
+
+# Per-row reward observability written with rollout data but not fetched by policy
+# workers. Pre-registering these names avoids TransferQueue's lazy-field race while
+# keeping the trainer input schema unchanged.
+ROLLOUT_REWARD_FIELDS = (
+    RAW_ENVIRONMENT_REWARD,
+    PRE_PENALTY_REWARD,
+    "total_reward",
 )
 
 # Subset fetched by logprob / ref-logprob workers.
@@ -91,6 +102,8 @@ PROMOTE_1D_FIELDS: frozenset[str] = frozenset(
         INPUT_LENGTHS,
         SHARED_PREFIX_PROMPT_LENGTHS,
         "total_reward",
+        RAW_ENVIRONMENT_REWARD,
+        PRE_PENALTY_REWARD,
         SAMPLE_MASK,
         ROLLOUT_TRUNCATED,
         RESPONSE_TOKEN_LENGTHS,

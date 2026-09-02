@@ -47,6 +47,7 @@ from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
+    ROLLOUT_REWARD_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
     fields_with_optional_routed_experts,
@@ -177,7 +178,8 @@ class TQPolicy(Policy):
             partition_id=self.tq_partition_id,
             fields=self._with_shared_prefix_fields(
                 fields_with_optional_routed_experts(
-                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                    (*DP_TRAIN_FIELDS, *ROLLOUT_REWARD_FIELDS),
+                    enabled=self._router_replay_enabled,
                 )
             ),
             num_samples=num_samples,
@@ -197,7 +199,8 @@ class TQPolicy(Policy):
         self.dp_client.register_partition(
             partition_id=partition_id,
             fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                (*DP_TRAIN_FIELDS, *ROLLOUT_REWARD_FIELDS),
+                enabled=self._router_replay_enabled,
             ),
             num_samples=num_samples,
             consumer_tasks=[partition_id],

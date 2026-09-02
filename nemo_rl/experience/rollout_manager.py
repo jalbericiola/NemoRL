@@ -50,6 +50,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
     PromptGroupRecord,
+    completion_reward_boundaries,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollouts import (
@@ -64,6 +65,7 @@ from nemo_rl.experience.rollouts import (
     attach_static_multimodal_payload,
     apply_reward_penalties,
     calculate_rewards,
+    resolve_nemo_gym_env_mask,
     resolve_reward_penalty_config,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -89,25 +91,17 @@ _PENALTY_COUNT_TO_RATE = {
 }
 
 
-def _resolve_gym_env_mask(
-    full_result: Mapping[str, Any], *, masking_enabled: bool
-) -> bool:
-    """Resolve Gym's mask flag once while preserving the raw environment result."""
-    instance_config = full_result.get("instance_config")
-    if instance_config is None:
-        return False
-    if not isinstance(instance_config, Mapping):
-        raise TypeError(
-            "NeMo-Gym full_result.instance_config must be a mapping, "
-            f"got {type(instance_config).__name__}"
+def _require_datum_loss_multiplier(input_sample: DatumSpec) -> float:
+    """Return a valid per-datum loss multiplier without a permissive default."""
+    if "loss_multiplier" not in input_sample:
+        raise ValueError("DatumSpec requires loss_multiplier")
+    loss_multiplier = float(input_sample["loss_multiplier"])
+    if not math.isfinite(loss_multiplier) or loss_multiplier < 0:
+        raise ValueError(
+            "DatumSpec.loss_multiplier must be finite and nonnegative, "
+            f"got {loss_multiplier}"
         )
-    value = instance_config.get("mask_sample", False)
-    if type(value) is not bool:
-        raise TypeError(
-            "NeMo-Gym full_result.instance_config.mask_sample must be a bool, "
-            f"got {type(value).__name__}"
-        )
-    return masking_enabled and value
+    return loss_multiplier
 
 
 def _reward_penalties_enabled(
@@ -143,54 +137,25 @@ def _add_cohort_rollout_metrics(
     rollout_metrics: dict[str, Any],
     completions: list[Completion],
     *,
-    raw_environment_rewards: Optional[list[float]] = None,
-    pre_penalty_rewards: Optional[list[float]] = None,
     penalty_counts: Optional[dict[str, int]] = None,
     effort_low_sample_count: int = 0,
-    effort_reward_delta_sum: float = 0.0,
 ) -> None:
     """Add exact additive counters for optimizer-step rollout reduction."""
     num_samples = len(completions)
     if num_samples == 0:
         raise ValueError("cannot compute rollout cohort metrics for no completions")
-    if pre_penalty_rewards is None:
-        pre_penalty_rewards = [completion.reward for completion in completions]
-    if raw_environment_rewards is None:
-        raw_environment_rewards = list(pre_penalty_rewards)
-    if len(raw_environment_rewards) != num_samples:
-        raise ValueError(
-            "raw environment reward count does not match completions: "
-            f"{len(raw_environment_rewards)} != {num_samples}"
-        )
-    if len(pre_penalty_rewards) != num_samples:
-        raise ValueError(
-            "pre-penalty reward count does not match completions: "
-            f"{len(pre_penalty_rewards)} != {num_samples}"
-        )
-    if not all(math.isfinite(float(reward)) for reward in pre_penalty_rewards):
-        raise ValueError("pre-penalty rewards must all be finite")
-    if not all(math.isfinite(float(reward)) for reward in raw_environment_rewards):
-        raise ValueError("raw environment rewards must all be finite")
-    if not all(math.isfinite(float(completion.reward)) for completion in completions):
-        raise ValueError("post-penalty rewards must all be finite")
+    boundaries = [
+        completion_reward_boundaries(completion) for completion in completions
+    ]
+    raw_environment_rewards = [values[0] for values in boundaries]
+    pre_penalty_rewards = [values[1] for values in boundaries]
+    effective_rewards = [values[2] for values in boundaries]
     if not 0 <= effort_low_sample_count <= num_samples:
         raise ValueError(
             "effort low-sample count is outside the cohort: "
             f"{effort_low_sample_count} not in [0, {num_samples}]"
         )
-    if not math.isfinite(effort_reward_delta_sum):
-        raise ValueError("effort reward delta sum must be finite")
-    observed_effort_delta = sum(pre_penalty_rewards) - sum(raw_environment_rewards)
-    if not math.isclose(
-        observed_effort_delta,
-        effort_reward_delta_sum,
-        rel_tol=1e-7,
-        abs_tol=1e-7,
-    ):
-        raise ValueError(
-            "effort reward delta does not match raw/pre-penalty boundaries: "
-            f"observed={observed_effort_delta}, supplied={effort_reward_delta_sum}"
-        )
+    effort_reward_delta_sum = sum(pre_penalty_rewards) - sum(raw_environment_rewards)
 
     counts = {key: 0 for key in _PENALTY_COUNT_TO_RATE}
     if penalty_counts is not None:
@@ -226,9 +191,7 @@ def _add_cohort_rollout_metrics(
             "cohort/effort_low_sample_count": effort_low_sample_count,
             "cohort/effort_reward_delta_sum": effort_reward_delta_sum,
             "cohort/env_masked_sample_count": env_masked_samples,
-            "cohort/post_penalty_reward_sum": sum(
-                completion.reward for completion in completions
-            ),
+            "cohort/post_penalty_reward_sum": sum(effective_rewards),
         }
     )
     for count_key, rate_key in _PENALTY_COUNT_TO_RATE.items():
@@ -576,6 +539,7 @@ class AsyncRolloutImpl:
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
         """
+        loss_multiplier = _require_datum_loss_multiplier(input_sample)
         del rollout_group_id
         timer = Timer()
         timer_prefix = "timing/rollout"
@@ -613,7 +577,7 @@ class AsyncRolloutImpl:
             extra_env_info=input_sample["extra_env_info"],
             metadata={
                 "task_name": input_sample["task_name"],
-                "loss_multiplier": float(input_sample["loss_multiplier"]),
+                "loss_multiplier": loss_multiplier,
             },
             completions=completions,
             rollout_metrics=rollout_metrics,
@@ -771,6 +735,8 @@ class AsyncRolloutImpl:
             env_extras=current_extra_env_info,
             truncated=truncated,
             reward=total_reward,
+            raw_environment_reward=total_reward,
+            pre_penalty_reward=total_reward,
             env_masked=False,
         )
         sample_metrics = {
@@ -1011,6 +977,7 @@ class AsyncNemoGymRolloutImpl:
         Returns:
             PromptGroupRecord with num_generations_per_prompt completions.
         """
+        loss_multiplier = _require_datum_loss_multiplier(input_sample)
         timer = Timer()
         timer_prefix = "timing/rollout"
         rollout_started_at_s = time.time()
@@ -1045,7 +1012,7 @@ class AsyncNemoGymRolloutImpl:
             extra_env_info=input_sample["extra_env_info"],
             metadata={
                 "task_name": "nemo_gym",
-                "loss_multiplier": float(input_sample["loss_multiplier"]),
+                "loss_multiplier": loss_multiplier,
             },
             completions=completions,
             rollout_metrics=rollout_metrics,
@@ -1281,7 +1248,17 @@ class AsyncNemoGymRolloutImpl:
             _tensorize_by_key(prompt_message_log, "token_ids")
             # Convert results to completions.
             completions = [
-                self._result_to_completion(result) for result in completed_results
+                self._result_to_completion(
+                    result,
+                    raw_environment_reward=raw_reward,
+                    pre_penalty_reward=pre_penalty_reward,
+                )
+                for result, raw_reward, pre_penalty_reward in zip(
+                    completed_results,
+                    raw_environment_rewards,
+                    pre_penalty_rewards,
+                    strict=True,
+                )
             ]
 
         # Compute rollout metrics.
@@ -1289,8 +1266,6 @@ class AsyncNemoGymRolloutImpl:
             rollout_metrics = self._compute_rollout_metrics(
                 completions,
                 inputs[0]["agent_ref"]["name"],
-                raw_environment_rewards=raw_environment_rewards,
-                pre_penalty_rewards=pre_penalty_rewards,
                 penalty_counts=penalty_counts,
                 effort_metrics=effort_metrics,
             )
@@ -1299,7 +1274,13 @@ class AsyncNemoGymRolloutImpl:
 
         return completions, prompt_message_log, rollout_metrics
 
-    def _result_to_completion(self, result: dict) -> Completion:
+    def _result_to_completion(
+        self,
+        result: dict,
+        *,
+        raw_environment_reward: Optional[float] = None,
+        pre_penalty_reward: Optional[float] = None,
+    ) -> Completion:
         """Convert one run_rollouts result dict into a Completion."""
         # Tensorize token fields.
         _tensorize_by_key(result["message_log"], "token_ids")
@@ -1312,16 +1293,27 @@ class AsyncNemoGymRolloutImpl:
             sum(len(m["token_ids"]) for m in result["message_log"]) == self._max_seq_len
         )
 
-        env_masked = _resolve_gym_env_mask(
+        env_masked = resolve_nemo_gym_env_mask(
             result["full_result"],
             masking_enabled=self._mask_env_flagged_samples,
         )
 
+        effective_reward = float(result["full_result"]["reward"])
         return Completion(
             message_log=result["message_log"],
             env_extras=result["full_result"],
             truncated=truncated,
-            reward=float(result["full_result"]["reward"]),
+            reward=effective_reward,
+            raw_environment_reward=(
+                effective_reward
+                if raw_environment_reward is None
+                else float(raw_environment_reward)
+            ),
+            pre_penalty_reward=(
+                effective_reward
+                if pre_penalty_reward is None
+                else float(pre_penalty_reward)
+            ),
             env_masked=env_masked,
         )
 
@@ -1330,14 +1322,15 @@ class AsyncNemoGymRolloutImpl:
         completions: list[Completion],
         agent_name: str,
         *,
-        raw_environment_rewards: Optional[list[float]] = None,
-        pre_penalty_rewards: Optional[list[float]] = None,
         penalty_counts: Optional[dict[str, int]] = None,
         effort_metrics: Optional[_EffortShapingMetrics] = None,
     ) -> dict[str, Any]:
         """Aggregate per-sample and per-agent metrics."""
         # Prepare lists of values for each metric.
-        total_reward = [c.reward for c in completions]
+        reward_boundaries = [completion_reward_boundaries(c) for c in completions]
+        raw_environment_rewards = [values[0] for values in reward_boundaries]
+        pre_penalty_rewards = [values[1] for values in reward_boundaries]
+        total_reward = [values[2] for values in reward_boundaries]
         turn_count = [
             sum(1 for m in c.message_log if m["role"] == "user") for c in completions
         ]
@@ -1367,6 +1360,16 @@ class AsyncNemoGymRolloutImpl:
         # Aggregate metrics across all samples.
         n = len(completions)
         rollout_metrics: dict[str, Any] = {
+            **calculate_single_metric(
+                raw_environment_rewards,
+                n,
+                "raw_environment_reward",
+            ),
+            **calculate_single_metric(
+                pre_penalty_rewards,
+                n,
+                "pre_penalty_environment_reward",
+            ),
             **calculate_single_metric(total_reward, n, "total_reward"),
             # turn metrics
             **calculate_single_metric(turn_count, n, "turns_per_sample"),
@@ -1434,14 +1437,9 @@ class AsyncNemoGymRolloutImpl:
         _add_cohort_rollout_metrics(
             rollout_metrics,
             completions,
-            raw_environment_rewards=raw_environment_rewards,
-            pre_penalty_rewards=pre_penalty_rewards,
             penalty_counts=penalty_counts,
             effort_low_sample_count=(
                 len(effort_metrics.rewards_low) if effort_metrics is not None else 0
-            ),
-            effort_reward_delta_sum=(
-                sum(pre_penalty_rewards or []) - sum(raw_environment_rewards or [])
             ),
         )
         return rollout_metrics

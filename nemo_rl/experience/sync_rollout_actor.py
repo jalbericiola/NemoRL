@@ -58,7 +58,9 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
+    should_mask_flagged_samples,
 )
+from nemo_rl.experience.interfaces import PRE_PENALTY_REWARD, RAW_ENVIRONMENT_REWARD
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy import get_shared_prefix_training_config
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
@@ -70,6 +72,44 @@ from nemo_rl.utils.r3_trace import trace_rollout_payload
 # the training/dynamic-sampling path only handles tensors/lists. Validation
 # requests them explicitly to print per-sample message logs.
 OPT_IN_CARRY_KEYS: tuple[str, ...] = ("turn_roles", "turn_contents")
+
+
+def _resolve_training_sample_mask(
+    loss_multiplier: torch.Tensor,
+    mask_sample: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Compose the required datum multiplier with an explicit Gym mask."""
+    if not isinstance(loss_multiplier, torch.Tensor):
+        raise TypeError(
+            "rollout loss_multiplier must be a tensor, "
+            f"got {type(loss_multiplier).__name__}"
+        )
+    if loss_multiplier.ndim != 1:
+        raise ValueError(
+            "rollout loss_multiplier must be one-dimensional, "
+            f"got shape {tuple(loss_multiplier.shape)}"
+        )
+    if not torch.isfinite(loss_multiplier).all() or (loss_multiplier < 0).any():
+        raise ValueError("rollout loss_multiplier must be finite and nonnegative")
+
+    resolved = loss_multiplier.clone()
+    if mask_sample is None:
+        return resolved
+    if not isinstance(mask_sample, torch.Tensor):
+        raise TypeError(
+            f"NeMo-Gym mask_sample must be a tensor, got {type(mask_sample).__name__}"
+        )
+    if mask_sample.dtype is not torch.bool:
+        raise TypeError(
+            f"NeMo-Gym mask_sample must have dtype bool, got {mask_sample.dtype}"
+        )
+    if mask_sample.shape != resolved.shape:
+        raise ValueError(
+            "NeMo-Gym mask_sample shape must match loss_multiplier: "
+            f"{tuple(mask_sample.shape)} != {tuple(resolved.shape)}"
+        )
+    resolved[mask_sample] = 0
+    return resolved
 
 
 def _flatten_rollout_message_log_for_tq(
@@ -266,6 +306,7 @@ class SyncRolloutActor:
                 else None,
                 reward_penalty_config=cfg.reward_penalties,
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
+                mask_env_flagged_samples=should_mask_flagged_samples(cfg.env),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,
             )
@@ -284,6 +325,23 @@ class SyncRolloutActor:
             )
         fb = final_batch.to("cpu")
         del final_batch
+        sample_mask = _resolve_training_sample_mask(
+            fb["loss_multiplier"],
+            fb.get("mask_sample"),
+        )
+        # Native environments have no Gym shaping/penalty stages. Materialize
+        # independent snapshots at this boundary so every row uses the same
+        # observability schema without aliasing effective reward storage.
+        raw_environment_reward = (
+            fb[RAW_ENVIRONMENT_REWARD].clone()
+            if RAW_ENVIRONMENT_REWARD in fb
+            else fb["total_reward"].clone()
+        )
+        pre_penalty_reward = (
+            fb[PRE_PENALTY_REWARD].clone()
+            if PRE_PENALTY_REWARD in fb
+            else fb["total_reward"].clone()
+        )
 
         # Flatten message_log → bulk tensors + extract original prompt ids.
         # GRPO masks only generated assistant turns, even if the dataset
@@ -315,7 +373,10 @@ class SyncRolloutActor:
                 "input_lengths": input_lengths,
                 "generation_logprobs": flat["generation_logprobs"],
                 "token_mask": flat["token_loss_mask"],
-                "sample_mask": fb["loss_multiplier"],
+                "sample_mask": sample_mask,
+                RAW_ENVIRONMENT_REWARD: raw_environment_reward,
+                PRE_PENALTY_REWARD: pre_penalty_reward,
+                "total_reward": fb["total_reward"],
             }
         )
         if ROUTED_EXPERTS_FIELD in flat:
@@ -361,7 +422,7 @@ class SyncRolloutActor:
             length = torch.tensor(length)
         driver_carry = {
             "total_reward": fb["total_reward"],
-            "loss_multiplier": fb["loss_multiplier"],
+            "loss_multiplier": sample_mask,
             "truncated": truncated,
             "length": length,
             "input_lengths": input_lengths,

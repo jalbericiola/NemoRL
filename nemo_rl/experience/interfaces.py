@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -35,6 +36,8 @@ MALFORMED_THINKING_MESSAGE_COUNT = "malformed_thinking_message_count"
 INVALID_AND_MALFORMED_MESSAGE_COUNT = "invalid_and_malformed_message_count"
 ROLLOUT_TRUNCATED = "truncated"
 RESPONSE_TOKEN_LENGTHS = "response_token_lengths"
+RAW_ENVIRONMENT_REWARD = "raw_environment_reward"
+PRE_PENALTY_REWARD = "pre_penalty_reward"
 
 
 @dataclass
@@ -44,10 +47,39 @@ class Completion:
     message_log: LLMMessageLogType | VLMMessageLogType
     env_extras: Optional[dict[str, Any]]
     truncated: bool
+    # Effective reward after effort shaping and configured penalties.
     reward: float
     # Resolved, provenance-preserving Gym loss gate. Native environments leave
     # this false; payload consumers must never infer it from arbitrary env_extras.
     env_masked: bool = False
+    # Immutable scalar snapshots around reward mutation. Native environments have
+    # no Gym shaping stage, so both equal ``reward`` there. Keep these after the
+    # existing fields to preserve positional construction compatibility.
+    raw_environment_reward: Optional[float] = None
+    pre_penalty_reward: Optional[float] = None
+
+
+def completion_reward_boundaries(completion: Completion) -> tuple[float, float, float]:
+    """Return finite raw, pre-penalty, and effective reward snapshots."""
+    effective_reward = float(completion.reward)
+    raw_environment_reward = (
+        effective_reward
+        if completion.raw_environment_reward is None
+        else float(completion.raw_environment_reward)
+    )
+    pre_penalty_reward = (
+        effective_reward
+        if completion.pre_penalty_reward is None
+        else float(completion.pre_penalty_reward)
+    )
+    values = (raw_environment_reward, pre_penalty_reward, effective_reward)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError(
+            "Completion reward boundaries must be finite: "
+            f"raw={raw_environment_reward}, pre_penalty={pre_penalty_reward}, "
+            f"effective={effective_reward}"
+        )
+    return values
 
 
 @dataclass

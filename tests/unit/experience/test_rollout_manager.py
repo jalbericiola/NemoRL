@@ -45,11 +45,13 @@ from nemo_rl.experience.failures import GenerationUnavailable
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
+    RAW_ENVIRONMENT_REWARD,
     Completion,
     PromptGroupRecord,
 )
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
+    AsyncRolloutImpl,
     RolloutManager,
     RolloutRetryPolicy,
     RolloutStats,
@@ -384,6 +386,117 @@ class TestGenerateAndPushFlow:
         # represented by the wall interval but excluded from attempt work.
         assert committed.rollout_metrics["timing/rollout/total"] == 8.0
 
+    def test_commit_latency_uses_same_lifecycle_boundary_on_retry(self, monkeypatch):
+        class _Clock:
+            def __init__(self) -> None:
+                self.wall_s = 100.0
+                self.work_s = 0.0
+
+            def time(self) -> float:
+                return self.wall_s
+
+            def perf_counter(self) -> float:
+                return self.work_s
+
+            def advance_rollout(self, seconds: float) -> None:
+                self.wall_s += seconds
+                self.work_s += seconds
+
+            def advance_wall(self, seconds: float) -> None:
+                self.wall_s += seconds
+
+        class _SlowCommitBuffer(_FakeBuffer):
+            def __init__(self, clock: _Clock) -> None:
+                super().__init__()
+                self._clock = clock
+                self._commit_durations = iter((7.0, 11.0))
+                self.commit_attempts: list[str] = []
+                self.receipts: dict[str, dict] = {}
+                self.receipt_history: list[tuple[str, str, dict]] = []
+
+            async def commit(
+                self,
+                group_id: str,
+                record,
+                start_weight_version: int,
+                end_weight_version: int,
+            ):
+                self.commit_attempts.append(group_id)
+                self._clock.advance_wall(next(self._commit_durations))
+                if len(self.commit_attempts) == 1:
+                    raise ConnectionError("injected slow failed commit")
+                self.commit_calls.append(
+                    (group_id, record, start_weight_version, end_weight_version)
+                )
+                receipt = deepcopy(record.rollout_metrics)
+                self.receipts[group_id] = receipt
+                self.receipt_history.append(("commit", group_id, receipt))
+                return record
+
+            def replace_committed_rollout_metrics(
+                self, group_id: str, rollout_metrics
+            ) -> None:
+                receipt = deepcopy(rollout_metrics)
+                self.receipts[group_id] = receipt
+                self.receipt_history.append(("replace", group_id, receipt))
+
+        clock = _Clock()
+        rollout_durations = iter((2.0, 3.0))
+
+        async def _run_for_attempt_duration(_sample) -> None:
+            clock.advance_rollout(next(rollout_durations))
+
+        async def _advance_backoff(seconds: float) -> None:
+            clock.advance_wall(seconds)
+
+        record = PromptGroupRecord(
+            prompt_idx=0,
+            prompt=[],
+            extra_env_info=None,
+            metadata={},
+            completions=[],
+            rollout_metrics={
+                "cohort/rollout_started_at_s": 8.0,
+                "cohort/rollout_finished_at_s": 9.0,
+                "timing/rollout/total": 1.0,
+            },
+        )
+        buf = _SlowCommitBuffer(clock)
+        impl = _FakeImpl(record=record, on_run=_run_for_attempt_duration)
+        policy = RolloutRetryPolicy.single_attempt(
+            max_infra_attempts=2,
+            backoff_base_s=5.0,
+        )
+        mgr = _make_manager(buf, impl, retry_policy=policy)
+        monkeypatch.setattr("nemo_rl.experience.rollout_manager.time.time", clock.time)
+        monkeypatch.setattr(
+            "nemo_rl.experience.rollout_manager.time.perf_counter",
+            clock.perf_counter,
+        )
+        monkeypatch.setattr(
+            "nemo_rl.experience.rollout_manager.asyncio.sleep", _advance_backoff
+        )
+
+        _run(mgr.generate_and_push({"prompt": "p"}))
+
+        failed_gid, successful_gid = buf.commit_attempts
+        assert failed_gid != successful_gid
+        assert buf.remove_calls == [failed_gid]
+        assert buf.remove_in_dp_calls == [False]
+        assert mgr._stats.redispatches_by_reason == {"ConnectionError": 1}
+        assert [event for event, _, _ in buf.receipt_history] == [
+            "commit",
+            "replace",
+        ]
+        provisional_receipt = buf.receipt_history[0][2]
+        assert provisional_receipt["cohort/rollout_finished_at_s"] == 117.0
+        assert buf.receipts[successful_gid] == {
+            **provisional_receipt,
+            "cohort/rollout_started_at_s": 100.0,
+            "cohort/rollout_finished_at_s": 128.0,
+            "timing/rollout/total": 5.0,
+        }
+
     def test_post_commit_receipt_failure_clears_materialized_rows(self):
         class _RejectingReceiptBuffer(_FakeBuffer):
             def replace_committed_rollout_metrics(
@@ -504,6 +617,14 @@ class TestGenerateAndPushFlow:
 # ---------------------------------------------------------------------------
 # Tests for RolloutManager
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("impl_type", [AsyncRolloutImpl, AsyncNemoGymRolloutImpl])
+def test_rollout_impl_requires_loss_multiplier_before_work(impl_type) -> None:
+    impl = object.__new__(impl_type)
+
+    with pytest.raises(ValueError, match="DatumSpec requires loss_multiplier"):
+        _run(impl.run_rollout(cast(DatumSpec, {})))
 
 
 def test_rollout_manager_raises_without_impl_params():
@@ -743,7 +864,13 @@ def test_nemo_gym_run_rollouts_applies_penalty_and_preserves_reward_boundary():
         )
     )
 
-    assert completions[0].reward == 0.0
+    completion = completions[0]
+    assert completion.raw_environment_reward == 1.0
+    assert completion.pre_penalty_reward == pytest.approx(1.9)
+    assert completion.reward == 0.0
+    assert metrics[f"{RAW_ENVIRONMENT_REWARD}/mean"] == 1.0
+    assert metrics["pre_penalty_environment_reward/mean"] == pytest.approx(1.9)
+    assert metrics["total_reward/mean"] == 0.0
     assert metrics["cohort/raw_environment_reward_sum"] == 1.0
     assert metrics["cohort/pre_penalty_reward_sum"] == pytest.approx(1.9)
     assert metrics["cohort/post_penalty_reward_sum"] == 0.0
@@ -765,6 +892,14 @@ def test_nemo_gym_run_rollouts_applies_penalty_and_preserves_reward_boundary():
     ):
         assert metrics[f"cohort/{count_key}_count"] == 0
         assert metrics[rate_key] == 0.0
+
+    # Environment result remains mutable provenance, but reward boundaries are
+    # immutable scalar snapshots and cannot be rewritten through that alias.
+    completion.env_extras["reward"] = 99.0
+    assert completion.raw_environment_reward == 1.0
+    assert completion.pre_penalty_reward == pytest.approx(1.9)
+    assert completion.reward == 0.0
+    assert result["full_result"]["reward"] == 1.0
 
 
 def test_nemo_gym_penalties_tensorize_token_ids_before_malformed_check():
