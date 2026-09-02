@@ -60,12 +60,58 @@ except ImportError:
 WeightUpdateTransport = Literal["ipc", "collective", "nccl_reshard"]
 WeightUpdateFinalizer = Callable[[], None]
 
+_NATIVE_MTP_PARAMETER_RE = re.compile(r"(?:^|\.)mtp(?:\.|$)")
+
 
 def _format_refit_key_error(label: str, keys: set[str]) -> str:
     """Format a bounded refit-key diagnostic."""
     ordered = sorted(keys)
     suffix = " ..." if len(ordered) > 8 else ""
     return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
+
+
+def _is_native_mtp_parameter_name(name: str) -> bool:
+    """Return whether ``name`` belongs to the checkpoint's native MTP tree."""
+    return _NATIVE_MTP_PARAMETER_RE.search(name) is not None
+
+
+def _split_main_and_native_mtp_weights(
+    weights: list[tuple[str, torch.Tensor]],
+) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]:
+    """Partition a policy stream by the vLLM model that owns each weight.
+
+    Native MTP layers are owned by vLLM's separate drafter. Sending them to
+    the main-model autoloader lets its prefix mapper alias ``mtp.layers.N`` to
+    ``model.layers.N`` and can feed MTP MoE tensors into the corresponding base
+    layer. Keep the namespaces separate and forward the complete policy stream
+    to the drafter below so shared embedding/head aliases remain available.
+    """
+    main_weights: list[tuple[str, torch.Tensor]] = []
+    native_mtp_weights: list[tuple[str, torch.Tensor]] = []
+    for name, tensor in weights:
+        destination = (
+            native_mtp_weights
+            if _is_native_mtp_parameter_name(name)
+            else main_weights
+        )
+        destination.append((name, tensor))
+    return main_weights, native_mtp_weights
+
+
+def _require_main_model_weight_namespace(
+    weights: list[tuple[str, torch.Tensor]],
+) -> None:
+    """Fail if a native MTP tensor bypassed the explicit drafter route."""
+    native_mtp_names = {
+        name for name, _tensor in weights if _is_native_mtp_parameter_name(name)
+    }
+    if native_mtp_names:
+        raise RuntimeError(
+            _format_refit_key_error(
+                "native MTP weights reached the main-model refit loader",
+                native_mtp_names,
+            )
+        )
 
 
 class IPCWeightManifestError(RuntimeError):
@@ -201,6 +247,7 @@ class VllmInternalWorkerExtension:
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
         from nemo_rl.models.generation.vllm.quantization import fp8
 
+        _require_main_model_weight_namespace(policy_weights)
         if fp8.is_fp8_model(self.model_runner.vllm_config):
             fp8.load_weights(policy_weights, self.model_runner)
             return
@@ -586,7 +633,11 @@ class VllmInternalWorkerExtension:
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
-        self._load_hf_weights(policy_weights)
+        main_policy_weights, _native_mtp_weights = (
+            _split_main_and_native_mtp_weights(policy_weights)
+        )
+        if main_policy_weights:
+            self._load_hf_weights(main_policy_weights)
         # Eagle3 draft weights are exported with the `draft.` prefix.
         self._load_draft_weights(draft_weights)
         # MTP drafters co-trained with the policy receive their weights from the

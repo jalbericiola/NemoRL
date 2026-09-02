@@ -478,7 +478,7 @@ def test_load_mtp_weights_from_disk_raises_when_mtp_weights_missing(
 
 @pytest.mark.vllm
 def test_load_weights_routes_only_policy_weights_to_mtp_drafter(monkeypatch):
-    """The MTP path receives policy weights, while Eagle gets draft-prefixed ones."""
+    """Native MTP weights bypass the main loader and reach only the drafter."""
     from nemo_rl.models.generation.vllm.quantization import fp8
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtension,
@@ -494,13 +494,63 @@ def test_load_weights_routes_only_policy_weights_to_mtp_drafter(monkeypatch):
     ext._maybe_refit_mtp_drafter = MagicMock()
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
 
-    policy_weights = [("model.weight", "policy-value")]
+    main_weights = [("model.weight", "policy-value")]
+    native_mtp_weights = [
+        ("mtp.layers.0.mixer.experts.0.up_proj.weight", "mtp-value"),
+        ("module.mtp.norm.weight", "prefixed-mtp-value"),
+    ]
+    policy_weights = main_weights + native_mtp_weights
     draft_weights = [("weight", "draft-value")]
     ext._load_weights(policy_weights + [("draft.weight", "draft-value")])
 
-    main_model.load_weights.assert_called_once_with(weights=policy_weights)
+    main_model.load_weights.assert_called_once_with(weights=main_weights)
     ext._load_draft_weights.assert_called_once_with(draft_weights)
     ext._maybe_refit_mtp_drafter.assert_called_once_with(policy_weights)
+
+
+@pytest.mark.vllm
+def test_load_weights_with_only_native_mtp_weights_skips_main_loader(monkeypatch):
+    """An MTP-only IPC bucket must not invoke the main-model autoloader."""
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    main_model = SimpleNamespace(load_weights=MagicMock())
+    ext.model_runner = SimpleNamespace(
+        model=main_model,
+        vllm_config=SimpleNamespace(model_config=SimpleNamespace(architectures=[])),
+    )
+    ext._load_draft_weights = MagicMock()
+    ext._maybe_refit_mtp_drafter = MagicMock()
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+
+    native_mtp_weights = [("mtp.layers.1.weight", "mtp-value")]
+    ext._load_weights(native_mtp_weights)
+
+    main_model.load_weights.assert_not_called()
+    ext._load_draft_weights.assert_not_called()
+    ext._maybe_refit_mtp_drafter.assert_called_once_with(native_mtp_weights)
+
+
+@pytest.mark.vllm
+def test_main_loader_rejects_native_mtp_namespace_before_load(monkeypatch):
+    """Direct callers cannot bypass the MTP/main ownership split."""
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    main_model = SimpleNamespace(load_weights=MagicMock())
+    ext.model_runner = SimpleNamespace(model=main_model, vllm_config=object())
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+
+    with pytest.raises(RuntimeError, match="native MTP weights reached.*main-model"):
+        ext._load_hf_weights([("language_model.mtp.norm.weight", "mtp-value")])
+
+    main_model.load_weights.assert_not_called()
 
 
 @pytest.mark.vllm
