@@ -302,6 +302,8 @@ mkdir -p -- "${pair_root}/off" "${pair_root}/on"
   printf 'vllm_backend_blob=%s\nvllm_backend_sha256=%s\n' \
     "${EXPECTED_VLLM_BACKEND_BLOB}" "${EXPECTED_VLLM_BACKEND_SHA256}"
   printf 'nemo_live_mounts=automatic_no_ro_flag,published_dirs_and_executables_0555,published_files_0444\n'
+  printf 'nemo_deployment_self_mount=%s:%s:ro\n' \
+    "${NEMO_DEPLOYMENT}" "${NEMO_DEPLOYMENT}"
   printf 'fixture=%s\nfixture_sha256=%s\n' "${FIXTURE_PATH}" "${EXPECTED_FIXTURE_SHA256}"
   printf 'arms=off:observe,on:train\nresources=per_arm_nodes:1,per_arm_gpus:4,colocated:true,vllm_gpu_memory_utilization:%s\n' \
     "${VLLM_GPU_MEMORY_UTILIZATION}"
@@ -327,9 +329,11 @@ launch_arm() {
   # relies on the fail-closed publication modes checked above (dirs and tracked
   # executables 0555, other tracked files 0444); Python bytecode and uv writes
   # are disabled.
-  # Do not add a second NeMo parent/child bind here.  Only independently pinned
-  # Bridge, MCore, Gym, Automodel, fixture/base, and model sources are explicit.
-  extra_mounts="${BASE_DEPLOYMENT}:${BASE_DEPLOYMENT}:ro,${AUTOMODEL_ROOT}:/opt/nemo-rl/3rdparty/Automodel-workspace/Automodel:ro,${BRIDGE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:ro,${MCORE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:ro,${GYM_ROOT}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:ro,${MODEL_PATH}:${MODEL_PATH}:ro"
+  # The identical-path read-only deployment bind makes nano35_launch.sh's host
+  # working directory visible to Pyxis.  It does not target or overlap /opt.
+  # Do not add a second NeMo parent/child bind under /opt/nemo-rl here.
+  extra_mounts="${NEMO_DEPLOYMENT}:${NEMO_DEPLOYMENT}:ro,${BASE_DEPLOYMENT}:${BASE_DEPLOYMENT}:ro,${AUTOMODEL_ROOT}:/opt/nemo-rl/3rdparty/Automodel-workspace/Automodel:ro,${BRIDGE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:ro,${MCORE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:ro,${GYM_ROOT}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:ro,${MODEL_PATH}:${MODEL_PATH}:ro"
+  [[ ",${extra_mounts}," == *",${NEMO_DEPLOYMENT}:${NEMO_DEPLOYMENT}:ro,"* ]]
   [[ "${extra_mounts}" != *':/opt/nemo-rl:ro'* ]]
   [[ "${extra_mounts}" != *':/opt/nemo-rl/nemo_rl'* ]]
   [[ "${extra_mounts}" != *'/vllm_backend.py:'* ]]
