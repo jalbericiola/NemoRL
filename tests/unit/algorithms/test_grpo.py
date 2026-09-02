@@ -3139,8 +3139,8 @@ def test_async_grpo_colocated_save_defers_wake_until_after_checkpoint(
     policy_generation.finish_generation.side_effect = lambda *a, **k: events.append(
         ("finish_generation", k.get("release_gpu", True))
     )
-    policy_generation.prepare_for_generation.side_effect = (
-        lambda *a, **k: events.append("wake_engine")
+    policy_generation.prepare_for_generation.side_effect = lambda *a, **k: (
+        events.append("wake_engine")
     )
     policy.offload_before_refit.side_effect = lambda *a, **k: events.append(
         "offload_before_refit"
@@ -3541,6 +3541,14 @@ def test_periodic_validation_starts_at_configured_step(
             master_config.data_plane = {"enabled": True}
             stack.enter_context(
                 mock_sync_grpo_infrastructure(mock_grpo_components["policy"])
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo_sync.group_id_from_sample_id",
+                    side_effect=AssertionError(
+                        "disabled shared-prefix mode must not parse sample IDs"
+                    ),
+                )
             )
             validate_target = "nemo_rl.algorithms.grpo_sync.validate_sync"
         elif train_func is async_grpo_train:

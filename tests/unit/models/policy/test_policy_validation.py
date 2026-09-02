@@ -333,6 +333,15 @@ def test_shared_prefix_plain_observe_does_not_require_deterministic_contract() -
     assert validate_shared_prefix_training_config(config).mode == "observe"
 
 
+@pytest.mark.parametrize("enabled", [True, 1, "false", None])
+def test_shared_prefix_train_rejects_peft(enabled: object) -> None:
+    config = create_shared_prefix_train_config()
+    cast(dict[str, Any], config["megatron_cfg"])["peft"] = {"enabled": enabled}
+
+    with pytest.raises(ValueError, match="peft.enabled=false"):
+        validate_shared_prefix_training_config(config)
+
+
 @pytest.mark.parametrize(
     ("block", "name", "value"),
     [

@@ -887,6 +887,16 @@ def validate_shared_prefix_training_config(
             "policy.sequence_packing.enabled=true."
         )
 
+    peft_config = megatron_config.get("peft")
+    if peft_config is not None and (
+        not isinstance(peft_config, Mapping) or peft_config.get("enabled") is not False
+    ):
+        raise ValueError(
+            "policy.shared_prefix_training.mode=train currently requires "
+            "policy.megatron_cfg.peft.enabled=false exactly; PEFT/LoRA execution "
+            "has not been validated for shared-prefix stochastic-mask semantics."
+        )
+
     try:
         tp_size, cp_size, _sequence_parallel = resolve_shared_prefix_parallel_topology(
             tp_size=megatron_config["tensor_model_parallel_size"],

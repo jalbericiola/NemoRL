@@ -82,6 +82,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.policy import get_shared_prefix_training_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import Logger, print_message_log_samples
@@ -873,21 +874,25 @@ def grpo_train_sync(
                         )
                     )
 
-                metrics.update(
-                    _get_shared_prefix_observation_metrics(
-                        policy_config=master_config.policy,
-                        expected_group_size=master_config.grpo.num_generations_per_prompt,
-                        group_ids=[
-                            group_id_from_sample_id(sample_id)
-                            for sample_id in meta.sample_ids
-                        ],
-                        prompt_token_ids=prompt_ids_for_adv,
-                        prompt_lengths=length,
-                        input_lengths=input_lengths,
-                        token_mask=token_mask,
-                        sample_mask=sample_mask,
+                if (
+                    get_shared_prefix_training_config(master_config.policy).mode
+                    != "disabled"
+                ):
+                    metrics.update(
+                        _get_shared_prefix_observation_metrics(
+                            policy_config=master_config.policy,
+                            expected_group_size=master_config.grpo.num_generations_per_prompt,
+                            group_ids=[
+                                group_id_from_sample_id(sample_id)
+                                for sample_id in meta.sample_ids
+                            ],
+                            prompt_token_ids=prompt_ids_for_adv,
+                            prompt_lengths=length,
+                            input_lengths=input_lengths,
+                            token_mask=token_mask,
+                            sample_mask=sample_mask,
+                        )
                     )
-                )
 
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)

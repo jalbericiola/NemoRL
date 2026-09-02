@@ -357,13 +357,20 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         self,
         max_size: int,
         drop_incomplete_targets_on_restore: bool,
+        include_shared_prefix_metadata: bool = False,
     ) -> None:
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
+        if type(include_shared_prefix_metadata) is not bool:
+            raise TypeError(
+                "include_shared_prefix_metadata must be a bool, got "
+                f"{include_shared_prefix_metadata!r}"
+            )
         self.max_size = max_size
         # True discards partial restored rows. The dataloader is not rewound,
         # so replacement rollouts come from subsequent prompts.
         self._drop_incomplete_targets_on_restore = drop_incomplete_targets_on_restore
+        self._include_shared_prefix_metadata = include_shared_prefix_metadata
         self.trajectories = []  # List[dict[str, Any]]
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
@@ -660,6 +667,9 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                     self.last_target_weight_already_generated
                 ),
                 "max_size": self.max_size,
+                "include_shared_prefix_metadata": (
+                    self._include_shared_prefix_metadata
+                ),
             }
 
     def save_to_path(self, path: str) -> int:
@@ -755,6 +765,28 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                     "ReplayBuffer max_size changed: "
                     f"checkpoint={state['max_size']}, current={self.max_size}. "
                     "Using current config value."
+                )
+
+            checkpoint_include_shared_prefix_metadata = state.get(
+                "include_shared_prefix_metadata", False
+            )
+            if type(checkpoint_include_shared_prefix_metadata) is not bool:
+                raise ValueError(
+                    "Replay buffer checkpoint field "
+                    "'include_shared_prefix_metadata' must be a bool, got "
+                    f"{checkpoint_include_shared_prefix_metadata!r}."
+                )
+            if (
+                checkpoint_include_shared_prefix_metadata
+                != self._include_shared_prefix_metadata
+            ):
+                raise ValueError(
+                    "Replay buffer checkpoint shared-prefix schema mismatch: "
+                    "checkpoint include_shared_prefix_metadata="
+                    f"{checkpoint_include_shared_prefix_metadata}, current="
+                    f"{self._include_shared_prefix_metadata}. Resume with the same "
+                    "policy.shared_prefix_training.mode or delete replay_buffer.pt "
+                    "to start with an empty buffer."
                 )
 
             self.trajectories = trajectories

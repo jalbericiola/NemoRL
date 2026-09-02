@@ -182,6 +182,53 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.get_debug_info()["target_weight_versions"] == expected_targets
         assert buffer.get_trajectories_needed(3, 2) == expected_needed
 
+    @pytest.mark.parametrize(
+        ("checkpoint_enabled", "current_enabled"),
+        [(False, True), (True, False)],
+    )
+    def test_local_restore_rejects_shared_prefix_schema_mismatch(
+        self, checkpoint_enabled: bool, current_enabled: bool
+    ) -> None:
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=False,
+            include_shared_prefix_metadata=current_enabled,
+        )
+        state = self._state(
+            trajectory_versions=[],
+            target_weight_versions=[],
+            last_target_weight_already_generated=-1,
+        )
+        state["include_shared_prefix_metadata"] = checkpoint_enabled
+
+        with pytest.raises(ValueError, match="shared-prefix schema mismatch"):
+            buffer.load_state_dict(state)
+
+    def test_local_restore_treats_legacy_schema_as_disabled(self) -> None:
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=False,
+            include_shared_prefix_metadata=False,
+        )
+        state = self._state(
+            trajectory_versions=[],
+            target_weight_versions=[],
+            last_target_weight_already_generated=-1,
+        )
+
+        buffer.load_state_dict(state)
+
+        assert buffer.size() == 0
+
+    def test_state_dict_records_shared_prefix_schema(self) -> None:
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=False,
+            include_shared_prefix_metadata=True,
+        )
+
+        assert buffer.state_dict()["include_shared_prefix_metadata"] is True
+
     def test_local_restore_empty_state_resets_generation_watermark(self):
         buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
         state = self._state(
