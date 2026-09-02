@@ -36,13 +36,16 @@ import re
 import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 CONTRACT_SCHEMA = "nemo-rl-strict-single-env-acceptance-contract-v1"
+PAIR_MANIFEST_SCHEMA = "nemo-rl-strict-single-env-pair-v2"
+SLURM_EXPORT_BOUNDARY_SCHEMA = "nemo-rl-strict-slurm-export-file-v2"
+RUNTIME_TOOL_MANIFEST_SCHEMA = "nemo-rl-strict-runtime-tools-v1"
 RUN_EXPORT_SCHEMA = "nemo-rl-offline-wandb-run-export-v1"
 REPORT_SCHEMA = "nemo-rl-strict-single-env-acceptance-report-v1"
-JOB_RECEIPT_SCHEMA = "nemo-rl-strict-pair-job-receipt-v1"
+JOB_RECEIPT_SCHEMA = "nemo-rl-strict-pair-job-receipt-v2"
 EXECUTION_MARKER_RECEIPT_SCHEMA = "nemo-rl-shared-prefix-physical-execution-receipt-v1"
 EXECUTION_MARKER_SEMANTICS = "production_packed_fused_training_path"
 
@@ -66,6 +69,143 @@ MAX_EXACT_INTEGER = 1 << 53
 HEX40_RE = re.compile(r"[0-9a-f]{40}\Z")
 HEX64_RE = re.compile(r"[0-9a-f]{64}\Z")
 SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+ENVIRONMENT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+SAFE_POSIX_PATH_RE = re.compile(r"/[A-Za-z0-9._/+:-]+\Z")
+
+# Frozen scheduler-boundary inventory. Receipts carry these names and hashes,
+# never the corresponding environment values.
+SLURM_EXPORT_ALLOWED_NAMES = (
+    "BASE_LOG_DIR",
+    "BATCH_SCRIPT",
+    "COLOCATED_GENERATION",
+    "COMMAND",
+    "CONTAINER",
+    "CPUS_PER_WORKER",
+    "DEDICATED_RAY_HEAD",
+    "DEPLOYMENT_ROOT",
+    "EXPECTED_BRIDGE_RUNNABLE_MANIFEST_SHA256",
+    "EXPECTED_DEPLOYMENT_READY",
+    "EXPECTED_DEPLOYMENT_READY_FILE_SHA256",
+    "EXPECTED_GYM_GITLINK_COMMIT",
+    "EXPECTED_MCORE_RUNNABLE_MANIFEST_SHA256",
+    "EXPECTED_NEMO_HEAD",
+    "EXPECTED_NEMO_RUNNABLE_MANIFEST_SHA256",
+    "EXPECTED_SHARED_PREFIX_DETERMINISM_ATTESTATION",
+    "EXPECTED_SHARED_PREFIX_DETERMINISM_ATTESTATION_COUNT",
+    "EXPECTED_SHARED_PREFIX_DETERMINISM_ATTESTATION_SCHEMA",
+    "EXPECTED_SHARED_PREFIX_DETERMINISM_ATTESTATION_SHA256",
+    "EXPECTED_STRICT_PAIR_BOOTSTRAP_SHA256SUM_SHA256",
+    "EXPECTED_STRICT_PAIR_CONTAINER_PYTHON_SHA256",
+    "EXPECTED_STRICT_PAIR_CONTAINER_SHA256",
+    "EXPECTED_STRICT_PAIR_CONTAINER_UV_SHA256",
+    "EXPECTED_STRICT_PAIR_FIXTURE_SHA256",
+    "EXPECTED_STRICT_PAIR_HOST_PYTHON_SHA256",
+    "EXPECTED_STRICT_PAIR_JOB_WRAPPER_SHA256",
+    "EXPECTED_STRICT_PAIR_MODEL_TREE_SHA256",
+    "EXPECTED_STRICT_PAIR_RUNTIME_TOOL_MANIFEST_SHA256",
+    "EXPECTED_STRICT_PAIR_SANDBOX_CONTAINER_SHA256",
+    "EXPECTED_STRICT_PAIR_UV_SHIM_SHA256",
+    "EXPECTED_STRICT_PREBUILT_SNAPSHOT_MANIFEST_SHA256",
+    "EXP_NAME",
+    "GPUS_PER_NODE",
+    "HF_DATASETS_CACHE",
+    "HF_HOME",
+    "HF_HUB_CACHE",
+    "HF_TOKEN",
+    "MODEL_PATH",
+    "MOUNTS",
+    "NEMO_SKILLS_SANDBOX_PORT",
+    "NUM_EXTERNAL_SERVICE_NODES",
+    "NUM_GEN_NODES",
+    "NUM_GYM_NODES",
+    "NUM_TRAIN_NODES",
+    "PAIR_ID",
+    "PERSISTENT_CACHE",
+    "RAY_LOG_SYNC_FREQUENCY",
+    "RAY_SUB",
+    "RESULTS_DIR",
+    "SANDBOX_COMMAND",
+    "SANDBOX_CONTAINER",
+    "SEGMENT_SIZE",
+    "SETUP_COMMAND",
+    "STRICT_PAIR_CONTAINER_PYTHON",
+    "STRICT_PAIR_CONTAINER_UV",
+    "STRICT_PAIR_HOST_PYTHON",
+    "STRICT_PAIR_JOB_WRAPPER",
+    "STRICT_PAIR_LAUNCH_MODE",
+    "STRICT_PAIR_RUNTIME_TOOL_MANIFEST",
+    "STRICT_PAIR_SHARED_PREFIX_MODE",
+    "STRICT_PAIR_UV_SHIM",
+    "STRICT_PREBUILT_SNAPSHOT_DIR",
+    "TRAIN_PATH",
+    "VAL_PATH",
+    "WANDB_API_KEY",
+    "WANDB_ENTITY",
+    "WANDB_PROJ",
+    "WANDB_RUN_GROUP",
+)
+
+HOST_RUNTIME_TOOL_NAMES = frozenset(
+    {
+        "awk",
+        "bash",
+        "cat",
+        "chmod",
+        "cmp",
+        "date",
+        "env",
+        "find",
+        "git",
+        "grep",
+        "ln",
+        "mkdir",
+        "mktemp",
+        "python",
+        "readlink",
+        "realpath",
+        "rm",
+        "rsync",
+        "sbatch",
+        "sha256sum",
+        "stat",
+        "wc",
+    }
+)
+CONTAINER_RUNTIME_TOOL_NAMES = frozenset({"python", "uv", "uv_shim"})
+
+CONTAINER_ENTRY_BOUNDARY = {
+    "bash_args": ["-p"],
+    "bash_path": "/bin/bash",
+    "env_path": "/usr/bin/env",
+    "sha256sum": {
+        "path": "/usr/bin/sha256sum",
+        "sha256": ("f3d040161f5c29e4c7cd4e3d6bb513ce9a43b9d1bd06f456a6aab3d34d0f1e33"),
+    },
+    "unset_environment": ["BASH_ENV", "ENV"],
+}
+
+SECRET_VALUE_FIELD_NAMES = frozenset(
+    {
+        "env",
+        "environment_values",
+        "export_values",
+        "payload",
+        "raw_values",
+        "secret",
+        "secret_values",
+        "secrets",
+        "values",
+    }
+)
+
+SLURM_EXPORT_JOB_ARGV = (
+    "--pair-manifest",
+    "{pair_manifest_path}",
+    "--pair-manifest-sha256",
+    "{pair_manifest_sha256}",
+    "--arm",
+    "{arm}",
+)
 
 SOURCE_KEYS = frozenset(
     {
@@ -539,6 +679,57 @@ def _digest(value: Any, label: str) -> str:
     ):
         raise EvidenceError(f"{label} must be a populated lowercase SHA-256")
     return value
+
+
+def _absolute_posix_path(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or SAFE_POSIX_PATH_RE.fullmatch(value) is None
+        or "\x00" in value
+    ):
+        raise EvidenceError(f"{label} must be a non-empty absolute POSIX path")
+    path = PurePosixPath(value)
+    if (
+        not path.is_absolute()
+        or path.as_posix() != value
+        or value == "/"
+        or ".." in path.parts
+    ):
+        raise EvidenceError(f"{label} must be a canonical absolute POSIX path")
+    return value
+
+
+def _canonical_json_sha256(value: Any, label: str) -> str:
+    try:
+        raw = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise EvidenceError(f"{label} is not canonical ASCII JSON") from error
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _reject_secret_value_fields(value: Any, label: str) -> None:
+    """Reject receipt members that could serialize environment secret values."""
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise EvidenceError(f"{label} contains a non-string field name")
+            if (
+                key in SLURM_EXPORT_ALLOWED_NAMES
+                or key.lower() in SECRET_VALUE_FIELD_NAMES
+            ):
+                raise EvidenceError(
+                    f"{label} contains forbidden secret-value field {key!r}"
+                )
+            _reject_secret_value_fields(nested, label)
+    elif isinstance(value, list):
+        for nested in value:
+            _reject_secret_value_fields(nested, label)
 
 
 def _commit(value: Any, label: str) -> str:
@@ -1019,6 +1210,235 @@ def _required_artifact(artifacts: Mapping[str, Any], key: str, label: str) -> Do
     return document
 
 
+def _validate_runtime_tool_record(value: Any, label: str) -> dict[str, Any]:
+    record = _mapping(value, label)
+    _exact_keys(record, {"path", "sha256"}, label)
+    _absolute_posix_path(record["path"], f"{label} path")
+    _digest(record["sha256"], f"{label} SHA-256")
+    return record
+
+
+def _validate_pair_runtime_tools(manifest: Mapping[str, Any]) -> None:
+    runtime_tools = _mapping(
+        manifest.get("runtime_tools"), "Pair manifest runtime tools"
+    )
+    _exact_keys(
+        runtime_tools,
+        {"bootstrap_sha256sum", "document", "manifest"},
+        "Pair manifest runtime tools",
+    )
+    document = _mapping(
+        runtime_tools["document"], "Pair manifest runtime-tool document"
+    )
+    _exact_keys(
+        document,
+        {"schema", "host", "container"},
+        "Pair manifest runtime-tool document",
+    )
+    if document["schema"] != RUNTIME_TOOL_MANIFEST_SCHEMA:
+        raise EvidenceError("unexpected Pair manifest runtime-tool schema")
+
+    host = _mapping(document["host"], "Pair manifest host runtime tools")
+    container = _mapping(document["container"], "Pair manifest container runtime tools")
+    _exact_keys(host, set(HOST_RUNTIME_TOOL_NAMES), "Pair manifest host runtime tools")
+    _exact_keys(
+        container,
+        set(CONTAINER_RUNTIME_TOOL_NAMES),
+        "Pair manifest container runtime tools",
+    )
+    for scope, records in (("host", host), ("container", container)):
+        for name in sorted(records):
+            _validate_runtime_tool_record(
+                records[name], f"Pair manifest {scope} runtime tool {name}"
+            )
+
+    bootstrap = _validate_runtime_tool_record(
+        runtime_tools["bootstrap_sha256sum"],
+        "Pair manifest bootstrap sha256sum",
+    )
+    if bootstrap != host["sha256sum"]:
+        raise EvidenceError(
+            "Pair manifest bootstrap sha256sum differs from the host inventory"
+        )
+
+    manifest_record = _validate_runtime_tool_record(
+        runtime_tools["manifest"], "Pair manifest runtime-tool manifest"
+    )
+    deployment = _mapping(manifest.get("deployment"), "Pair manifest deployment")
+    deployment_root = _absolute_posix_path(
+        deployment.get("root"), "Pair manifest deployment root"
+    )
+    expected_manifest_path = (
+        PurePosixPath(deployment_root) / "strict_pair_runtime_tools.json"
+    ).as_posix()
+    if manifest_record["path"] != expected_manifest_path:
+        raise EvidenceError(
+            "Pair manifest runtime-tool manifest is outside its canonical deployment path"
+        )
+
+
+def _validate_pair_container_entry_boundary(manifest: Mapping[str, Any]) -> None:
+    boundary = _mapping(
+        manifest.get("container_entry_boundary"),
+        "Pair manifest container-entry boundary",
+    )
+    _exact_keys(
+        boundary,
+        {"bash_args", "bash_path", "env_path", "sha256sum", "unset_environment"},
+        "Pair manifest container-entry boundary",
+    )
+    sha256sum = _mapping(
+        boundary["sha256sum"], "Pair manifest container-entry sha256sum"
+    )
+    _exact_keys(
+        sha256sum,
+        {"path", "sha256"},
+        "Pair manifest container-entry sha256sum",
+    )
+    if boundary != CONTAINER_ENTRY_BOUNDARY:
+        raise EvidenceError(
+            "Pair manifest container-entry boundary differs from the fixed image contract"
+        )
+
+
+def _validate_pair_gym_source(
+    manifest: Mapping[str, Any], contract: Mapping[str, Any]
+) -> None:
+    source = _mapping(manifest.get("source"), "Pair manifest source")
+    gym = _mapping(source.get("gym"), "Pair manifest Gym source")
+    _exact_keys(gym, {"gitlink_commit", "path", "tree"}, "Pair manifest Gym source")
+    commit = _commit(gym["gitlink_commit"], "Pair manifest Gym gitlink commit")
+    tree = _commit(gym["tree"], "Pair manifest Gym Git tree")
+    path = _absolute_posix_path(gym["path"], "Pair manifest Gym path")
+    if commit != contract["provenance"]["source_commits"]["nemo_gym"]:
+        raise EvidenceError("Pair manifest Gym commit differs from the acceptance pin")
+    if tree != contract["provenance"]["source_git_trees"]["nemo_gym"]:
+        raise EvidenceError("Pair manifest Gym tree differs from the acceptance pin")
+
+    deployment = _mapping(manifest.get("deployment"), "Pair manifest deployment")
+    deployment_root = _absolute_posix_path(
+        deployment.get("root"), "Pair manifest deployment root"
+    )
+    expected_path = (
+        PurePosixPath(deployment_root) / "runnable/NemoRL/3rdparty/Gym-workspace/Gym"
+    ).as_posix()
+    if path != expected_path:
+        raise EvidenceError("Pair manifest Gym path differs from the deployed gitlink")
+
+
+def _validate_pair_manifest(
+    document: Document, contract: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Authenticate the execution Pair manifest and its sealed Slurm boundary."""
+    expected_sha256 = contract["provenance"]["common"]["pair_manifest_sha256"]
+    if document.sha256 != expected_sha256:
+        raise EvidenceError("Pair manifest bytes differ from the pinned SHA-256")
+
+    manifest = document.value
+    if manifest.get("schema") != PAIR_MANIFEST_SCHEMA:
+        raise EvidenceError("unexpected Pair manifest schema")
+    if manifest.get("pair_id") != contract["pair"]["pair_id"]:
+        raise EvidenceError(
+            "Pair manifest pair_id differs from the acceptance contract"
+        )
+    if manifest.get("arms") != {"off": "observe", "on": "train"}:
+        raise EvidenceError("Pair manifest arms differ from the strict OFF/ON modes")
+
+    boundary = _mapping(
+        manifest.get("slurm_export_boundary"),
+        "Pair manifest Slurm export boundary",
+    )
+    _exact_keys(
+        boundary,
+        {
+            "schema",
+            "format",
+            "allowed_names",
+            "ambient_merge",
+            "get_user_env",
+            "arms",
+            "job_argv",
+        },
+        "Pair manifest Slurm export boundary",
+    )
+    if boundary["schema"] != SLURM_EXPORT_BOUNDARY_SCHEMA:
+        raise EvidenceError("unexpected Pair manifest Slurm export boundary schema")
+    if boundary["format"] != "nul-separated-name-value":
+        raise EvidenceError("unexpected Pair manifest Slurm export boundary format")
+    if boundary["ambient_merge"] is not False:
+        raise EvidenceError("Pair manifest Slurm export boundary permits ambient merge")
+    if boundary["get_user_env"] is not False:
+        raise EvidenceError("Pair manifest Slurm export boundary permits get-user-env")
+
+    allowed_names = boundary["allowed_names"]
+    if not isinstance(allowed_names, list) or not allowed_names:
+        raise EvidenceError(
+            "Pair manifest Slurm export allowed_names must be a non-empty list"
+        )
+    if any(
+        not isinstance(name, str) or ENVIRONMENT_NAME_RE.fullmatch(name) is None
+        for name in allowed_names
+    ):
+        raise EvidenceError(
+            "Pair manifest Slurm export allowed_names must contain names only"
+        )
+    if allowed_names != sorted(allowed_names) or len(allowed_names) != len(
+        set(allowed_names)
+    ):
+        raise EvidenceError(
+            "Pair manifest Slurm export allowed_names must be sorted and unique"
+        )
+    if allowed_names != list(SLURM_EXPORT_ALLOWED_NAMES):
+        raise EvidenceError(
+            "Pair manifest Slurm export allowed_names differ from the canonical user payload"
+        )
+
+    arm_records = _mapping(boundary["arms"], "Pair manifest Slurm export arms")
+    _exact_keys(arm_records, {"off", "on"}, "Pair manifest Slurm export arms")
+    paths: dict[str, str] = {}
+    digests: dict[str, str] = {}
+    for arm in ("off", "on"):
+        record = _mapping(arm_records[arm], f"Pair manifest {arm} Slurm export record")
+        _exact_keys(
+            record,
+            {"path", "sha256"},
+            f"Pair manifest {arm} Slurm export record",
+        )
+        paths[arm] = _absolute_posix_path(
+            record["path"], f"Pair manifest {arm} Slurm export path"
+        )
+        digests[arm] = _digest(
+            record["sha256"], f"Pair manifest {arm} Slurm export SHA-256"
+        )
+    if paths["off"] == paths["on"]:
+        raise EvidenceError("OFF/ON Slurm export files must have distinct paths")
+    if digests["off"] == digests["on"]:
+        raise EvidenceError("OFF/ON Slurm export files must have distinct SHA-256s")
+
+    if boundary["job_argv"] != list(SLURM_EXPORT_JOB_ARGV):
+        raise EvidenceError(
+            "Pair manifest Slurm job argv differs from the positional boundary"
+        )
+
+    pair_paths = _mapping(manifest.get("paths"), "Pair manifest paths")
+    results_root = _absolute_posix_path(
+        pair_paths.get("results_root"), "Pair manifest results root"
+    )
+    export_parent = (
+        PurePosixPath(results_root) / "strict_pair_slurm_exports" / manifest["pair_id"]
+    )
+    for arm in ("off", "on"):
+        expected_export_path = (export_parent / f"{arm}.env").as_posix()
+        if paths[arm] != expected_export_path:
+            raise EvidenceError(
+                f"Pair manifest {arm} Slurm export path differs from the canonical arm path"
+            )
+    _validate_pair_runtime_tools(manifest)
+    _validate_pair_container_entry_boundary(manifest)
+    _validate_pair_gym_source(manifest, contract)
+    return manifest
+
+
 def _validate_holdout(
     document: Document, contract: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1103,8 +1523,62 @@ def _validate_step_receipts(
         raise EvidenceError("cross-arm row digest aliases the input fixture digest")
 
 
+def _resolved_slurm_export_boundary(
+    pair_manifest: Mapping[str, Any], arm: str, pair_manifest_sha256: str
+) -> dict[str, Any]:
+    pair_boundary = _mapping(
+        pair_manifest["slurm_export_boundary"],
+        "Pair manifest Slurm export boundary",
+    )
+    arm_records = _mapping(pair_boundary["arms"], "Pair manifest Slurm export arms")
+    arm_record = _mapping(arm_records[arm], f"Pair manifest {arm} Slurm export record")
+    paths = _mapping(pair_manifest["paths"], "Pair manifest paths")
+    pair_manifest_path = (
+        PurePosixPath(paths["results_root"]) / "PAIR_MANIFEST.json"
+    ).as_posix()
+    return {
+        "schema": SLURM_EXPORT_BOUNDARY_SCHEMA,
+        "format": "nul-separated-name-value",
+        "allowed_names": list(SLURM_EXPORT_ALLOWED_NAMES),
+        "ambient_merge": False,
+        "get_user_env": False,
+        "arm": arm,
+        "path": arm_record["path"],
+        "sha256": arm_record["sha256"],
+        "job_argv": [
+            "--pair-manifest",
+            pair_manifest_path,
+            "--pair-manifest-sha256",
+            pair_manifest_sha256,
+            "--arm",
+            arm,
+        ],
+    }
+
+
+def _runtime_tool_receipt_pins(pair_manifest: Mapping[str, Any]) -> dict[str, Any]:
+    runtime_tools = pair_manifest["runtime_tools"]
+    document = runtime_tools["document"]
+    host = document["host"]
+    container = document["container"]
+    return {
+        "runtime_tool_manifest_path": runtime_tools["manifest"]["path"],
+        "runtime_tool_manifest_sha256": runtime_tools["manifest"]["sha256"],
+        "runtime_tool_host_python_path": host["python"]["path"],
+        "runtime_tool_host_python_sha256": host["python"]["sha256"],
+        "runtime_tool_container_python_path": container["python"]["path"],
+        "runtime_tool_container_python_sha256": container["python"]["sha256"],
+        "runtime_tool_container_uv_path": container["uv"]["path"],
+        "runtime_tool_container_uv_sha256": container["uv"]["sha256"],
+        "runtime_tool_uv_shim_path": container["uv_shim"]["path"],
+        "runtime_tool_uv_shim_sha256": container["uv_shim"]["sha256"],
+    }
+
+
 def _validate_execution_receipts(
-    contract: Mapping[str, Any], artifacts: Mapping[str, Any]
+    contract: Mapping[str, Any],
+    artifacts: Mapping[str, Any],
+    pair_manifest: Mapping[str, Any],
 ) -> None:
     pair = contract["pair"]
     receipt_groups = contract["receipts"]
@@ -1151,6 +1625,20 @@ def _validate_execution_receipts(
             receipt_groups["strict_job_exit_receipts"][arm],
             label=f"{arm} strict job EXIT receipt",
         )
+        _reject_secret_value_fields(job, f"{arm} strict job EXIT receipt")
+        pair_manifest_sha256 = contract["provenance"]["common"]["pair_manifest_sha256"]
+        slurm_export_boundary = _resolved_slurm_export_boundary(
+            pair_manifest, arm, pair_manifest_sha256
+        )
+        slurm_export_boundary_sha256 = _canonical_json_sha256(
+            slurm_export_boundary, f"{arm} resolved Slurm export boundary"
+        )
+        runtime_tool_pins = _runtime_tool_receipt_pins(pair_manifest)
+        container_entry_boundary = pair_manifest["container_entry_boundary"]
+        container_entry_boundary_sha256 = _canonical_json_sha256(
+            container_entry_boundary, "container-entry boundary"
+        )
+        gym_source = pair_manifest["source"]["gym"]
         _semantic_subset(
             job,
             {
@@ -1162,9 +1650,7 @@ def _validate_execution_receipts(
                 "arm": arm,
                 "runtime_attestation_expected_count": 4,
                 "runtime_attestation_actual_count": 4,
-                "pair_manifest_sha256": contract["provenance"]["common"][
-                    "pair_manifest_sha256"
-                ],
+                "pair_manifest_sha256": pair_manifest_sha256,
                 "fixture_sha256": contract["provenance"]["common"]["fixture_sha256"],
                 "fixture_rows": 5,
                 "model_tree_sha256_v1": contract["provenance"]["common"][
@@ -1209,9 +1695,46 @@ def _validate_execution_receipts(
                 ],
                 "command_sha256": contract["provenance"]["arms"][arm]["command_sha256"],
                 "mounts_sha256": contract["provenance"]["arms"][arm]["mounts_sha256"],
+                "container_entry_boundary": container_entry_boundary,
+                "container_entry_boundary_sha256": container_entry_boundary_sha256,
+                "gym_gitlink_commit": gym_source["gitlink_commit"],
+                "gym_tree": gym_source["tree"],
+                "slurm_export_boundary": slurm_export_boundary,
+                "slurm_export_boundary_sha256": slurm_export_boundary_sha256,
+                **runtime_tool_pins,
             },
             f"{arm} strict job EXIT receipt",
         )
+        if job["container_entry_boundary"] != container_entry_boundary:
+            raise EvidenceError(
+                f"{arm} EXIT container-entry boundary differs from the Pair manifest"
+            )
+        resolved_boundary = _mapping(
+            job["slurm_export_boundary"], f"{arm} EXIT Slurm export boundary"
+        )
+        _exact_keys(
+            resolved_boundary,
+            {
+                "schema",
+                "format",
+                "allowed_names",
+                "ambient_merge",
+                "get_user_env",
+                "arm",
+                "path",
+                "sha256",
+                "job_argv",
+            },
+            f"{arm} EXIT Slurm export boundary",
+        )
+        if resolved_boundary != slurm_export_boundary:
+            raise EvidenceError(
+                f"{arm} EXIT Slurm export boundary differs from its resolved Pair arm"
+            )
+        if job["slurm_export_boundary_sha256"] != slurm_export_boundary_sha256:
+            raise EvidenceError(
+                f"{arm} EXIT Slurm export boundary digest differs from canonical JSON"
+            )
         pre_receipt_sha256 = _digest(
             job.get("pre_receipt_sha256"), f"{arm} PRE receipt hash"
         )
@@ -1621,12 +2144,13 @@ def _evaluate_speed(
     contract: Mapping[str, Any],
     runs: Mapping[str, Run],
     artifacts: Mapping[str, Any],
+    pair_manifest: Mapping[str, Any],
 ) -> Gate:
     gate = Gate("speed_evidence")
     if not _require_histories(gate, runs, SPEED_METRICS, steps=PRIMARY_STEPS):
         return gate
     try:
-        _validate_execution_receipts(contract, artifacts)
+        _validate_execution_receipts(contract, artifacts, pair_manifest)
     except (EvidenceError, KeyError) as error:
         gate.unverifiable(str(error))
         return gate
@@ -1737,6 +2261,10 @@ def evaluate_pair(
     """Evaluate all gates without allowing one result to mask another."""
     try:
         contract = validate_contract(contract_value)
+        pair_manifest = _validate_pair_manifest(
+            _required_artifact(artifacts, "pair_manifest", "Pair manifest"),
+            contract,
+        )
         runs = {
             "off": _validate_run(off_export, contract, "off"),
             "on": _validate_run(on_export, contract, "on"),
@@ -1746,7 +2274,7 @@ def evaluate_pair(
 
     reward = _evaluate_reward(contract, runs, artifacts)
     learning = _evaluate_learning(contract, runs, artifacts)
-    speed = _evaluate_speed(contract, runs, artifacts)
+    speed = _evaluate_speed(contract, runs, artifacts, pair_manifest)
     statuses = {
         "reward_correctness": reward.status,
         "learning_behavior": learning.status,
@@ -1788,6 +2316,7 @@ def _text_report(report: Mapping[str, Any]) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contract", type=Path, required=True)
+    parser.add_argument("--pair-manifest", type=Path)
     parser.add_argument("--off-export", type=Path, required=True)
     parser.add_argument("--on-export", type=Path, required=True)
     parser.add_argument("--holdout-receipt", type=Path)
@@ -1804,6 +2333,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         off = load_document(args.off_export, "OFF W&B export")
         on = load_document(args.on_export, "ON W&B export")
         artifact_arguments = (
+            ("pair_manifest", args.pair_manifest, "Pair manifest"),
             ("holdout", args.holdout_receipt, "holdout receipt"),
             (
                 "same_arm",

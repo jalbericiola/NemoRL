@@ -197,8 +197,39 @@ def _job_exit(
     source_commits: dict[str, Any],
     source_git_trees: dict[str, Any],
     arm_provenance: dict[str, Any],
+    pair_manifest: dict[str, Any],
 ) -> dict[str, Any]:
     mode = "observe" if arm == "off" else "train"
+    pair_boundary = pair_manifest["slurm_export_boundary"]
+    arm_boundary = pair_boundary["arms"][arm]
+    resolved_boundary = {
+        "schema": EVALUATOR.SLURM_EXPORT_BOUNDARY_SCHEMA,
+        "format": "nul-separated-name-value",
+        "allowed_names": list(EVALUATOR.SLURM_EXPORT_ALLOWED_NAMES),
+        "ambient_merge": False,
+        "get_user_env": False,
+        "arm": arm,
+        "path": arm_boundary["path"],
+        "sha256": arm_boundary["sha256"],
+        "job_argv": [
+            "--pair-manifest",
+            f"{pair_manifest['paths']['results_root']}/PAIR_MANIFEST.json",
+            "--pair-manifest-sha256",
+            common["pair_manifest_sha256"],
+            "--arm",
+            arm,
+        ],
+    }
+    resolved_boundary_sha256 = hashlib.sha256(
+        json.dumps(resolved_boundary, sort_keys=True, separators=(",", ":")).encode(
+            "ascii"
+        )
+    ).hexdigest()
+    runtime_tools = pair_manifest["runtime_tools"]
+    runtime_document = runtime_tools["document"]
+    host_tools = runtime_document["host"]
+    container_tools = runtime_document["container"]
+    container_entry_boundary = pair_manifest["container_entry_boundary"]
     return {
         "schema": EVALUATOR.JOB_RECEIPT_SCHEMA,
         "phase": "EXIT",
@@ -237,6 +268,26 @@ def _job_exit(
         "inner_ray_sha256": arm_provenance["inner_ray_sha256"],
         "command_sha256": arm_provenance["command_sha256"],
         "mounts_sha256": arm_provenance["mounts_sha256"],
+        "container_entry_boundary": copy.deepcopy(container_entry_boundary),
+        "container_entry_boundary_sha256": hashlib.sha256(
+            json.dumps(
+                container_entry_boundary, sort_keys=True, separators=(",", ":")
+            ).encode("ascii")
+        ).hexdigest(),
+        "gym_gitlink_commit": pair_manifest["source"]["gym"]["gitlink_commit"],
+        "gym_tree": pair_manifest["source"]["gym"]["tree"],
+        "runtime_tool_manifest_path": runtime_tools["manifest"]["path"],
+        "runtime_tool_manifest_sha256": runtime_tools["manifest"]["sha256"],
+        "runtime_tool_host_python_path": host_tools["python"]["path"],
+        "runtime_tool_host_python_sha256": host_tools["python"]["sha256"],
+        "runtime_tool_container_python_path": container_tools["python"]["path"],
+        "runtime_tool_container_python_sha256": container_tools["python"]["sha256"],
+        "runtime_tool_container_uv_path": container_tools["uv"]["path"],
+        "runtime_tool_container_uv_sha256": container_tools["uv"]["sha256"],
+        "runtime_tool_uv_shim_path": container_tools["uv_shim"]["path"],
+        "runtime_tool_uv_shim_sha256": container_tools["uv_shim"]["sha256"],
+        "slurm_export_boundary": resolved_boundary,
+        "slurm_export_boundary_sha256": resolved_boundary_sha256,
     }
 
 
@@ -255,17 +306,105 @@ def _pin(document: Any, semantic_pins: dict[str, Any]) -> dict[str, Any]:
     return {"sha256": document.sha256, "semantic_pins": semantic_pins}
 
 
+def _pair_manifest(
+    pair_id: str,
+    source_commits: dict[str, Any],
+    source_git_trees: dict[str, Any],
+) -> Any:
+    host_tools = {
+        name: {
+            "path": "/bin/bash" if name == "bash" else f"/usr/bin/{name}",
+            "sha256": _digest(f"runtime-tool:host:{name}"),
+        }
+        for name in EVALUATOR.HOST_RUNTIME_TOOL_NAMES
+    }
+    container_tools = {
+        "python": {
+            "path": (
+                "/root/.local/share/uv/python/"
+                "cpython-3.13.14-linux-aarch64-gnu/bin/python3.13"
+            ),
+            "sha256": _digest("runtime-tool:container:python"),
+        },
+        "uv": {
+            "path": "/root/.local/bin/uv",
+            "sha256": _digest("runtime-tool:container:uv"),
+        },
+        "uv_shim": {
+            "path": "/deployment/runtime/uv",
+            "sha256": _digest("runtime-tool:container:uv-shim"),
+        },
+    }
+    return EVALUATOR.document_from_value(
+        {
+            "schema": EVALUATOR.PAIR_MANIFEST_SCHEMA,
+            "pair_id": pair_id,
+            "arms": {"off": "observe", "on": "train"},
+            "paths": {"results_root": f"/results/{pair_id}"},
+            "deployment": {"root": "/deployment"},
+            "container_entry_boundary": copy.deepcopy(
+                EVALUATOR.CONTAINER_ENTRY_BOUNDARY
+            ),
+            "runtime_tools": {
+                "bootstrap_sha256sum": copy.deepcopy(host_tools["sha256sum"]),
+                "document": {
+                    "schema": EVALUATOR.RUNTIME_TOOL_MANIFEST_SCHEMA,
+                    "host": host_tools,
+                    "container": container_tools,
+                },
+                "manifest": {
+                    "path": "/deployment/strict_pair_runtime_tools.json",
+                    "sha256": _digest("runtime-tool-manifest"),
+                },
+            },
+            "source": {
+                "gym": {
+                    "gitlink_commit": source_commits["nemo_gym"],
+                    "path": ("/deployment/runnable/NemoRL/3rdparty/Gym-workspace/Gym"),
+                    "tree": source_git_trees["nemo_gym"],
+                }
+            },
+            "slurm_export_boundary": {
+                "schema": EVALUATOR.SLURM_EXPORT_BOUNDARY_SCHEMA,
+                "format": "nul-separated-name-value",
+                "allowed_names": list(EVALUATOR.SLURM_EXPORT_ALLOWED_NAMES),
+                "ambient_merge": False,
+                "get_user_env": False,
+                "arms": {
+                    "off": {
+                        "path": (
+                            f"/results/{pair_id}/strict_pair_slurm_exports/"
+                            f"{pair_id}/off.env"
+                        ),
+                        "sha256": _digest("off-slurm-export"),
+                    },
+                    "on": {
+                        "path": (
+                            f"/results/{pair_id}/strict_pair_slurm_exports/"
+                            f"{pair_id}/on.env"
+                        ),
+                        "sha256": _digest("on-slurm-export"),
+                    },
+                },
+                "job_argv": list(EVALUATOR.SLURM_EXPORT_JOB_ARGV),
+            },
+        }
+    )
+
+
 def _fixture() -> Fixture:
     pair_id = "reasoning-gym-strict-spfx-ab"
     environment = "reasoning_gym"
     run_ids = {"off": "wandb-off-a1b2c3", "on": "wandb-on-d4e5f6"}
     fixture_sha = _digest("fixture")
-    common = {key: _digest(f"common:{key}") for key in EVALUATOR.COMMON_PROVENANCE_KEYS}
-    common["fixture_sha256"] = fixture_sha
     source_commits = {key: _commit(key) for key in EVALUATOR.SOURCE_KEYS}
     source_git_trees = {
         key: _commit(f"git-tree:{key}") for key in EVALUATOR.SOURCE_KEYS
     }
+    pair_manifest = _pair_manifest(pair_id, source_commits, source_git_trees)
+    common = {key: _digest(f"common:{key}") for key in EVALUATOR.COMMON_PROVENANCE_KEYS}
+    common["pair_manifest_sha256"] = pair_manifest.sha256
+    common["fixture_sha256"] = fixture_sha
     source_trees = {key: _digest(f"tree:{key}") for key in EVALUATOR.SOURCE_KEYS}
     arms = {
         arm: {key: _digest(f"{arm}:{key}") for key in EVALUATOR.ARM_PROVENANCE_KEYS}
@@ -352,6 +491,7 @@ def _fixture() -> Fixture:
                 source_commits,
                 source_git_trees,
                 arms[arm],
+                pair_manifest.value,
             )
         )
         for arm in ("off", "on")
@@ -470,6 +610,7 @@ def _fixture() -> Fixture:
         off=run_export("off"),
         on=run_export("on"),
         artifacts={
+            "pair_manifest": pair_manifest,
             "holdout": holdout,
             "same_arm": same_arm,
             "cross_arm": cross_arm,
@@ -513,6 +654,29 @@ def _replace_arm_pin(fixture: Fixture, arm: str, key: str, value: str) -> None:
     run["provenance"]["arm"][key] = value
 
 
+def _replace_pair_manifest(fixture: Fixture, value: dict[str, Any]) -> None:
+    document = EVALUATOR.document_from_value(value)
+    fixture.artifacts["pair_manifest"] = document
+    _replace_common_pin(fixture, "pair_manifest_sha256", document.sha256)
+
+
+def _replace_job_exit(fixture: Fixture, arm: str, value: dict[str, Any]) -> None:
+    document = EVALUATOR.document_from_value(value)
+    fixture.artifacts[f"{arm}_job_exit"] = document
+    semantic_pins = {"phase": "EXIT", "arm": arm}
+    if "schema" in value:
+        semantic_pins["schema"] = value["schema"]
+    fixture.contract["receipts"]["strict_job_exit_receipts"][arm] = _pin(
+        document, semantic_pins
+    )
+
+
+def _assert_only_speed_is_unverifiable(report: dict[str, Any]) -> None:
+    assert report["reward_correctness"]["status"] == "PASS"
+    assert report["learning_behavior"]["status"] == "PASS"
+    assert report["speed_evidence"]["status"] == "UNVERIFIABLE"
+
+
 def test_sparse_known_good_pair_is_green() -> None:
     report = _fixture().evaluate()
 
@@ -527,6 +691,183 @@ def test_sparse_known_good_pair_is_green() -> None:
     assert speed["bootstrap_95_ci"]["resamples"] == 10_000
     assert speed["bootstrap_95_ci"]["seed"] == EVALUATOR.BOOTSTRAP_SEED
     assert math.isclose(speed["bootstrap_95_ci"]["low"], 1.25)
+
+
+def test_slurm_export_inventory_is_the_frozen_sorted_68_name_payload() -> None:
+    names = EVALUATOR.SLURM_EXPORT_ALLOWED_NAMES
+
+    assert len(names) == 68
+    assert len(set(names)) == 68
+    assert names == tuple(sorted(names))
+    assert names[names.index("BATCH_SCRIPT") + 1] == "COLOCATED_GENERATION"
+    assert names[names.index("HF_TOKEN") + 1] == "MODEL_PATH"
+    assert names[names.index("SANDBOX_CONTAINER") + 1] == "SEGMENT_SIZE"
+
+
+def test_pair_manifest_is_a_required_authenticated_trust_anchor() -> None:
+    fixture = _fixture()
+    del fixture.artifacts["pair_manifest"]
+
+    report = fixture.evaluate()
+
+    assert report["overall"]["status"] == "UNVERIFIABLE"
+    assert set(report["overall"]["independent_statuses"].values()) == {"UNVERIFIABLE"}
+
+
+def test_pair_manifest_bytes_must_match_acceptance_provenance_pin() -> None:
+    fixture = _fixture()
+    replacement = copy.deepcopy(fixture.artifacts["pair_manifest"].value)
+    replacement["pair_id"] = "different-pair"
+    fixture.artifacts["pair_manifest"] = EVALUATOR.document_from_value(replacement)
+
+    report = fixture.evaluate()
+
+    assert report["overall"]["status"] == "UNVERIFIABLE"
+    assert "bytes differ" in " ".join(report["reward_correctness"]["unavailable"])
+
+
+def test_pair_slurm_boundary_deletion_and_mutation_fail_closed() -> None:
+    for mutation in ("deleted-field", "ambient-merge", "get-user-env"):
+        fixture = _fixture()
+        replacement = copy.deepcopy(fixture.artifacts["pair_manifest"].value)
+        boundary = replacement["slurm_export_boundary"]
+        if mutation == "deleted-field":
+            del boundary["format"]
+        elif mutation == "ambient-merge":
+            boundary["ambient_merge"] = True
+        else:
+            boundary["get_user_env"] = True
+        _replace_pair_manifest(fixture, replacement)
+
+        report = fixture.evaluate()
+
+        assert report["overall"]["status"] == "UNVERIFIABLE"
+        assert set(report["overall"]["independent_statuses"].values()) == {
+            "UNVERIFIABLE"
+        }
+
+
+def test_pair_slurm_boundary_rejects_secret_value_without_echoing_it() -> None:
+    fixture = _fixture()
+    replacement = copy.deepcopy(fixture.artifacts["pair_manifest"].value)
+    replacement["slurm_export_boundary"]["values"] = {"WANDB_API_KEY": "supersecret"}
+    _replace_pair_manifest(fixture, replacement)
+
+    report = fixture.evaluate()
+    serialized = json.dumps(report, sort_keys=True)
+
+    assert report["overall"]["status"] == "UNVERIFIABLE"
+    assert "supersecret" not in serialized
+    assert "extra=['values']" in serialized
+
+
+def test_pair_slurm_boundary_requires_canonical_names_and_positional_job_args() -> None:
+    for mutation in (
+        "unsorted-names",
+        "duplicate-name",
+        "changed-name",
+        "value-bearing-name",
+        "inlined-job-args",
+    ):
+        fixture = _fixture()
+        replacement = copy.deepcopy(fixture.artifacts["pair_manifest"].value)
+        boundary = replacement["slurm_export_boundary"]
+        if mutation == "unsorted-names":
+            boundary["allowed_names"] = list(reversed(boundary["allowed_names"]))
+        elif mutation == "duplicate-name":
+            boundary["allowed_names"].append(boundary["allowed_names"][-1])
+        elif mutation == "changed-name":
+            boundary["allowed_names"][-1] = "WANDB_RUN_GROUP_CHANGED"
+        elif mutation == "value-bearing-name":
+            boundary["allowed_names"][-1] = "WANDB_API_KEY=supersecret"
+        else:
+            boundary["job_argv"] = [
+                "--pair-manifest",
+                "/results/PAIR_MANIFEST.json",
+                "--pair-manifest-sha256",
+                _digest("pair-manifest"),
+                "--arm",
+                "on",
+            ]
+        _replace_pair_manifest(fixture, replacement)
+
+        report = fixture.evaluate()
+
+        assert report["overall"]["status"] == "UNVERIFIABLE"
+        assert "supersecret" not in json.dumps(report, sort_keys=True)
+
+
+def test_pair_slurm_boundary_requires_distinct_canonical_arm_records() -> None:
+    for mutation in (
+        "relative-path",
+        "wrong-canonical-path",
+        "aliased-path",
+        "aliased-digest",
+    ):
+        fixture = _fixture()
+        replacement = copy.deepcopy(fixture.artifacts["pair_manifest"].value)
+        arms = replacement["slurm_export_boundary"]["arms"]
+        if mutation == "relative-path":
+            arms["on"]["path"] = "on.env"
+        elif mutation == "wrong-canonical-path":
+            arms["on"]["path"] = "/results/other/strict_pair_slurm_exports/on.env"
+        elif mutation == "aliased-path":
+            arms["on"]["path"] = arms["off"]["path"]
+        else:
+            arms["on"]["sha256"] = arms["off"]["sha256"]
+        _replace_pair_manifest(fixture, replacement)
+
+        report = fixture.evaluate()
+
+        assert report["overall"]["status"] == "UNVERIFIABLE"
+
+
+def test_pair_v1_and_runtime_container_gym_drift_fail_closed() -> None:
+    for mutation in (
+        "pair-v1",
+        "runtime-schema",
+        "runtime-inventory",
+        "runtime-bootstrap",
+        "runtime-manifest-path",
+        "container-entry",
+        "gym-commit",
+        "gym-tree",
+        "gym-path",
+    ):
+        fixture = _fixture()
+        replacement = copy.deepcopy(fixture.artifacts["pair_manifest"].value)
+        if mutation == "pair-v1":
+            replacement["schema"] = "nemo-rl-strict-single-env-pair-v1"
+        elif mutation == "runtime-schema":
+            replacement["runtime_tools"]["document"]["schema"] = (
+                "nemo-rl-strict-runtime-tools-v0"
+            )
+        elif mutation == "runtime-inventory":
+            del replacement["runtime_tools"]["document"]["host"]["awk"]
+        elif mutation == "runtime-bootstrap":
+            replacement["runtime_tools"]["bootstrap_sha256sum"]["sha256"] = _digest(
+                "different-bootstrap"
+            )
+        elif mutation == "runtime-manifest-path":
+            replacement["runtime_tools"]["manifest"]["path"] = (
+                "/deployment/other-runtime-tools.json"
+            )
+        elif mutation == "container-entry":
+            replacement["container_entry_boundary"]["bash_args"] = []
+        elif mutation == "gym-commit":
+            replacement["source"]["gym"]["gitlink_commit"] = _commit("different-gym")
+        elif mutation == "gym-tree":
+            replacement["source"]["gym"]["tree"] = _commit("different-gym-tree")
+        else:
+            replacement["source"]["gym"]["path"] = "/deployment/runnable/other-gym"
+        _replace_pair_manifest(fixture, replacement)
+
+        report = fixture.evaluate()
+
+        assert report["overall"]["status"] == "UNVERIFIABLE"
+        assert set(report["overall"]["independent_statuses"].values()) == {
+            "UNVERIFIABLE"
+        }
 
 
 def test_missing_reward_only_metric_leaves_speed_independently_passed() -> None:
@@ -662,6 +1003,8 @@ def test_cli_absent_cross_arm_receipt_preserves_independent_results(
     arguments = [
         "--contract",
         str(write("contract", fixture.contract)),
+        "--pair-manifest",
+        str(write("pair-manifest", fixture.artifacts["pair_manifest"].value)),
         "--off-export",
         str(write("off", fixture.off)),
         "--on-export",
@@ -757,6 +1100,126 @@ def test_execution_marker_must_name_the_production_packed_fused_path() -> None:
     assert "production_packed_fused_training_path" in " ".join(
         report["speed_evidence"]["unavailable"]
     )
+
+
+def test_job_exit_v1_and_resolved_slurm_boundary_drift_fail_closed() -> None:
+    for mutation in (
+        "receipt-v1",
+        "missing-boundary",
+        "extra-boundary-key",
+        "wrong-boundary-schema",
+        "wrong-format",
+        "ambient-merge",
+        "get-user-env",
+        "unsorted-names",
+        "duplicate-name",
+        "changed-name",
+        "wrong-arm",
+        "wrong-path",
+        "wrong-export-sha",
+        "wrong-argv-order",
+        "wrong-argv-pair-sha",
+        "wrong-boundary-digest",
+        "malformed-boundary-digest",
+    ):
+        fixture = _fixture()
+        replacement = copy.deepcopy(fixture.artifacts["on_job_exit"].value)
+        boundary = replacement["slurm_export_boundary"]
+        if mutation == "receipt-v1":
+            replacement["schema"] = "nemo-rl-strict-pair-job-receipt-v1"
+        elif mutation == "missing-boundary":
+            del replacement["slurm_export_boundary"]
+        elif mutation == "extra-boundary-key":
+            boundary["unexpected"] = True
+        elif mutation == "wrong-boundary-schema":
+            boundary["schema"] = "nemo-rl-strict-slurm-export-file-v1"
+        elif mutation == "wrong-format":
+            boundary["format"] = "comma-separated-name-value"
+        elif mutation == "ambient-merge":
+            boundary["ambient_merge"] = True
+        elif mutation == "get-user-env":
+            boundary["get_user_env"] = True
+        elif mutation == "unsorted-names":
+            boundary["allowed_names"] = list(reversed(boundary["allowed_names"]))
+        elif mutation == "duplicate-name":
+            boundary["allowed_names"].append(boundary["allowed_names"][-1])
+        elif mutation == "changed-name":
+            boundary["allowed_names"][-1] = "WANDB_RUN_GROUP_CHANGED"
+        elif mutation == "wrong-arm":
+            boundary["arm"] = "off"
+        elif mutation == "wrong-path":
+            boundary["path"] = "/results/wrong/export.env"
+        elif mutation == "wrong-export-sha":
+            boundary["sha256"] = _digest("wrong-export-file")
+        elif mutation == "wrong-argv-order":
+            boundary["job_argv"][0:2] = list(reversed(boundary["job_argv"][0:2]))
+        elif mutation == "wrong-argv-pair-sha":
+            boundary["job_argv"][3] = _digest("wrong-pair-manifest")
+        elif mutation == "wrong-boundary-digest":
+            replacement["slurm_export_boundary_sha256"] = _digest("wrong-boundary")
+        else:
+            replacement["slurm_export_boundary_sha256"] = "not-a-digest"
+        _replace_job_exit(fixture, "on", replacement)
+
+        report = fixture.evaluate()
+
+        _assert_only_speed_is_unverifiable(report)
+
+
+def test_job_exit_rejects_secret_values_without_echoing_them() -> None:
+    for location in ("boundary", "top-level"):
+        fixture = _fixture()
+        replacement = copy.deepcopy(fixture.artifacts["on_job_exit"].value)
+        if location == "boundary":
+            replacement["slurm_export_boundary"]["values"] = {
+                "WANDB_API_KEY": "supersecret"
+            }
+        else:
+            replacement["WANDB_API_KEY"] = "supersecret"
+        _replace_job_exit(fixture, "on", replacement)
+
+        report = fixture.evaluate()
+        serialized = json.dumps(report, sort_keys=True)
+
+        _assert_only_speed_is_unverifiable(report)
+        assert "supersecret" not in serialized
+
+
+def test_job_exit_runtime_container_and_gym_bindings_are_exact() -> None:
+    for mutation in (
+        "missing-runtime-tool",
+        "runtime-tool-path",
+        "runtime-tool-sha",
+        "container-entry",
+        "container-entry-digest",
+        "gym-commit",
+        "gym-tree",
+    ):
+        fixture = _fixture()
+        replacement = copy.deepcopy(fixture.artifacts["on_job_exit"].value)
+        if mutation == "missing-runtime-tool":
+            del replacement["runtime_tool_manifest_sha256"]
+        elif mutation == "runtime-tool-path":
+            replacement["runtime_tool_container_python_path"] = (
+                "/root/.local/bin/different-python"
+            )
+        elif mutation == "runtime-tool-sha":
+            replacement["runtime_tool_uv_shim_sha256"] = _digest("different-uv-shim")
+        elif mutation == "container-entry":
+            replacement["container_entry_boundary"]["unset_environment"] = []
+        elif mutation == "container-entry-digest":
+            replacement["container_entry_boundary_sha256"] = _digest(
+                "different-container-entry"
+            )
+        elif mutation == "gym-commit":
+            replacement["gym_gitlink_commit"] = _commit("different-gym")
+        else:
+            replacement["gym_tree"] = _commit("different-gym-tree")
+        _replace_job_exit(fixture, "on", replacement)
+
+        report = fixture.evaluate()
+
+        _assert_only_speed_is_unverifiable(report)
 
 
 def test_job_exit_requires_pre_hash_and_exact_provenance_bindings() -> None:
