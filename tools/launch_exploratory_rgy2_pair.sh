@@ -143,10 +143,14 @@ launch_arm() {
   local shared_prefix_mode="$2"
   local arm_root="${pair_root}/${arm}"
   local cache_root="${arm_root}/cache"
+  local gym_metadata_cache="${arm_root}/gym_metadata_cache"
   local receipt_root="${arm_root}/runtime_receipts"
   local extra_mounts
-  mkdir -p -- "${cache_root}" "${receipt_root}"
-  extra_mounts="${BASE_DEPLOYMENT}:${BASE_DEPLOYMENT}:ro,${SOURCE_DEPLOYMENT}:${SOURCE_DEPLOYMENT}:ro,${AUTOMODEL_ROOT}:/opt/nemo-rl/3rdparty/Automodel-workspace/Automodel:ro,${BRIDGE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:ro,${MCORE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:ro,${GYM_ROOT}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:ro,${MODEL_PATH}:${MODEL_PATH}:ro"
+  mkdir -p -- "${cache_root}" "${gym_metadata_cache}" "${receipt_root}"
+  # Gym is authenticated and mounted read-only, but its editable setuptools
+  # metadata is intentionally configured under Gym/cache.  Overlay only that
+  # generated cache subdirectory as writable; source files stay read-only.
+  extra_mounts="${BASE_DEPLOYMENT}:${BASE_DEPLOYMENT}:ro,${SOURCE_DEPLOYMENT}:${SOURCE_DEPLOYMENT}:ro,${AUTOMODEL_ROOT}:/opt/nemo-rl/3rdparty/Automodel-workspace/Automodel:ro,${BRIDGE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:ro,${MCORE_ROOT}:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:ro,${GYM_ROOT}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:ro,${gym_metadata_cache}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym/cache,${MODEL_PATH}:${MODEL_PATH}:ro"
 
   export PATH="${HOST_PATH}" SLURM_CONF="${SLURM_CONF_PATH}"
   export EXP_NAME="x-rgy2-133d-${pair_nonce}-${arm}"
