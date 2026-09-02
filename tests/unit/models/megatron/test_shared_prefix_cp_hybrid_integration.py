@@ -570,6 +570,7 @@ def _run_cp2_hybrid_to_nemo_loss_parity(rank: int, world_size: int) -> None:
                         tensor_bin=tensor_bin,
                         source_sequence_length=source_input_ids.shape[1],
                         padding_multiple=2 * world_size,
+                        topology_padding_multiple=2 * world_size,
                         cp_rank=cp_rank,
                         cp_size=world_size,
                         padded_total_length=global_shared_input.shape[0],

@@ -34,6 +34,7 @@ from nemo_rl.data.packing import (
     SharedPrefixLayout,
     SharedPrefixRow,
     SharedPrefixTensorBin,
+    get_shared_prefix_physical_alignment,
     materialize_shared_prefix_layout,
     plan_shared_prefix_bins,
     resolve_shared_prefix_parallel_topology,
@@ -66,16 +67,19 @@ class SharedPrefixForwardMetadata:
     """Structured global star metadata retained until model-output fan-out.
 
     For CP>1, the model input/output sequence is the standard two-chunk zigzag
-    shard for ``cp_rank``. ``padding_multiple`` is the resolved physical packing
+    shard for ``cp_rank``. ``padding_multiple`` is the per-dense-branch packing
     contract ``M`` and is a multiple of the TP/CP topology quantum ``Q``.
-    ``padded_total_length`` is the minimally ``M``-padded global star length.
-    ``tensor_bin`` retains the global physical and logical correctness metadata
-    used to route scalar next-token log-probabilities.
+    ``topology_padding_multiple`` records ``Q`` explicitly. Each ordinary dense
+    branch is minimally padded to ``M``, while the deduplicated global star is
+    minimally padded only to ``Q``. ``tensor_bin`` retains the global physical
+    and logical correctness metadata used to route scalar next-token
+    log-probabilities.
     """
 
     tensor_bin: SharedPrefixTensorBin
     source_sequence_length: int
     padding_multiple: int
+    topology_padding_multiple: int
     cp_rank: int = 0
     cp_size: int = 1
     padded_total_length: Optional[int] = None
@@ -273,6 +277,7 @@ def get_microbatch_iterator(
 
     shared_prefix_train = get_shared_prefix_training_config(cfg).mode == "train"
     shared_prefix_padding_multiple: Optional[int] = None
+    shared_prefix_topology_padding_multiple: Optional[int] = None
     if shared_prefix_train:
         if shared_prefix_bin_capacity is None:
             raise ValueError(
@@ -300,11 +305,15 @@ def get_microbatch_iterator(
             dtype=torch.long,
         )
         (
-            _tp_size,
-            _cp_size,
+            tp_size,
+            cp_size,
             _sequence_parallel,
             shared_prefix_padding_multiple,
         ) = _resolve_shared_prefix_execution_topology(cfg)
+        shared_prefix_topology_padding_multiple = get_shared_prefix_physical_alignment(
+            tp_size=tp_size,
+            cp_size=cp_size,
+        )
         raw_iterator = iter((working_data,))
         (
             data_iterator_len,
@@ -366,12 +375,13 @@ def get_microbatch_iterator(
     # Compute padded sequence length for pipeline parallelism
     if shared_prefix_train:
         assert shared_prefix_padding_multiple is not None
+        assert shared_prefix_topology_padding_multiple is not None
         padded_seq_length = (
             pad_full_seq_to
             if pad_full_seq_to is not None
             else _round_up_to_multiple(
                 max_execution_length,
-                shared_prefix_padding_multiple,
+                shared_prefix_topology_padding_multiple,
             )
         )
     else:
@@ -729,6 +739,10 @@ def process_shared_prefix_microbatch(
             cp_size=cp_size,
             padding_multiple=padding_multiple,
         )
+    topology_padding_multiple = get_shared_prefix_physical_alignment(
+        tp_size=tp_size,
+        cp_size=cp_size,
+    )
     execution_units = _plan_prescribed_shared_prefix_execution_units(
         data_dict,
         cfg=cfg,
@@ -752,7 +766,7 @@ def process_shared_prefix_microbatch(
                 cp_rank=cp_rank,
                 cp_size=cp_size,
                 tp_size=tp_size,
-                padding_multiple=resolved_padding_multiple,
+                padding_multiple=topology_padding_multiple,
             )
             if cp_shard.padded_total_length > bin_capacity:
                 raise RuntimeError(
@@ -761,8 +775,8 @@ def process_shared_prefix_microbatch(
                     f"physical_tokens={tensor_bin.layout.physical_total_length}, "
                     f"padded_tokens={cp_shard.padded_total_length}, "
                     f"capacity={bin_capacity}. Configure shared-prefix microbatch "
-                    "token capacities as multiples of resolved padding "
-                    f"M={resolved_padding_multiple}."
+                    "token capacities for the resolved topology padding "
+                    f"Q={topology_padding_multiple}."
                 )
             shared_prefix = SharedPrefixForwardMetadata(
                 tensor_bin=tensor_bin,
@@ -771,6 +785,7 @@ def process_shared_prefix_microbatch(
                 cp_size=cp_size,
                 padded_total_length=cp_shard.padded_total_length,
                 padding_multiple=resolved_padding_multiple,
+                topology_padding_multiple=topology_padding_multiple,
             )
             yield ProcessedMicrobatch(
                 data_dict=unit_data,

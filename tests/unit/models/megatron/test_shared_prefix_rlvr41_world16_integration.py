@@ -351,6 +351,7 @@ def test_rlvr41_world16_shared_prefix_reaches_nemo_loss_and_finalizes_once() -> 
             tensor_bin=tensor_bin,
             source_sequence_length=source_input_ids.shape[1],
             padding_multiple=_PADDING_MULTIPLE,
+            topology_padding_multiple=2 * _TP_SIZE * _CP_SIZE,
             cp_rank=cp_rank,
             cp_size=_CP_SIZE,
             padded_total_length=_STAR_PHYSICAL_LENGTH,

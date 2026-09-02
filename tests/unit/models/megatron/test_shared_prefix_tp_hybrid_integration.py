@@ -511,6 +511,7 @@ def _run_tp_sp_hybrid_to_nemo_loss_parity(
             cp_size=cp_size,
             padded_total_length=shared_physical_length,
             padding_multiple=padding_multiple,
+            topology_padding_multiple=physical_alignment,
         )
 
         def reject_cp_logit_gather(*_args: object, **_kwargs: object) -> None:

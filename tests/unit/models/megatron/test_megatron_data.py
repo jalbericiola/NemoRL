@@ -213,9 +213,10 @@ def test_shared_prefix_microbatch_uses_context_parallel_zigzag_shard():
     assert microbatch.shared_prefix.tensor_bin.layout.physical_total_length == 13
     assert microbatch.shared_prefix.padded_total_length == 16
     assert microbatch.shared_prefix.padding_multiple == 4
+    assert microbatch.shared_prefix.topology_padding_multiple == 4
 
 
-def test_shared_prefix_microbatch_propagates_tp_sp_physical_multiple():
+def test_shared_prefix_microbatch_keeps_m128_branches_and_q8_global_star():
     from nemo_rl.data.packing.shared_prefix_metadata import (
         SHARED_PREFIX_EXECUTION_SLOT,
         SHARED_PREFIX_GROUP_ID,
@@ -233,17 +234,18 @@ def test_shared_prefix_microbatch_propagates_tp_sp_physical_multiple():
                     [10, 11, 12, 13, 20, 21, 22, 0, 0],
                     [10, 11, 12, 13, 30, 31, 32, 33, 0],
                     [10, 11, 12, 13, 40, 41, 42, 43, 44],
+                    [10, 11, 12, 13, 50, 51, 0, 0, 0],
                 ]
             ),
-            "input_lengths": torch.tensor([7, 8, 9]),
-            SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([4, 4, 4]),
-            SHARED_PREFIX_GROUP_ID: ["g", "g", "g"],
-            SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0, 0]),
-            SHARED_PREFIX_SOURCE_ROW_INDEX: torch.arange(3),
+            "input_lengths": torch.tensor([7, 8, 9, 6]),
+            SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([4, 4, 4, 4]),
+            SHARED_PREFIX_GROUP_ID: ["g", "g", "g", "g"],
+            SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0, 0, 0]),
+            SHARED_PREFIX_SOURCE_ROW_INDEX: torch.arange(4),
         }
     )
     cfg = {
-        "make_sequence_length_divisible_by": 16,
+        "make_sequence_length_divisible_by": 128,
         "megatron_cfg": {
             "tensor_model_parallel_size": 2,
             "context_parallel_size": 2,
@@ -260,9 +262,9 @@ def test_shared_prefix_microbatch_propagates_tp_sp_physical_multiple():
             process_shared_prefix_microbatch(
                 data_dict=batch,
                 cfg=cfg,
-                bin_capacity=64,
+                bin_capacity=512,
                 seq_length_key="input_lengths",
-                pad_individual_seqs_to_multiple_of=16,
+                pad_individual_seqs_to_multiple_of=128,
                 pad_packed_seq_to_multiple_of=1,
                 pad_full_seq_to=None,
                 straggler_timer=None,
@@ -270,12 +272,13 @@ def test_shared_prefix_microbatch_propagates_tp_sp_physical_multiple():
         )
 
     assert microbatch.shared_prefix is not None
-    assert microbatch.shared_prefix.padding_multiple == 16
+    assert microbatch.shared_prefix.padding_multiple == 128
+    assert microbatch.shared_prefix.topology_padding_multiple == 8
     assert microbatch.shared_prefix.cp_rank == 1
     assert microbatch.shared_prefix.cp_size == 2
-    assert microbatch.shared_prefix.tensor_bin.layout.physical_total_length == 40
-    assert microbatch.shared_prefix.padded_total_length == 48
-    assert microbatch.input_ids_cp_sharded.shape == (1, 24)
+    assert microbatch.shared_prefix.tensor_bin.layout.physical_total_length == 500
+    assert microbatch.shared_prefix.padded_total_length == 504
+    assert microbatch.input_ids_cp_sharded.shape == (1, 252)
 
 
 def test_shared_prefix_supplied_topology_fails_loudly_on_missing_keys():

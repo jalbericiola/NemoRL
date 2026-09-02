@@ -145,6 +145,7 @@ def test_shared_prefix_logprobs_are_chunked_ordered_and_differentiable(
         tensor_bin=tensor_bin,
         source_sequence_length=6,
         padding_multiple=1,
+        topology_padding_multiple=1,
     )
     torch.manual_seed(7)
     packed_logits = torch.randn(
@@ -263,6 +264,7 @@ def test_shared_prefix_cp_logprobs_reduce_scalars_and_route_gradients(
                 tensor_bin=tensor_bin,
                 source_sequence_length=6,
                 padding_multiple=1,
+                topology_padding_multiple=1,
             ),
             chunk_size=2,
         )
@@ -318,6 +320,7 @@ def test_shared_prefix_cp_logprobs_reduce_scalars_and_route_gradients(
                         cp_size=2,
                         padded_total_length=8,
                         padding_multiple=4,
+                        topology_padding_multiple=4,
                     ),
                     chunk_size=2,
                 )
@@ -409,6 +412,7 @@ def test_shared_prefix_logprobs_reject_mismatched_context_parallel_rank() -> Non
                 cp_size=2,
                 padded_total_length=8,
                 padding_multiple=4,
+                topology_padding_multiple=4,
             ),
         )
 
@@ -495,6 +499,7 @@ def test_shared_prefix_tp_logprobs_use_scalar_vocab_parallel_primitive() -> None
                 source_sequence_length=6,
                 padded_total_length=16,
                 padding_multiple=4,
+                topology_padding_multiple=4,
             ),
             chunk_size=2,
         )
@@ -538,6 +543,7 @@ def test_shared_prefix_model_forward_lowers_outer_layout_to_hybrid_adapter():
         tensor_bin=tensor_bin,
         source_sequence_length=6,
         padding_multiple=4,
+        topology_padding_multiple=4,
     )
     model = MagicMock(return_value=torch.randn(1, 8, 4))
     data_dict = MagicMock()
@@ -566,9 +572,10 @@ def test_shared_prefix_model_forward_lowers_outer_layout_to_hybrid_adapter():
         2,
     )
     assert call_kwargs["shared_prefix_layout"].padding_multiple == 4
+    assert call_kwargs["shared_prefix_layout"].topology_padding_multiple == 4
 
 
-def test_shared_prefix_cp1_logprobs_allow_explicit_topology_tail():
+def test_shared_prefix_cp1_logprobs_use_q1_without_branch_m_tail():
     from nemo_rl.data.packing import build_shared_prefix_tensor_plan
     from nemo_rl.models.megatron.data import SharedPrefixForwardMetadata
     from nemo_rl.models.megatron.train import shared_prefix_next_token_logprobs
@@ -593,24 +600,39 @@ def test_shared_prefix_cp1_logprobs_allow_explicit_topology_tail():
 
     with _mock_shared_prefix_runtime_topology():
         padded = shared_prefix_next_token_logprobs(
-            padded_logits,
+            padded_logits[:, : tensor_bin.layout.physical_total_length],
             SharedPrefixForwardMetadata(
                 tensor_bin=tensor_bin,
                 source_sequence_length=7,
-                padded_total_length=16,
+                padded_total_length=tensor_bin.layout.physical_total_length,
                 padding_multiple=4,
+                topology_padding_multiple=1,
             ),
         )
         assert padded.shape == (2, 6)
         with pytest.raises(ValueError, match="minimal trailing pad"):
             shared_prefix_next_token_logprobs(
-                padded_logits[:, : tensor_bin.layout.physical_total_length],
+                padded_logits,
                 SharedPrefixForwardMetadata(
                     tensor_bin=tensor_bin,
                     source_sequence_length=7,
+                    padded_total_length=16,
                     padding_multiple=4,
+                    topology_padding_multiple=1,
                 ),
             )
+        for invalid_topology_padding in (True, 4):
+            with pytest.raises(ValueError, match="topology padding must be an integer"):
+                shared_prefix_next_token_logprobs(
+                    padded_logits[:, : tensor_bin.layout.physical_total_length],
+                    SharedPrefixForwardMetadata(
+                        tensor_bin=tensor_bin,
+                        source_sequence_length=7,
+                        padded_total_length=tensor_bin.layout.physical_total_length,
+                        padding_multiple=4,
+                        topology_padding_multiple=invalid_topology_padding,
+                    ),
+                )
 
 
 class TestModelForward:

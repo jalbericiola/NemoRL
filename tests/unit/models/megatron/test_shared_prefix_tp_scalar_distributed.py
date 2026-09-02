@@ -220,6 +220,7 @@ def _run_tp_shared_prefix_scalar_parity(
                             cp_size=cp_size,
                             padded_total_length=padded_length,
                             padding_multiple=alignment,
+                            topology_padding_multiple=alignment,
                         ),
                         chunk_size=chunk_size,
                         temperature=temperature,

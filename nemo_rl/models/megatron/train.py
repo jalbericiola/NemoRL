@@ -209,6 +209,7 @@ def model_forward(
                 shared_prefix.tensor_bin.layout.completion_lengths
             ),
             padding_multiple=shared_prefix.padding_multiple,
+            topology_padding_multiple=shared_prefix.topology_padding_multiple,
         )
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
@@ -329,6 +330,17 @@ def shared_prefix_next_token_logprobs(
             "shared-prefix metadata padding_multiple must be a positive multiple "
             f"of topology alignment Q={topology_alignment}, got {padding_multiple!r}"
         )
+    metadata_topology_padding = shared_prefix.topology_padding_multiple
+    if (
+        isinstance(metadata_topology_padding, bool)
+        or not isinstance(metadata_topology_padding, int)
+        or metadata_topology_padding != topology_alignment
+    ):
+        raise ValueError(
+            "shared-prefix metadata topology padding must be an integer matching "
+            f"the active TP/CP topology: metadata={metadata_topology_padding!r}, "
+            f"expected Q={topology_alignment}"
+        )
     padded_total_length = (
         layout.physical_total_length
         if shared_prefix.padded_total_length is None
@@ -340,14 +352,15 @@ def shared_prefix_next_token_logprobs(
             f"{padded_total_length} < {layout.physical_total_length}"
         )
     if (
-        padded_total_length % padding_multiple != 0
-        or padded_total_length - layout.physical_total_length >= padding_multiple
+        padded_total_length % topology_alignment != 0
+        or padded_total_length - layout.physical_total_length >= topology_alignment
     ):
         raise ValueError(
             "shared-prefix output must use the minimal trailing pad for its "
-            "resolved physical packing contract: "
+            "resolved TP/CP topology contract: "
             f"padded={padded_total_length}, physical="
-            f"{layout.physical_total_length}, M={padding_multiple}, "
+            f"{layout.physical_total_length}, Q={topology_alignment}, "
+            f"branch_M={padding_multiple}, "
             f"tp_size={tp_size}, cp_size={cp_size}"
         )
     expected_local_length = padded_total_length // cp_size

@@ -246,6 +246,7 @@ def _run_shared_prefix_cp2_scalar_reduce(rank: int, world_size: int) -> None:
                         tensor_bin=tensor_bin,
                         source_sequence_length=source_input_ids.shape[1],
                         padding_multiple=2 * world_size,
+                        topology_padding_multiple=2 * world_size,
                         cp_rank=rank,
                         cp_size=world_size,
                         padded_total_length=padded_length,
