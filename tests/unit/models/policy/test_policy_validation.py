@@ -29,6 +29,7 @@ from nemo_rl.models.policy import (
     PolicyConfig,
     SharedPrefixTrainingConfig,
     get_shared_prefix_training_config,
+    shared_prefix_deterministic_execution_required,
     validate_shared_prefix_training_config,
 )
 from nemo_rl.models.policy.lm_policy import Policy
@@ -179,11 +180,30 @@ def create_megatron_config(
     }
 
 
+def _add_shared_prefix_determinism_contract(config: PolicyConfig) -> PolicyConfig:
+    """Install the exact deterministic actor/provider test contract."""
+    megatron_config = cast(dict[str, Any], config["megatron_cfg"])
+    megatron_config["env_vars"] = {
+        "MAMBA_DETERMINISTIC": "1",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "NCCL_ALGO": "Ring",
+    }
+    megatron_config["model_overrides"] = {
+        "deterministic_mode": True,
+        "cross_entropy_loss_fusion": False,
+        "tp_comm_overlap": False,
+    }
+    return config
+
+
 def create_shared_prefix_train_config(
     *, tp: int = 1, pp: int = 1, cp: int = 1
 ) -> PolicyConfig:
     """Create a topology-valid shared-prefix policy slice."""
-    config = create_megatron_config("test-model", tp=tp, pp=pp, cp=cp)
+    config = _add_shared_prefix_determinism_contract(
+        create_megatron_config("test-model", tp=tp, pp=pp, cp=cp)
+    )
     cast(dict[str, Any], config["megatron_cfg"])["sequence_parallel"] = tp > 1
     config["precision"] = "bfloat16"
     config["sequence_packing"] = {
@@ -211,6 +231,139 @@ def test_shared_prefix_observe_mode_is_backend_neutral() -> None:
     resolved_config = validate_shared_prefix_training_config(config)
 
     assert resolved_config.mode == "observe"
+
+
+def test_shared_prefix_disabled_mode_rejects_deterministic_execution_opt_in() -> None:
+    config = create_dtensor_config("test-model", tp=1)
+    config["shared_prefix_training"] = {
+        "mode": "disabled",
+        "require_deterministic_execution": True,
+    }
+
+    with pytest.raises(ValueError, match="mode=disabled must preserve"):
+        shared_prefix_deterministic_execution_required(config)
+    with pytest.raises(ValueError, match="mode=disabled must preserve"):
+        validate_shared_prefix_training_config(config)
+
+
+def test_shared_prefix_strict_observe_requires_megatron() -> None:
+    config = create_dtensor_config("test-model", tp=1)
+    config["shared_prefix_training"] = {
+        "mode": "observe",
+        "require_deterministic_execution": True,
+    }
+
+    with pytest.raises(ValueError, match="policy.megatron_cfg.enabled=true"):
+        validate_shared_prefix_training_config(config)
+
+
+def test_shared_prefix_strict_observe_accepts_exact_contract_without_train_gates() -> None:
+    config = _add_shared_prefix_determinism_contract(
+        create_megatron_config("test-model", tp=1, pp=2, cp=2)
+    )
+    config["shared_prefix_training"] = {
+        "mode": "observe",
+        "require_deterministic_execution": True,
+    }
+
+    resolved_config = validate_shared_prefix_training_config(config)
+
+    assert resolved_config.mode == "observe"
+    assert shared_prefix_deterministic_execution_required(config)
+
+
+def test_shared_prefix_plain_observe_does_not_require_deterministic_contract() -> None:
+    config = create_megatron_config("test-model", tp=1)
+    config["shared_prefix_training"] = {"mode": "observe"}
+
+    assert not shared_prefix_deterministic_execution_required(config)
+    assert validate_shared_prefix_training_config(config).mode == "observe"
+
+
+@pytest.mark.parametrize(
+    ("block", "name", "value"),
+    [
+        ("env_vars", "MAMBA_DETERMINISTIC", "0"),
+        ("model_overrides", "deterministic_mode", False),
+    ],
+)
+def test_shared_prefix_strict_observe_rejects_determinism_contract_drift(
+    block: str,
+    name: str,
+    value: object,
+) -> None:
+    config = _add_shared_prefix_determinism_contract(
+        create_megatron_config("test-model", tp=1)
+    )
+    config["shared_prefix_training"] = {
+        "mode": "observe",
+        "require_deterministic_execution": True,
+    }
+    cast(dict[str, Any], config["megatron_cfg"])[block][name] = value
+
+    with pytest.raises(ValueError, match=rf"{block}\.{name}="):
+        validate_shared_prefix_training_config(config)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("MAMBA_DETERMINISTIC", None),
+        ("MAMBA_DETERMINISTIC", "0"),
+        ("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1"),
+        ("CUBLAS_WORKSPACE_CONFIG", ":16:8"),
+        ("NCCL_ALGO", "Tree"),
+    ],
+)
+def test_shared_prefix_train_requires_exact_determinism_environment(
+    name: str,
+    value: object,
+) -> None:
+    config = create_shared_prefix_train_config()
+    env_vars = cast(dict[str, Any], config["megatron_cfg"])["env_vars"]
+    if value is None:
+        env_vars.pop(name)
+    else:
+        env_vars[name] = value
+
+    with pytest.raises(ValueError, match=rf"env_vars\.{name}="):
+        validate_shared_prefix_training_config(config)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("deterministic_mode", False),
+        ("cross_entropy_loss_fusion", True),
+        ("tp_comm_overlap", True),
+    ],
+)
+def test_shared_prefix_train_requires_exact_determinism_model_overrides(
+    name: str,
+    value: object,
+) -> None:
+    config = create_shared_prefix_train_config()
+    overrides = cast(dict[str, Any], config["megatron_cfg"])["model_overrides"]
+    overrides[name] = value
+
+    with pytest.raises(ValueError, match=rf"model_overrides\.{name}="):
+        validate_shared_prefix_training_config(config)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "TRITON_CACHE_AUTOTUNING",
+        "TRITON_AUTOTUNE_BLOCK_SIZE_M",
+        "TRITON_AUTOTUNE_BLOCK_T",
+    ],
+)
+def test_shared_prefix_determinism_rejects_triton_autotuning(name: str) -> None:
+    config = create_shared_prefix_train_config()
+    cast(dict[str, Any], config["megatron_cfg"])["env_vars"][name] = "1"
+
+    with pytest.raises(ValueError, match=rf"unset.*{name}"):
+        validate_shared_prefix_training_config(config)
 
 
 def test_shared_prefix_train_mode_accepts_first_slice_topology() -> None:
@@ -273,15 +426,21 @@ def test_shared_prefix_train_mode_rejects_coercible_topology_values(
             "policy.megatron_cfg.enabled=true",
         ),
         (
-            create_megatron_config("test-model", tp=1),
+            _add_shared_prefix_determinism_contract(
+                create_megatron_config("test-model", tp=1)
+            ),
             "policy.sequence_packing.enabled=true",
         ),
         (
-            create_megatron_config("test-model", tp=1, pp=2),
+            _add_shared_prefix_determinism_contract(
+                create_megatron_config("test-model", tp=1, pp=2)
+            ),
             "policy.megatron_cfg.pipeline_model_parallel_size=1",
         ),
         (
-            create_megatron_config("test-model", tp=2),
+            _add_shared_prefix_determinism_contract(
+                create_megatron_config("test-model", tp=2)
+            ),
             "sequence_parallel=true exactly when TP>1",
         ),
     ],

@@ -35,6 +35,7 @@ The feature is controlled under the policy configuration:
 policy:
   shared_prefix_training:
     mode: disabled  # disabled, observe, or train
+    require_deterministic_execution: false
 ```
 
 - `disabled` preserves the existing data path and model execution.
@@ -43,6 +44,41 @@ policy:
 
 `observe` is intended to be safe on existing recipes, including recipes whose
 parallel topology is not yet supported by `train`.
+
+`train` always requires the fail-closed deterministic execution contract. For
+controlled OFF/ON comparisons, set `require_deterministic_execution: true` in
+both the `observe` and `train` arms. The opt-in makes `observe` attest and enable
+the same Megatron environment, resolved model overrides, and PyTorch
+deterministic algorithms while retaining dense execution. Plain `observe`
+remains backend-neutral and execution-neutral. Combining the opt-in with
+`mode: disabled` is rejected because disabled mode must not change execution.
+This controls the current DP1 single-environment A/B slice. At DP>1, `train`
+also uses a DP-width dispatch quantum; a controlled comparison must separately
+hold scheduler/cohort dispatch constant.
+
+The strict contract is:
+
+```yaml
+policy:
+  shared_prefix_training:
+    mode: observe
+    require_deterministic_execution: true
+  megatron_cfg:
+    env_vars:
+      MAMBA_DETERMINISTIC: "1"
+      NVTE_ALLOW_NONDETERMINISTIC_ALGO: "0"
+      CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+      NCCL_ALGO: "Ring"
+    model_overrides:
+      deterministic_mode: true
+      cross_entropy_loss_fusion: false
+      tp_comm_overlap: false
+```
+
+Triton cache autotuning and `TRITON_AUTOTUNE_BLOCK*` overrides must be absent.
+The driver validates the configured values, the worker re-attests the effective
+import-time environment before touching CUDA, and the resolved Megatron Bridge
+provider is checked before model construction continues.
 
 ## Group Identity and Correctness
 
@@ -122,11 +158,13 @@ shareable prompt from those effects.
 `train` is deliberately fail-closed. The current capability is limited to:
 
 - Megatron Hybrid models with the matching shared-prefix capability marker.
-- tensor parallel, context parallel, and pipeline parallel sizes all equal to
-  one; sequence parallelism disabled.
+- pipeline parallel size one. TP1 uses sequence parallelism off; TP>1 requires
+  sequence parallelism and the matching TP capability. CP>1 likewise requires
+  the matching CP or combined TP/CP capability.
 - sequence packing enabled and MTP disabled.
-- no full/core-attention recompute, fine-grained activation offload, training
-  CUDA graphs, FP8, or FP4.
+- full recompute only with the matching capability, uniform method, and one
+  layer per recompute unit; no selective core-attention recompute,
+  fine-grained activation offload, training CUDA graphs, FP8, or FP4.
 - zero attention and hidden dropout, standard RoPE, vanilla softmax, no
   sliding-window attention, and no multi-latent attention.
 - deterministic MoE routing without auxiliary or z losses, router jitter,

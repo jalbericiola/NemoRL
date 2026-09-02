@@ -1986,6 +1986,9 @@ class TestValidateSharedPrefixModelCapability:
         from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
 
         model_cfg = HybridModelProvider.__new__(HybridModelProvider)
+        model_cfg.deterministic_mode = True
+        model_cfg.cross_entropy_loss_fusion = False
+        model_cfg.tp_comm_overlap = False
         model_cfg.sequence_parallel = False
         model_cfg.tensor_model_parallel_size = 1
         model_cfg.pipeline_model_parallel_size = 1
@@ -2042,6 +2045,58 @@ class TestValidateSharedPrefixModelCapability:
 
         _validate_shared_prefix_model_capability(config, object())
 
+    def test_strict_observe_attests_resolved_determinism_without_hybrid_gate(self):
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {
+            "shared_prefix_training": {
+                "mode": "observe",
+                "require_deterministic_execution": True,
+            }
+        }
+        model_cfg = SimpleNamespace(
+            deterministic_mode=True,
+            cross_entropy_loss_fusion=False,
+            tp_comm_overlap=False,
+        )
+
+        _validate_shared_prefix_model_capability(config, model_cfg)
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("deterministic_mode", False),
+            ("cross_entropy_loss_fusion", True),
+            ("tp_comm_overlap", True),
+        ],
+    )
+    def test_strict_observe_rejects_resolved_determinism_drift(
+        self,
+        name: str,
+        value: object,
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {
+            "shared_prefix_training": {
+                "mode": "observe",
+                "require_deterministic_execution": True,
+            }
+        }
+        model_cfg = SimpleNamespace(
+            deterministic_mode=True,
+            cross_entropy_loss_fusion=False,
+            tp_comm_overlap=False,
+        )
+        setattr(model_cfg, name, value)
+
+        with pytest.raises(NotImplementedError, match=rf"model_cfg\.{name}="):
+            _validate_shared_prefix_model_capability(config, model_cfg)
+
     def test_train_rejects_non_hybrid_provider(self):
         from nemo_rl.models.megatron.setup import (
             _validate_shared_prefix_model_capability,
@@ -2051,6 +2106,30 @@ class TestValidateSharedPrefixModelCapability:
 
         with pytest.raises(NotImplementedError, match="HybridModelProvider"):
             _validate_shared_prefix_model_capability(config, object())
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("deterministic_mode", False),
+            ("cross_entropy_loss_fusion", True),
+            ("tp_comm_overlap", True),
+        ],
+    )
+    def test_train_rejects_resolved_determinism_drift(
+        self,
+        name: str,
+        value: object,
+    ) -> None:
+        from nemo_rl.models.megatron.setup import (
+            _validate_shared_prefix_model_capability,
+        )
+
+        config = {"shared_prefix_training": {"mode": "train"}}
+        model_cfg = self._supported_model_cfg()
+        setattr(model_cfg, name, value)
+
+        with pytest.raises(NotImplementedError, match=rf"model_cfg\.{name}="):
+            _validate_shared_prefix_model_capability(config, model_cfg)
 
     @pytest.mark.parametrize("capability", [None, "hybrid_star_v1"])
     def test_train_rejects_incompatible_mcore_capability(self, capability):

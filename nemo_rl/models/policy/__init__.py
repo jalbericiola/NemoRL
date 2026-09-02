@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
 from typing import Any, Literal, NotRequired, TypedDict, Union, cast
 
 from pydantic import BaseModel
@@ -22,6 +23,12 @@ from nemo_rl.data.packing.shared_prefix_tensors import (
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
+from nemo_rl.utils.shared_prefix_determinism import (
+    SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES,
+    SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES,
+    SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES,
+    SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES,
+)
 
 
 def _patch_transformers_tokenizer_class_set():
@@ -232,10 +239,14 @@ class SharedPrefixTrainingConfig(BaseModel, extra="allow"):
     ``disabled`` preserves the existing packing and model execution. ``observe``
     may report prefix-reuse opportunity metrics but must not alter execution.
     ``train`` requests the experimental shared-prefix execution path and is
-    guarded by :func:`validate_shared_prefix_training_config`.
+    guarded by :func:`validate_shared_prefix_training_config`. Observation
+    remains execution-neutral by default; ``require_deterministic_execution``
+    opts a Megatron observation arm into the same fail-closed determinism
+    contract that train mode always requires.
     """
 
     mode: Literal["disabled", "observe", "train"] = "disabled"
+    require_deterministic_execution: bool = False
 
 
 class RewardModelConfig(TypedDict):
@@ -643,6 +654,31 @@ def get_shared_prefix_training_config(
     return SharedPrefixTrainingConfig.model_validate(shared_prefix_config)
 
 
+def shared_prefix_deterministic_execution_required(config: PolicyConfig) -> bool:
+    """Whether this policy must use the shared-prefix determinism contract.
+
+    Train mode is always strict. Observe mode is strict only when explicitly
+    requested, preserving the existing backend-neutral observation behavior.
+    Disabled mode never changes model execution, so combining it with the
+    opt-in flag is rejected here rather than silently ignored by direct worker
+    or setup callers that do not pass through :class:`Policy` validation.
+    """
+    shared_prefix_config = get_shared_prefix_training_config(config)
+    if (
+        shared_prefix_config.mode == "disabled"
+        and shared_prefix_config.require_deterministic_execution
+    ):
+        raise ValueError(
+            "policy.shared_prefix_training.require_deterministic_execution=true "
+            "requires mode=observe or mode=train; mode=disabled must preserve "
+            "existing model execution."
+        )
+    return shared_prefix_config.mode == "train" or (
+        shared_prefix_config.mode == "observe"
+        and shared_prefix_config.require_deterministic_execution
+    )
+
+
 def validate_shared_prefix_training_config(
     config: PolicyConfig,
 ) -> SharedPrefixTrainingConfig:
@@ -655,17 +691,81 @@ def validate_shared_prefix_training_config(
     unless MCore exports the exact topology and physical-layout capabilities.
     """
     shared_prefix_config = get_shared_prefix_training_config(config)
-    if shared_prefix_config.mode != "train":
+    deterministic_execution_required = (
+        shared_prefix_deterministic_execution_required(config)
+    )
+    if not deterministic_execution_required:
         return shared_prefix_config
 
     megatron_config = config.get("megatron_cfg")
     if megatron_config is None or megatron_config["enabled"] is not True:
         raise ValueError(
-            "policy.shared_prefix_training.mode=train requires "
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} with "
+            "deterministic execution requires "
             "policy.megatron_cfg.enabled=true. Observation mode remains "
-            "available with policy.shared_prefix_training.mode=observe."
+            "backend-neutral when require_deterministic_execution=false."
         )
     megatron_config = cast(MegatronConfig, megatron_config)
+
+    env_vars = megatron_config.get("env_vars")
+    if not isinstance(env_vars, Mapping):
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} with "
+            "deterministic execution requires policy.megatron_cfg.env_vars to "
+            "contain the deterministic execution contract."
+        )
+    forbidden_env_vars = sorted(
+        name
+        for name in env_vars
+        if name in SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES
+        or (
+            isinstance(name, str)
+            and any(
+                name.startswith(prefix)
+                for prefix in SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES
+            )
+        )
+    )
+    if forbidden_env_vars:
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} with "
+            "deterministic execution requires Triton autotuning controls to be "
+            "unset; remove from policy.megatron_cfg.env_vars: "
+            + ", ".join(forbidden_env_vars)
+        )
+    for name, expected_value in SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES.items():
+        actual_value = env_vars.get(name)
+        if actual_value != expected_value:
+            raise ValueError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} "
+                "with deterministic execution requires "
+                f"policy.megatron_cfg.env_vars.{name}={expected_value!r}; "
+                f"got {actual_value!r}."
+            )
+
+    model_overrides = megatron_config.get("model_overrides")
+    if not isinstance(model_overrides, Mapping):
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} with "
+            "deterministic execution requires policy.megatron_cfg.model_overrides "
+            "to contain the deterministic execution contract."
+        )
+    for name, expected_value in (
+        SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES.items()
+    ):
+        actual_value = model_overrides.get(name)
+        if actual_value is not expected_value:
+            raise ValueError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} "
+                "with deterministic execution requires "
+                f"policy.megatron_cfg.model_overrides.{name}={expected_value!r}; "
+                f"got {actual_value!r}."
+            )
+
+    # Strict observe changes only the determinism controls. It deliberately
+    # remains exempt from shared-prefix packing/topology/capability gates.
+    if shared_prefix_config.mode != "train":
+        return shared_prefix_config
 
     sequence_packing_config = config.get("sequence_packing")
     if sequence_packing_config is None or not sequence_packing_config["enabled"]:

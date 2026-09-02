@@ -18,6 +18,8 @@ import importlib
 import sys
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 
 def _ensure_package(monkeypatch, name: str) -> ModuleType:
     """Create a minimal package module in sys.modules for import stubbing."""
@@ -58,6 +60,11 @@ def _load_community_import_module(monkeypatch):
     # Stub MegatronConfig type import.
     nemo_policy = ModuleType("nemo_rl.models.policy")
     nemo_policy.MegatronConfig = dict
+    nemo_policy.SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES = {
+        "deterministic_mode": True,
+        "cross_entropy_loss_fusion": False,
+        "tp_comm_overlap": False,
+    }
     monkeypatch.setitem(sys.modules, "nemo_rl.models.policy", nemo_policy)
 
     module_name = "nemo_rl.models.megatron.community_import"
@@ -120,6 +127,47 @@ def test_prefer_nvrx_is_noop_when_strategy_import_fails(monkeypatch):
     # Should not raise when dist-checkpoint strategy is unavailable.
     with module._prefer_nvrx_for_dist_ckpt_save():
         pass
+
+
+def test_deterministic_model_overrides_apply_before_provider_construction(
+    monkeypatch,
+):
+    module = _load_community_import_module(monkeypatch)
+    provider = SimpleNamespace(
+        deterministic_mode=False,
+        cross_entropy_loss_fusion=True,
+        tp_comm_overlap=True,
+    )
+
+    original_values = module._apply_deterministic_model_overrides(
+        provider,
+        {
+            "model_overrides": {
+                "deterministic_mode": True,
+                "cross_entropy_loss_fusion": False,
+                "tp_comm_overlap": False,
+            }
+        },
+    )
+
+    assert provider.deterministic_mode is True
+    assert provider.cross_entropy_loss_fusion is False
+    assert provider.tp_comm_overlap is False
+    assert original_values == {
+        "deterministic_mode": False,
+        "cross_entropy_loss_fusion": True,
+        "tp_comm_overlap": True,
+    }
+
+
+def test_deterministic_model_override_rejects_unsupported_provider(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+
+    with pytest.raises(ValueError, match="model_overrides.deterministic_mode"):
+        module._apply_deterministic_model_overrides(
+            SimpleNamespace(),
+            {"model_overrides": {"deterministic_mode": True}},
+        )
 
 
 def test_prefer_nvrx_uses_async_save_and_restores_original_save(monkeypatch):
@@ -247,3 +295,94 @@ def test_import_model_from_hf_name_calls_bridge_save(monkeypatch):
 
     assert fake_bridge.saved_model is not None
     assert fake_bridge.saved_path == "/tmp/out"
+
+
+def test_hf_import_does_not_persist_deterministic_execution_overrides(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+    _install_runtime_stubs_for_hf_import(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.dist_checkpointing.strategies.torch", None
+    )
+
+    class FakeProvider:
+        def __init__(self):
+            self.deterministic_mode = False
+            self.cross_entropy_loss_fusion = True
+            self.tp_comm_overlap = True
+            self.tensor_model_parallel_size = 1
+            self.pipeline_model_parallel_size = 1
+            self.context_parallel_size = 1
+            self.expert_model_parallel_size = 1
+            self.expert_tensor_parallel_size = 1
+            self.num_layers_in_first_pipeline_stage = None
+            self.num_layers_in_last_pipeline_stage = None
+            self.pipeline_dtype = "fp32"
+            self.execution_values = None
+
+        def finalize(self):
+            pass
+
+        def initialize_model_parallel(self, seed):
+            self.seed = seed
+
+        def provide_distributed_model(self, wrap_with_ddp, post_wrap_hook):
+            self.execution_values = (
+                self.deterministic_mode,
+                self.cross_entropy_loss_fusion,
+                self.tp_comm_overlap,
+            )
+            config = SimpleNamespace(
+                deterministic_mode=self.deterministic_mode,
+                cross_entropy_loss_fusion=self.cross_entropy_loss_fusion,
+                tp_comm_overlap=self.tp_comm_overlap,
+            )
+            return [SimpleNamespace(config=config)]
+
+    class FakeBridge:
+        def __init__(self):
+            self.provider = FakeProvider()
+            self.saved_config = None
+
+        def to_megatron_provider(self, load_weights):
+            assert load_weights is True
+            return self.provider
+
+        def save_megatron_model(self, megatron_model, output_path):
+            self.saved_config = megatron_model[0].config
+
+    fake_bridge = FakeBridge()
+
+    class FakeAutoBridge:
+        @staticmethod
+        def from_hf_pretrained(hf_model_name, *args, **kwargs):
+            return fake_bridge
+
+    monkeypatch.setattr(module, "AutoBridge", FakeAutoBridge)
+    megatron_config = {
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "expert_model_parallel_size": 1,
+        "expert_tensor_parallel_size": 1,
+        "num_layers_in_first_pipeline_stage": None,
+        "num_layers_in_last_pipeline_stage": None,
+        "pipeline_dtype": "float32",
+        "sequence_parallel": False,
+        "gradient_accumulation_fusion": False,
+        "model_overrides": {
+            "deterministic_mode": True,
+            "cross_entropy_loss_fusion": False,
+            "tp_comm_overlap": False,
+        },
+    }
+
+    module.import_model_from_hf_name(
+        "fake/hf-model",
+        "/tmp/out",
+        megatron_config,
+    )
+
+    assert fake_bridge.provider.execution_values == (True, False, False)
+    assert fake_bridge.saved_config.deterministic_mode is False
+    assert fake_bridge.saved_config.cross_entropy_loss_fusion is True
+    assert fake_bridge.saved_config.tp_comm_overlap is True

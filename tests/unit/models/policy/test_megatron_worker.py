@@ -46,6 +46,132 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
+def _set_deterministic_worker_environment(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    for name in list(os.environ):
+        if name in worker_module.SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES or any(
+            name.startswith(prefix)
+            for prefix in worker_module.SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES
+        ):
+            monkeypatch.delenv(name)
+    for name, value in worker_module.SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES.items():
+        monkeypatch.setenv(name, value)
+    return worker_module
+
+
+@pytest.mark.parametrize(
+    "shared_prefix_config",
+    [
+        {"mode": "train"},
+        {"mode": "observe", "require_deterministic_execution": True},
+    ],
+)
+def test_shared_prefix_worker_enables_torch_determinism_before_cuda(
+    monkeypatch,
+    shared_prefix_config,
+) -> None:
+    worker_module = _set_deterministic_worker_environment(monkeypatch)
+    enable_determinism = MagicMock()
+    monkeypatch.setattr(
+        worker_module.torch,
+        "use_deterministic_algorithms",
+        enable_determinism,
+    )
+    monkeypatch.setattr(
+        worker_module.torch,
+        "are_deterministic_algorithms_enabled",
+        lambda: True,
+    )
+
+    worker_module._enable_shared_prefix_deterministic_execution(
+        {"shared_prefix_training": shared_prefix_config}
+    )
+
+    enable_determinism.assert_called_once_with(True)
+
+
+def test_worker_constructor_attests_determinism_before_any_other_action() -> None:
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    module_ast = ast.parse(Path(worker_module.__file__).read_text())
+    worker_class = next(
+        node
+        for node in module_ast.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "MegatronPolicyWorkerImpl"
+    )
+    constructor = next(
+        node
+        for node in worker_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    executable_body = constructor.body
+    if (
+        executable_body
+        and isinstance(executable_body[0], ast.Expr)
+        and isinstance(executable_body[0].value, ast.Constant)
+        and isinstance(executable_body[0].value.value, str)
+    ):
+        executable_body = executable_body[1:]
+
+    first_call = executable_body[0]
+    assert isinstance(first_call, ast.Expr)
+    assert isinstance(first_call.value, ast.Call)
+    assert isinstance(first_call.value.func, ast.Name)
+    assert first_call.value.func.id == "_enable_shared_prefix_deterministic_execution"
+
+
+@pytest.mark.parametrize(
+    "shared_prefix_config",
+    [
+        {"mode": "disabled"},
+        {"mode": "observe"},
+    ],
+)
+def test_uncontrolled_worker_does_not_change_torch_determinism(
+    monkeypatch,
+    shared_prefix_config,
+) -> None:
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    enable_determinism = MagicMock()
+    monkeypatch.setattr(
+        worker_module.torch,
+        "use_deterministic_algorithms",
+        enable_determinism,
+    )
+
+    worker_module._enable_shared_prefix_deterministic_execution(
+        {"shared_prefix_training": shared_prefix_config}
+    )
+
+    enable_determinism.assert_not_called()
+
+
+def test_strict_observe_worker_rejects_wrong_effective_environment(monkeypatch) -> None:
+    worker_module = _set_deterministic_worker_environment(monkeypatch)
+    monkeypatch.setenv("MAMBA_DETERMINISTIC", "0")
+    enable_determinism = MagicMock()
+    monkeypatch.setattr(
+        worker_module.torch,
+        "use_deterministic_algorithms",
+        enable_determinism,
+    )
+
+    with pytest.raises(RuntimeError, match="MAMBA_DETERMINISTIC="):
+        worker_module._enable_shared_prefix_deterministic_execution(
+            {
+                "shared_prefix_training": {
+                    "mode": "observe",
+                    "require_deterministic_execution": True,
+                }
+            }
+        )
+
+    enable_determinism.assert_not_called()
+
+
 def test_shared_prefix_logprobs_restore_original_row_order():
     from nemo_rl.models.megatron.data import SHARED_PREFIX_SOURCE_ROW_INDEX
     from nemo_rl.models.policy.workers.megatron_policy_worker import (

@@ -46,6 +46,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.policy import (
     PolicyConfig,
+    shared_prefix_deterministic_execution_required,
     validate_shared_prefix_training_config,
 )
 from nemo_rl.models.policy.interfaces import (
@@ -115,6 +116,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self.debug_payload_metrics = False
         self.shared_prefix_training_config = validate_shared_prefix_training_config(
             config
+        )
+        require_deterministic_execution = (
+            shared_prefix_deterministic_execution_required(config)
         )
         if weights_path:
             weights_path = os.path.abspath(weights_path)
@@ -309,6 +313,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 bundle_indices_list=tied_groups,
                 sharding_annotations=self.sharding_annotations,
                 env_vars=env_vars or {},
+                require_deterministic_execution=require_deterministic_execution,
             )
 
         else:
@@ -319,6 +324,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 workers_per_node=workers_per_node,
                 sharding_annotations=self.sharding_annotations,
                 env_vars=env_vars or {},
+                require_deterministic_execution=require_deterministic_execution,
             )
 
         if config["dynamic_batching"]["enabled"]:

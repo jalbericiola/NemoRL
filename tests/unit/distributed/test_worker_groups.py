@@ -25,7 +25,22 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     PY_EXECUTABLES,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.distributed.worker_groups import (
+    RayWorkerBuilder,
+    RayWorkerGroup,
+    _get_initializer_env_vars,
+)
+
+
+_IMPORT_TIME_DETERMINISM_ENV = {
+    name: os.environ.get(name)
+    for name in (
+        "CUBLAS_WORKSPACE_CONFIG",
+        "MAMBA_DETERMINISTIC",
+        "NCCL_ALGO",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
+    )
+}
 
 
 @ray.remote
@@ -104,6 +119,35 @@ class MyTestActor:
         return resources, env_vars_update, init_kwargs_update, {}
 
 
+@ray.remote
+class ImportTimeEnvironmentActor:
+    """Expose initializer- and actor-process cold-import environments."""
+
+    def __init__(self, initializer_import_env):
+        self.initializer_import_env = initializer_import_env
+        self.actor_import_env = _IMPORT_TIME_DETERMINISM_ENV
+        self.actor_runtime_env = {
+            name: os.environ.get(name) for name in _IMPORT_TIME_DETERMINISM_ENV
+        }
+
+    @staticmethod
+    def configure_worker(num_gpus, bundle_indices=None, num_gpus_per_node=None):
+        del bundle_indices, num_gpus_per_node
+        return (
+            {"num_gpus": num_gpus},
+            {},
+            {"initializer_import_env": _IMPORT_TIME_DETERMINISM_ENV},
+            {},
+        )
+
+    def get_import_environments(self):
+        return (
+            self.initializer_import_env,
+            self.actor_import_env,
+            self.actor_runtime_env,
+        )
+
+
 @ray.remote(
     runtime_env={
         "env_vars": {
@@ -143,6 +187,123 @@ class PrecedenceActor:
 
 
 MY_TEST_ACTOR_FQN = f"{MyTestActor.__module__}.MyTestActor"
+IMPORT_TIME_ENV_ACTOR_FQN = (
+    f"{ImportTimeEnvironmentActor.__module__}.ImportTimeEnvironmentActor"
+)
+
+
+def test_initializer_receives_worker_import_time_determinism_environment() -> None:
+    environment = {
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "HF_HOME": "/tmp/hf",
+        "MAMBA_DETERMINISTIC": "1",
+        "NCCL_ALGO": "Ring",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+        "PYTHONPATH": "/opt/nemo-rl",
+        "WORKER_ONLY": "must-not-reach-initializer",
+    }
+
+    assert _get_initializer_env_vars(
+        environment,
+        require_deterministic_execution=True,
+    ) == {
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "HF_HOME": "/tmp/hf",
+        "MAMBA_DETERMINISTIC": "1",
+        "NCCL_ALGO": "Ring",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+        "PYTHONPATH": "/opt/nemo-rl",
+    }
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "TRITON_CACHE_AUTOTUNING",
+        "TRITON_AUTOTUNE_BLOCK_SIZE_M",
+        "TRITON_AUTOTUNE_BLOCK_T",
+    ],
+)
+def test_initializer_rejects_triton_autotuning_with_deterministic_mamba(
+    name: str,
+) -> None:
+    with pytest.raises(ValueError, match=rf"unset.*{name}"):
+        _get_initializer_env_vars(
+            {
+                "MAMBA_DETERMINISTIC": "1",
+                name: "1",
+            },
+            require_deterministic_execution=True,
+        )
+
+
+def test_initializer_plain_mode_does_not_reject_existing_triton_environment() -> None:
+    environment = {
+        "HF_HOME": "/tmp/hf",
+        "MAMBA_DETERMINISTIC": "1",
+        "TRITON_CACHE_AUTOTUNING": "0",
+    }
+
+    assert _get_initializer_env_vars(environment) == {"HF_HOME": "/tmp/hf"}
+
+
+@pytest.mark.parametrize(
+    "require_deterministic_execution",
+    [True, False],
+)
+def test_initializer_cold_import_receives_determinism_env_only_when_strict(
+    monkeypatch,
+    virtual_cluster,
+    require_deterministic_execution: bool,
+) -> None:
+    deterministic_names = {
+        "CUBLAS_WORKSPACE_CONFIG",
+        "MAMBA_DETERMINISTIC",
+        "NCCL_ALGO",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
+    }
+    for name in list(os.environ):
+        if (
+            name in deterministic_names
+            or name == "TRITON_CACHE_AUTOTUNING"
+            or name.startswith("TRITON_AUTOTUNE_BLOCK")
+        ):
+            monkeypatch.delenv(name)
+    configured_mamba = (
+        "1" if require_deterministic_execution else "plain-config-only"
+    )
+    deterministic_environment = {
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "MAMBA_DETERMINISTIC": configured_mamba,
+        "NCCL_ALGO": "Ring",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+    }
+    expected_deterministic_environment = deterministic_environment.copy()
+    monkeypatch.setitem(
+        ACTOR_ENVIRONMENT_REGISTRY,
+        IMPORT_TIME_ENV_ACTOR_FQN,
+        PY_EXECUTABLES.SYSTEM,
+    )
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=RayWorkerBuilder(IMPORT_TIME_ENV_ACTOR_FQN),
+        workers_per_node=1,
+        env_vars=deterministic_environment,
+        require_deterministic_execution=require_deterministic_execution,
+    )
+    try:
+        initializer_import_env, actor_import_env, actor_runtime_env = ray.get(
+            worker_group.workers[0].get_import_environments.remote()
+        )
+    finally:
+        worker_group.shutdown(force=True)
+
+    if require_deterministic_execution:
+        assert initializer_import_env["MAMBA_DETERMINISTIC"] == configured_mamba
+    else:
+        assert initializer_import_env["MAMBA_DETERMINISTIC"] != configured_mamba
+    assert actor_import_env == initializer_import_env
+    assert actor_runtime_env == expected_deterministic_environment
 
 
 @ray.remote(

@@ -338,11 +338,14 @@ policy:
 
   # Prompt-prefix reuse in policy training forwards. "observe" only reports
   # opportunity metrics and does not change packing or model execution. "train"
-  # is experimental and requires Megatron, sequence packing, TP1, PP1, and a
-  # supported Hybrid model. CP>1 additionally requires an MCore build that
-  # advertises the distinct end-to-end shared-prefix CP capability.
+  # is experimental and requires Megatron, sequence packing, PP1, and a
+  # supported Hybrid model. TP>1 requires sequence parallelism; TP/CP topologies
+  # require the matching end-to-end shared-prefix MCore capability.
   shared_prefix_training:
     mode: "disabled"
+    # Set true in both observe/train arms of a controlled A/B comparison.
+    # Train mode requires deterministic execution regardless of this value.
+    require_deterministic_execution: false
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training

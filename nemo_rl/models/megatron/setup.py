@@ -250,9 +250,11 @@ from nemo_rl.models.megatron.router_replay import (
     validate_router_replay_config,
 )
 from nemo_rl.models.policy import (
+    SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES,
     MegatronConfig,
     PolicyConfig,
     get_shared_prefix_training_config,
+    shared_prefix_deterministic_execution_required,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -502,17 +504,37 @@ def _validate_shared_prefix_model_capability(
     config: PolicyConfig,
     model_cfg: Any,
 ) -> None:
-    """Reject train mode until the resolved Hybrid provider and MCore agree."""
+    """Attest deterministic config, then gate train-only MCore capabilities."""
     shared_prefix_config = get_shared_prefix_training_config(config)
-    if shared_prefix_config.mode != "train":
+    if not shared_prefix_deterministic_execution_required(config):
         return
 
-    if not isinstance(model_cfg, HybridModelProvider):
+    if shared_prefix_config.mode == "train" and not isinstance(
+        model_cfg, HybridModelProvider
+    ):
         raise NotImplementedError(
             "policy.shared_prefix_training.mode=train currently supports only "
             "Megatron Bridge HybridModelProvider models; resolved provider was "
             f"{type(model_cfg).__name__}."
         )
+
+    for name, expected_value in (
+        SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES.items()
+    ):
+        actual_value = getattr(model_cfg, name, None)
+        if actual_value is not expected_value:
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} "
+                "with deterministic execution requires resolved "
+                f"model_cfg.{name}={expected_value!r}; got {actual_value!r}. "
+                "Set the exact value through "
+                f"policy.megatron_cfg.model_overrides.{name}."
+            )
+
+    # Strict observation attests the same resolved execution controls without
+    # opting into Hybrid shared-prefix packing or its MCore capabilities.
+    if shared_prefix_config.mode != "train":
+        return
 
     tp_size = int(getattr(model_cfg, "tensor_model_parallel_size", 1))
     pp_size = int(getattr(model_cfg, "pipeline_model_parallel_size", 1))

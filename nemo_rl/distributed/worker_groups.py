@@ -31,9 +31,66 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+from nemo_rl.utils.shared_prefix_determinism import (
+    SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES,
+    SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES,
+    SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES,
+)
 from nemo_rl.utils.venvs import (
     create_local_venv_on_each_node,
 )
+
+
+# The pooled initializer imports the concrete worker class before creating the
+# real actor. Any library switch captured during import must therefore be
+# present in both processes, not only in the final GPU worker runtime_env.
+_INITIALIZER_IMPORT_ENV_VAR_NAMES = (
+    "HF_HOME",
+    "HF_MODULES_CACHE",
+    "PYTHONPATH",
+)
+_DETERMINISTIC_INITIALIZER_IMPORT_ENV_VAR_NAMES = (
+    *SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES,
+)
+
+
+def _get_initializer_env_vars(
+    env_vars: dict[str, str],
+    *,
+    require_deterministic_execution: bool = False,
+) -> dict[str, str]:
+    """Return import-time variables for the pooled worker initializer.
+
+    A strict shared-prefix control selects a single fixed Mamba Triton
+    configuration only when cache autotuning and block-size overrides are
+    absent. Reject even an empty value in that mode so a polluted submit
+    environment cannot silently change the worker's kernels. Uncontrolled
+    worker groups retain their existing environment behavior.
+    """
+    forbidden_triton_env_vars = sorted(
+        name
+        for name in env_vars
+        if name in SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES
+        or any(
+            name.startswith(prefix)
+            for prefix in SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES
+        )
+    )
+    if require_deterministic_execution and forbidden_triton_env_vars:
+        raise ValueError(
+            "Triton autotuning controls must be unset when MAMBA_DETERMINISTIC "
+            "enables deterministic Mamba kernels; found: "
+            + ", ".join(forbidden_triton_env_vars)
+        )
+
+    import_env_var_names = _INITIALIZER_IMPORT_ENV_VAR_NAMES
+    if require_deterministic_execution:
+        import_env_var_names += _DETERMINISTIC_INITIALIZER_IMPORT_ENV_VAR_NAMES
+    return {
+        name: env_vars[name]
+        for name in import_env_var_names
+        if name in env_vars
+    }
 
 
 @dataclass
@@ -342,6 +399,7 @@ class RayWorkerGroup:
         bundle_indices_list: Optional[list[tuple[int, list[int]]]] = None,
         sharding_annotations: Optional[NamedSharding] = None,
         env_vars: dict[str, str] = {},
+        require_deterministic_execution: bool = False,
     ):
         """Initialize a group of distributed Ray workers.
 
@@ -355,12 +413,15 @@ class RayWorkerGroup:
                                Each tuple defines a tied group of workers placed on the same node.
                                If provided, workers_per_node is ignored.
             sharding_annotations: NamedSharding object representing mapping of named axes to ranks (i.e. for TP, PP, etc.)
+            require_deterministic_execution: Whether initializer imports must
+                reject determinism-breaking Triton environment controls.
         """
         self._workers: list[ray.actor.ActorHandle] = []
         self._worker_metadata: list[dict[str, Any]] = []
         self.cluster = cluster
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
+        self.require_deterministic_execution = require_deterministic_execution
         self.dp_leader_worker_indices: list[int] = []
 
         # If explicit bundle indices are provided, use those
@@ -502,11 +563,10 @@ class RayWorkerGroup:
         # import-related variables that trust_remote_code classes need to
         # resolve their generated modules have to travel with it.
         unique_pg_indices = sorted({pg_idx for pg_idx, _ in bundle_indices_list})
-        initializer_env_vars = {
-            key: env_vars[key]
-            for key in ("HF_HOME", "HF_MODULES_CACHE", "PYTHONPATH")
-            if key in env_vars
-        }
+        initializer_env_vars = _get_initializer_env_vars(
+            env_vars,
+            require_deterministic_execution=self.require_deterministic_execution,
+        )
         initializer_runtime_env = {}
         if py_executable != sys.executable:
             initializer_runtime_env["py_executable"] = py_executable

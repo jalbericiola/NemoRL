@@ -95,7 +95,14 @@ from nemo_rl.models.megatron.train import (
     aggregate_training_statistics,
     megatron_forward_backward,
 )
-from nemo_rl.models.policy import PolicyConfig, get_shared_prefix_training_config
+from nemo_rl.models.policy import (
+    SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES,
+    SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES,
+    SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES,
+    PolicyConfig,
+    get_shared_prefix_training_config,
+    shared_prefix_deterministic_execution_required,
+)
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -122,6 +129,51 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _enable_shared_prefix_deterministic_execution(config: PolicyConfig) -> None:
+    """Attest and enable determinism before this worker first touches CUDA.
+
+    Mamba selects its Triton configuration while modules are imported, so this
+    function refuses to repair a late or polluted environment. The Ray runtime
+    and pooled import initializer must install the exact values before importing
+    this module.
+    """
+    if not shared_prefix_deterministic_execution_required(config):
+        return
+
+    mode = get_shared_prefix_training_config(config).mode
+    forbidden_env_vars = sorted(
+        name
+        for name in os.environ
+        if name in SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES
+        or any(
+            name.startswith(prefix)
+            for prefix in SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES
+        )
+    )
+    if forbidden_env_vars:
+        raise RuntimeError(
+            f"shared-prefix mode={mode} deterministic worker requires Triton "
+            "autotuning controls to be unset before Python import; found: "
+            + ", ".join(forbidden_env_vars)
+        )
+
+    for name, expected_value in SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES.items():
+        actual_value = os.environ.get(name)
+        if actual_value != expected_value:
+            raise RuntimeError(
+                f"shared-prefix mode={mode} deterministic worker requires the "
+                f"import-time environment {name}={expected_value!r}; got "
+                f"{actual_value!r}."
+            )
+
+    torch.use_deterministic_algorithms(True)
+    if not torch.are_deterministic_algorithms_enabled():
+        raise RuntimeError(
+            "torch deterministic algorithms were not enabled for the "
+            f"shared-prefix mode={mode} deterministic worker"
+        )
 
 
 def _should_use_router_replay(
@@ -551,6 +603,11 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        # Must precede diagnostics, CUDA device selection, NCCL setup, model
+        # import, and provider construction. A late call cannot constrain
+        # import-time Mamba kernels or already-created CUDA libraries.
+        _enable_shared_prefix_deterministic_execution(config)
+
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
         # not initialize a CUDA context ahead of the set_device below.
         log_gpu_memory_diagnostics(

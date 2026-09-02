@@ -21,7 +21,10 @@ import torch
 from megatron.bridge import AutoBridge
 from megatron.core.transformer import ModuleSpec
 
-from nemo_rl.models.policy import MegatronConfig
+from nemo_rl.models.policy import (
+    SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES,
+    MegatronConfig,
+)
 
 
 def iter_vlm_config_overrides(
@@ -42,6 +45,29 @@ def iter_vlm_config_overrides(
     for key in keys:
         if key in megatron_config:
             yield key, megatron_config[key]
+
+
+def _apply_deterministic_model_overrides(
+    model_provider: Any,
+    megatron_config: MegatronConfig,
+) -> dict[str, Any]:
+    """Apply configured determinism fields and return values to restore."""
+    model_overrides = megatron_config.get("model_overrides") or {}
+    requested_keys = [
+        key
+        for key in SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES
+        if key in model_overrides
+    ]
+    for key in requested_keys:
+        if not hasattr(model_provider, key):
+            raise ValueError(
+                f"policy.megatron_cfg.model_overrides.{key} cannot be applied "
+                f"to {type(model_provider).__name__}."
+            )
+    original_values = {key: getattr(model_provider, key) for key in requested_keys}
+    for key in requested_keys:
+        setattr(model_provider, key, model_overrides[key])
+    return original_values
 
 
 def to_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
@@ -132,7 +158,15 @@ def import_model_from_hf_name(
 
     model_provider = bridge.to_megatron_provider(load_weights=True)
 
+    original_deterministic_model_values: dict[str, Any] = {}
     if megatron_config is not None:
+        # HF conversion constructs a real Megatron model before the normal
+        # setup path reloads and merges model_overrides. Apply this subset here
+        # as well, before finalize/model construction.
+        original_deterministic_model_values = _apply_deterministic_model_overrides(
+            model_provider, megatron_config
+        )
+
         for key, value in iter_vlm_config_overrides(megatron_config):
             # Match the import-time behaviour in megatron/setup.py: a key the
             # recipe set explicitly must not be dropped just because this
@@ -224,6 +258,11 @@ def import_model_from_hf_name(
     config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
     config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
     config.pipeline_dtype = orig_pipeline_dtype
+    # Conversion caches are shared by strict and uncontrolled runs. Persist the
+    # architecture defaults, not this run's execution controls, so a strict
+    # cold conversion cannot make a later disabled/plain-observe run strict.
+    for key, value in original_deterministic_model_values.items():
+        setattr(config, key, value)
 
     with _prefer_nvrx_for_dist_ckpt_save():
         bridge.save_megatron_model(megatron_model, output_path)

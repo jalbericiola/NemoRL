@@ -36,6 +36,7 @@ from nemo_rl.distributed.batched_data_dict import (
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.policy import shared_prefix_deterministic_execution_required
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 
 
@@ -220,6 +221,9 @@ class TeacherWorkerGroup:
             name_prefix=f"teacher_{self.alias}",
             sharding_annotations=self.sharding_annotations,
             env_vars=env_vars or {},
+            require_deterministic_execution=shared_prefix_deterministic_execution_required(
+                cfg
+            ),
         )
 
         self.cfg = cfg
