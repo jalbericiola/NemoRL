@@ -118,16 +118,87 @@ def test_shared_prefix_execution_count_rejects_uneven_model_world():
             )
 
 
+def test_timed_shared_prefix_execution_barrier_records_its_own_timer_key():
+    """The barrier keeps its semantics but its wait lands under a separate label."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY,
+        MegatronPolicyWorkerImpl,
+    )
+    from nemo_rl.utils.timer import Timer
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.timer = Timer(context={"worker": "test"})
+
+    with patch(
+        "nemo_rl.models.policy.workers.megatron_policy_worker."
+        "_require_equal_shared_prefix_execution_count",
+        return_value=4,
+    ) as barrier:
+        agreed, elapsed = worker._timed_shared_prefix_execution_barrier(
+            4,
+            stage="train",
+        )
+
+    barrier.assert_called_once_with(4, stage="train")
+    assert agreed == 4
+    assert elapsed >= 0.0
+    recorded = worker.timer.get_elapsed(SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY)
+    assert recorded == [elapsed]
+
+    # A mismatch still propagates unchanged, and the label is not left running.
+    with patch(
+        "nemo_rl.models.policy.workers.megatron_policy_worker."
+        "_require_equal_shared_prefix_execution_count",
+        side_effect=RuntimeError("min=2, max=3"),
+    ):
+        with pytest.raises(RuntimeError, match="min=2, max=3"):
+            worker._timed_shared_prefix_execution_barrier(2, stage="logprob")
+    assert len(worker.timer.get_elapsed(SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY)) == 2
+    worker.timer.start(SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY)
+    worker.timer.stop(SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY)
+
+
+def test_worker_plans_shared_prefix_units_once_under_its_own_timer():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        SHARED_PREFIX_EXECUTION_PLANNING_TIMER_KEY,
+        MegatronPolicyWorkerImpl,
+    )
+    from nemo_rl.utils.timer import Timer
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.timer = Timer(context={"worker": "test"})
+    worker.cfg = {"shared_prefix_training": {"mode": "disabled"}}
+    worker._shared_prefix_training_enabled = False
+    data = BatchedDataDict({"input_lengths": torch.tensor([4, 5])})
+
+    assert worker._plan_shared_prefix_execution_units(data, bin_capacity=None) is None
+    assert SHARED_PREFIX_EXECUTION_PLANNING_TIMER_KEY not in worker.timer.get_timing_metrics()
+
+    worker.cfg = {"shared_prefix_training": {"mode": "train"}}
+    worker._shared_prefix_training_enabled = True
+    sentinel_units = (object(),)
+    with patch(
+        "nemo_rl.models.policy.workers.megatron_policy_worker."
+        "plan_shared_prefix_execution_units",
+        return_value=sentinel_units,
+    ) as planner:
+        units = worker._plan_shared_prefix_execution_units(data, bin_capacity=16)
+
+    planner.assert_called_once_with(data, cfg=worker.cfg, bin_capacity=16)
+    assert units is sentinel_units
+    assert len(worker.timer.get_elapsed(SHARED_PREFIX_EXECUTION_PLANNING_TIMER_KEY)) == 1
+
+
 def test_shared_prefix_tq_worker_attaches_driver_execution_slots():
     from nemo_rl.data.packing.shared_prefix_metadata import (
         SHARED_PREFIX_EXECUTION_SLOT,
         SHARED_PREFIX_GROUP_ID,
     )
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorker,
+        MegatronPolicyWorkerImpl,
     )
 
-    worker = MegatronPolicyWorker.__new__(MegatronPolicyWorker)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
     worker.cfg = {"shared_prefix_training": {"mode": "train"}}
     worker._shared_prefix_training_enabled = True
     data = BatchedDataDict(

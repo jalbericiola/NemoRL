@@ -70,6 +70,7 @@ from nemo_rl.models.megatron.data import (
     SHARED_PREFIX_SOURCE_ROW_INDEX,
     _normalize_shared_prefix_group_ids,
     get_microbatch_iterator,
+    plan_shared_prefix_execution_units,
     process_global_batch,
 )
 from nemo_rl.models.megatron.pipeline_parallel import (
@@ -202,6 +203,24 @@ def _restore_logprobs_in_source_order(
     restored = concatenated_logprobs.new_zeros((expected_rows, sequence_length))
     restored.index_copy_(0, concatenated_rows, concatenated_logprobs)
     return restored
+
+
+# Worker ``Timer`` labels for the shared-prefix per-call planning and the
+# model-world forward-count barrier. The barrier wait used to be invisible
+# inside the enclosing ``train`` / ``get_logprobs`` labels (and, on the driver,
+# inside ``policy_training``); it now has its own label so it can be told apart
+# from compute.
+SHARED_PREFIX_EXECUTION_PLANNING_TIMER_KEY = "shared_prefix_execution_planning"
+SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY = "shared_prefix_execution_barrier"
+# Returned-metrics keys. ``*_seconds`` is this rank's summed barrier wait for
+# the call (same contract as ``train_elapsed_seconds``). ``*_dp_sum_seconds``
+# rides along in ``all_mb_metrics``, whose default reducer in grpo.py and the
+# single-controller utilities sums list entries across DP-replica leaders, so
+# the logged value is the sum over DP ranks of the per-rank wait.
+SHARED_PREFIX_EXECUTION_BARRIER_SECONDS_KEY = "shared_prefix_execution_barrier_seconds"
+SHARED_PREFIX_EXECUTION_BARRIER_DP_SUM_KEY = (
+    "shared_prefix_execution_barrier_dp_sum_seconds"
+)
 
 
 def _require_equal_shared_prefix_execution_count(
@@ -946,6 +965,57 @@ class MegatronPolicyWorkerImpl(
             )
         return int(sequence_packing[key])
 
+    def _plan_shared_prefix_execution_units(
+        self,
+        data: BatchedDataDict[Any],
+        *,
+        bin_capacity: Optional[int],
+    ) -> Optional[tuple[Any, ...]]:
+        """Plan this call's shared-prefix forwards once, under their own timer.
+
+        Returns ``None`` outside shared-prefix train mode. The units feed both
+        :func:`get_microbatch_iterator` (which then skips its own planning and
+        the iterator's device-copy re-planning) and the forward-count barrier.
+        """
+        if not self._shared_prefix_training_enabled:
+            return None
+        assert bin_capacity is not None, (
+            "shared-prefix train mode requires a per-stage token bin capacity"
+        )
+        with self.timer.time(SHARED_PREFIX_EXECUTION_PLANNING_TIMER_KEY):
+            return plan_shared_prefix_execution_units(
+                data,
+                cfg=self.cfg,
+                bin_capacity=bin_capacity,
+            )
+
+    def _timed_shared_prefix_execution_barrier(
+        self,
+        local_count: int,
+        *,
+        stage: str,
+    ) -> tuple[int, float]:
+        """Run the model-world forward-count barrier under its own timer label.
+
+        The barrier itself is unchanged: the same MAX ``all_reduce`` on the
+        default group, at the same position relative to the surrounding
+        collectives on every rank, raising the same ``RuntimeError`` on a
+        mismatch. Only the attribution changes. ``Timer`` has no pause/resume
+        (``stop`` finalizes a measurement), so the wait cannot be carved out of
+        the enclosing ``train`` / ``get_logprobs`` label; it is recorded under
+        ``SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY`` and the elapsed seconds
+        are returned so callers can surface them in their metrics.
+        """
+        self.timer.start(SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY)
+        try:
+            agreed_count = _require_equal_shared_prefix_execution_count(
+                local_count,
+                stage=stage,
+            )
+        finally:
+            elapsed = self.timer.stop(SHARED_PREFIX_EXECUTION_BARRIER_TIMER_KEY)
+        return agreed_count, elapsed
+
     def _get_model_extra_state_dict(self) -> dict[str, Any]:
         fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
         if not fp8_enabled:
@@ -1038,6 +1108,7 @@ class MegatronPolicyWorkerImpl(
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
+            shared_prefix_barrier_seconds = 0.0
             for gb_idx in range(num_global_batches):
                 gb_result = process_global_batch(
                     data,
@@ -1063,6 +1134,15 @@ class MegatronPolicyWorkerImpl(
 
                 attach_media_token_validity_mask(batch, self.media_placeholder_token_id)
 
+                shared_prefix_bin_capacity = self._shared_prefix_bin_capacity(
+                    "train_mb_tokens"
+                )
+                shared_prefix_execution_units = (
+                    self._plan_shared_prefix_execution_units(
+                        batch,
+                        bin_capacity=shared_prefix_bin_capacity,
+                    )
+                )
                 (
                     data_iterator,
                     num_microbatches,
@@ -1077,15 +1157,18 @@ class MegatronPolicyWorkerImpl(
                     delegate_pack_to_model=self.delegate_pack_to_model,
                     delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
                     model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
-                    shared_prefix_bin_capacity=self._shared_prefix_bin_capacity(
-                        "train_mb_tokens"
-                    ),
+                    shared_prefix_bin_capacity=shared_prefix_bin_capacity,
+                    shared_prefix_execution_units=shared_prefix_execution_units,
                 )
                 if self._shared_prefix_training_enabled:
-                    num_microbatches = _require_equal_shared_prefix_execution_count(
+                    (
+                        num_microbatches,
+                        barrier_seconds,
+                    ) = self._timed_shared_prefix_execution_barrier(
                         num_microbatches,
                         stage="train",
                     )
+                    shared_prefix_barrier_seconds += barrier_seconds
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
 
@@ -1289,6 +1372,13 @@ class MegatronPolicyWorkerImpl(
             losses=losses,
             data_parallel_group=parallel_state.get_data_parallel_group(),
         )
+        if self._shared_prefix_training_enabled:
+            # Barrier wait is still inside ``train_elapsed_seconds`` and the
+            # driver's ``policy_training`` wall clock; this entry lets those be
+            # corrected without new plumbing (see the key's comment above).
+            mb_metrics[SHARED_PREFIX_EXECUTION_BARRIER_DP_SUM_KEY] = [
+                shared_prefix_barrier_seconds
+            ]
 
         metrics = {
             "global_loss": global_loss.cpu(),
@@ -1299,6 +1389,10 @@ class MegatronPolicyWorkerImpl(
             "grad_norm": torch.tensor([grad_norm]),
             "train_elapsed_seconds": metrics_train_elapsed,  # pragma: no cover
         }
+        if self._shared_prefix_training_enabled:
+            metrics[SHARED_PREFIX_EXECUTION_BARRIER_SECONDS_KEY] = (
+                shared_prefix_barrier_seconds
+            )
         # Read "config" via getattr-by-string so the token stays out of
         # train.__code__.co_names; with torch 2.11 cloudpickle otherwise
         # matches torch.distributed.config (a non-pickleable ConfigModuleInstance).
@@ -1444,6 +1538,9 @@ class MegatronPolicyWorkerImpl(
             "all_mb_metrics": [],
             "mb_losses": [],
             "total_num_microbatches": 0,
+            # Summed shared-prefix forward-count barrier wait across this step's
+            # train_microbatch calls; surfaced by finish_train_step.
+            "shared_prefix_execution_barrier_seconds": 0.0,
             # One increment per train_microbatch call, i.e. the number of
             # streaming chunks the controller has fed into this optimizer step
             # so far.
@@ -1697,6 +1794,13 @@ class MegatronPolicyWorkerImpl(
         # Build the per-call iterator. Each ``train_microbatches_from_meta``
         # call carries one DP slice; the iterator subdivides into pipeline
         # microbatches.
+        shared_prefix_bin_capacity = self._shared_prefix_bin_capacity(
+            "train_mb_tokens"
+        )
+        shared_prefix_execution_units = self._plan_shared_prefix_execution_units(
+            data,
+            bin_capacity=shared_prefix_bin_capacity,
+        )
         (
             data_iterator,
             num_microbatches,
@@ -1708,15 +1812,18 @@ class MegatronPolicyWorkerImpl(
             self.cfg,
             state["mbs"],
             straggler_timer=self.mcore_state.straggler_timer,
-            shared_prefix_bin_capacity=self._shared_prefix_bin_capacity(
-                "train_mb_tokens"
-            ),
+            shared_prefix_bin_capacity=shared_prefix_bin_capacity,
+            shared_prefix_execution_units=shared_prefix_execution_units,
         )
         if self._shared_prefix_training_enabled:
-            num_microbatches = _require_equal_shared_prefix_execution_count(
+            (
+                num_microbatches,
+                barrier_seconds,
+            ) = self._timed_shared_prefix_execution_barrier(
                 num_microbatches,
                 stage="presharded train",
             )
+            state["shared_prefix_execution_barrier_seconds"] += barrier_seconds
         state["total_num_microbatches"] += int(num_microbatches)
 
         loss_post_processor = LossPostProcessor(
@@ -2023,6 +2130,11 @@ class MegatronPolicyWorkerImpl(
             losses=losses_to_aggregate,
             data_parallel_group=parallel_state.get_data_parallel_group(),
         )
+        if self._shared_prefix_training_enabled:
+            # Same surfacing as the synchronous train() path.
+            mb_metrics[SHARED_PREFIX_EXECUTION_BARRIER_DP_SUM_KEY] = [
+                state["shared_prefix_execution_barrier_seconds"]
+            ]
 
         metrics = {
             "global_loss": global_loss.cpu(),
@@ -2032,6 +2144,10 @@ class MegatronPolicyWorkerImpl(
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
         }
+        if self._shared_prefix_training_enabled:
+            metrics[SHARED_PREFIX_EXECUTION_BARRIER_SECONDS_KEY] = state[
+                "shared_prefix_execution_barrier_seconds"
+            ]
 
         # MoE aux-loss metrics: same convention as sync train() — scale
         # by the total pipeline-microbatch count accumulated across all
@@ -2108,6 +2224,13 @@ class MegatronPolicyWorkerImpl(
         # against a different media alignment than the one trained on.
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
 
+        shared_prefix_bin_capacity = self._shared_prefix_bin_capacity(
+            "logprob_mb_tokens"
+        )
+        shared_prefix_execution_units = self._plan_shared_prefix_execution_units(
+            data,
+            bin_capacity=shared_prefix_bin_capacity,
+        )
         (
             mb_iterator,
             num_microbatches,
@@ -2122,14 +2245,24 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
-            shared_prefix_bin_capacity=self._shared_prefix_bin_capacity(
-                "logprob_mb_tokens"
-            ),
+            shared_prefix_bin_capacity=shared_prefix_bin_capacity,
+            shared_prefix_execution_units=shared_prefix_execution_units,
         )
         if self._shared_prefix_training_enabled:
-            num_microbatches = _require_equal_shared_prefix_execution_count(
+            # get_logprobs returns only the logprob tensor (no metrics channel),
+            # so the wait is visible through the worker Timer label and this
+            # debug line only.
+            (
+                num_microbatches,
+                barrier_seconds,
+            ) = self._timed_shared_prefix_execution_barrier(
                 num_microbatches,
                 stage="logprob",
+            )
+            log.debug(
+                "[shared-prefix] logprob execution barrier rank=%d wait=%.4fs",
+                self.rank,
+                barrier_seconds,
             )
 
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(

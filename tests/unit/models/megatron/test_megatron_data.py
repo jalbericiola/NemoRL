@@ -362,11 +362,13 @@ def test_shared_prefix_microbatch_mixes_star_and_fallback_without_row_loss():
             cu_seqlens_padded=None,
         )
 
-    execution_count, max_execution_length = _get_shared_prefix_execution_shape(
+    execution_plan = _get_shared_prefix_execution_shape(
         batch,
         cfg=cfg,
         bin_capacity=16,
     )
+    execution_count = execution_plan.num_units
+    max_execution_length = execution_plan.max_physical_length
 
     with patch(
         "nemo_rl.models.megatron.data.process_microbatch",
@@ -387,6 +389,9 @@ def test_shared_prefix_microbatch_mixes_star_and_fallback_without_row_loss():
 
     assert execution_count == len(processed) == 2
     assert max_execution_length == 8
+    assert len(execution_plan.units) == 2
+    assert execution_plan.units[0].shared_layout is not None
+    assert execution_plan.units[1].shared_layout is None
     assert processed[0].shared_prefix is not None
     assert processed[1].shared_prefix is None
     assert all(item.shared_prefix_train_mode for item in processed)
@@ -474,6 +479,335 @@ def test_prescribed_slot_prompt_mismatch_falls_back_as_one_real_forward():
         processed[0].data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX],
         torch.arange(2),
     )
+
+
+def _shared_prefix_plan_once_batch():
+    """Star group, singleton, and a prompt-mismatch fallback in one local batch."""
+    from nemo_rl.data.packing.shared_prefix_metadata import (
+        SHARED_PREFIX_EXECUTION_SLOT,
+        SHARED_PREFIX_GROUP_ID,
+        SHARED_PREFIX_PROMPT_LENGTHS,
+    )
+    from nemo_rl.models.megatron.data import SHARED_PREFIX_SOURCE_ROW_INDEX
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [
+                    [10, 11, 12, 20, 21, 0],
+                    [10, 11, 12, 30, 31, 32],
+                    [40, 41, 42, 43, 0, 0],
+                    [50, 51, 60, 61, 0, 0],
+                    [50, 99, 60, 61, 62, 0],
+                ]
+            ),
+            "input_lengths": torch.tensor([5, 6, 4, 4, 5]),
+            "mtp_loss_mask": torch.tensor(
+                [
+                    [0, 0, 0, 1, 1, 0],
+                    [0, 0, 0, 1, 1, 1],
+                    [0, 0, 1, 1, 0, 0],
+                    [0, 0, 1, 1, 0, 0],
+                    [0, 0, 1, 1, 1, 0],
+                ]
+            ),
+            SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([3, 3, 2, 2, 2]),
+            SHARED_PREFIX_GROUP_ID: np.asarray(
+                ["shared", "shared", "singleton", "mismatch", "mismatch"],
+                dtype=object,
+            ),
+            SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0, 0, 0, 0]),
+            SHARED_PREFIX_SOURCE_ROW_INDEX: torch.arange(5),
+        }
+    )
+    cfg = {
+        "make_sequence_length_divisible_by": 1,
+        "sequence_packing": {
+            "enabled": True,
+            "algorithm": "FIRST_FIT_DECREASING",
+        },
+    }
+    return batch, cfg
+
+
+def _mock_fallback_process_microbatch(*, data_dict, **_kwargs):
+    from nemo_rl.models.megatron.data import ProcessedInputs
+
+    return ProcessedInputs(
+        input_ids=data_dict["input_ids"],
+        input_ids_cp_sharded=data_dict["input_ids"],
+        attention_mask=None,
+        position_ids=None,
+        packed_seq_params=None,
+        cu_seqlens_padded=None,
+    )
+
+
+def test_build_shared_prefix_rows_values_and_validation():
+    from nemo_rl.data.packing import SharedPrefixRow
+    from nemo_rl.data.packing.shared_prefix_metadata import (
+        SHARED_PREFIX_GROUP_ID,
+        SHARED_PREFIX_PROMPT_LENGTHS,
+    )
+    from nemo_rl.models.megatron.data import _build_shared_prefix_rows
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [
+                    [10, 11, 12, 20, 21, 0],
+                    [40, 41, 42, 43, 0, 0],
+                    [7, 8, 0, 0, 0, 0],
+                ]
+            ),
+            "input_lengths": torch.tensor([5, 4, 2], dtype=torch.int32),
+            SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([3, 2, 2], dtype=torch.int32),
+            SHARED_PREFIX_GROUP_ID: ["g", None, "h"],
+        }
+    )
+
+    rows = _build_shared_prefix_rows(batch)
+
+    assert rows == [
+        SharedPrefixRow(
+            row_index=0,
+            group_id="g",
+            prompt_token_ids=(10, 11, 12),
+            completion_length=2,
+        ),
+        SharedPrefixRow(
+            row_index=1,
+            group_id=None,
+            prompt_token_ids=(40, 41),
+            completion_length=2,
+        ),
+        SharedPrefixRow(
+            row_index=2,
+            group_id="h",
+            prompt_token_ids=(7, 8),
+            completion_length=0,
+        ),
+    ]
+    assert all(row.total_length == length for row, length in zip(rows, [5, 4, 2]))
+
+    bad_prompt = BatchedDataDict(dict(batch.items()))
+    bad_prompt[SHARED_PREFIX_PROMPT_LENGTHS] = torch.tensor([6, 2, 2])
+    with pytest.raises(ValueError, match="prompt length for row 0"):
+        _build_shared_prefix_rows(bad_prompt)
+
+    bad_length = BatchedDataDict(dict(batch.items()))
+    bad_length["input_lengths"] = torch.tensor([7, 4, 2])
+    with pytest.raises(ValueError, match="input length for row 0"):
+        _build_shared_prefix_rows(bad_length)
+
+    bad_group = BatchedDataDict(dict(batch.items()))
+    bad_group[SHARED_PREFIX_GROUP_ID] = ["g", 3, "h"]
+    with pytest.raises(TypeError, match="group ID for row 1"):
+        _build_shared_prefix_rows(bad_group)
+
+
+def test_shared_prefix_precomputed_units_match_replanned_microbatches():
+    """Reusing the worker-side plan must reproduce the re-planning path exactly."""
+    from nemo_rl.models.megatron import data as megatron_data
+    from nemo_rl.models.megatron.data import (
+        SHARED_PREFIX_SOURCE_ROW_INDEX,
+        _get_shared_prefix_execution_shape,
+        plan_shared_prefix_execution_units,
+        process_shared_prefix_microbatch,
+    )
+
+    batch, cfg = _shared_prefix_plan_once_batch()
+
+    planned_units = plan_shared_prefix_execution_units(
+        batch,
+        cfg=cfg,
+        bin_capacity=16,
+    )
+    execution_plan = _get_shared_prefix_execution_shape(
+        batch,
+        cfg=cfg,
+        bin_capacity=16,
+    )
+    assert execution_plan.units == planned_units
+    assert execution_plan.num_units == 3
+    assert execution_plan.max_physical_length == 9
+    assert [unit.shared_layout is not None for unit in planned_units] == [
+        True,
+        False,
+        False,
+    ]
+    # Star units carry the planner's layout row order, so compare as sets.
+    assert [tuple(sorted(unit.row_indices)) for unit in planned_units] == [
+        (0, 1),
+        (2,),
+        (3, 4),
+    ]
+    # The worker-facing planner must leave the caller's batch untouched.
+    assert isinstance(batch[megatron_data.SHARED_PREFIX_GROUP_ID], np.ndarray)
+
+    def run(execution_units):
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.process_microbatch",
+                side_effect=_mock_fallback_process_microbatch,
+            ),
+            patch.object(
+                megatron_data,
+                "_plan_prescribed_shared_prefix_execution_units",
+                wraps=megatron_data._plan_prescribed_shared_prefix_execution_units,
+            ) as planner,
+        ):
+            processed = list(
+                process_shared_prefix_microbatch(
+                    data_dict=batch,
+                    cfg=cfg,
+                    bin_capacity=16,
+                    seq_length_key="input_lengths",
+                    pad_individual_seqs_to_multiple_of=1,
+                    pad_packed_seq_to_multiple_of=1,
+                    pad_full_seq_to=None,
+                    straggler_timer=None,
+                    execution_units=execution_units,
+                )
+            )
+        return processed, planner.call_count
+
+    replanned, replanned_calls = run(None)
+    reused, reused_calls = run(planned_units)
+
+    assert replanned_calls == 1
+    assert reused_calls == 0
+    assert len(replanned) == len(reused) == 3
+    for expected, actual in zip(replanned, reused, strict=True):
+        assert actual.shared_prefix_train_mode is True
+        assert (expected.shared_prefix is None) == (actual.shared_prefix is None)
+        torch.testing.assert_close(
+            actual.data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX],
+            expected.data_dict[SHARED_PREFIX_SOURCE_ROW_INDEX],
+        )
+        torch.testing.assert_close(actual.input_ids, expected.input_ids)
+        torch.testing.assert_close(
+            actual.input_ids_cp_sharded, expected.input_ids_cp_sharded
+        )
+        if expected.position_ids is None:
+            assert actual.position_ids is None
+        else:
+            torch.testing.assert_close(actual.position_ids, expected.position_ids)
+        if expected.mtp_loss_mask is None:
+            assert actual.mtp_loss_mask is None
+        else:
+            torch.testing.assert_close(actual.mtp_loss_mask, expected.mtp_loss_mask)
+        if expected.shared_prefix is not None:
+            assert (
+                actual.shared_prefix.tensor_bin.layout
+                == expected.shared_prefix.tensor_bin.layout
+            )
+            torch.testing.assert_close(
+                actual.shared_prefix.tensor_bin.packed_input_ids,
+                expected.shared_prefix.tensor_bin.packed_input_ids,
+            )
+            assert (
+                actual.shared_prefix.padded_total_length
+                == expected.shared_prefix.padded_total_length
+            )
+            assert (
+                actual.shared_prefix.source_sequence_length
+                == expected.shared_prefix.source_sequence_length
+            )
+
+
+def test_get_microbatch_iterator_reuses_precomputed_shared_prefix_units():
+    from nemo_rl.models.megatron import data as megatron_data
+    from nemo_rl.models.megatron.data import (
+        _SharedPrefixExecutionUnit,
+        get_microbatch_iterator,
+        plan_shared_prefix_execution_units,
+    )
+
+    batch, cfg = _shared_prefix_plan_once_batch()
+    del batch[megatron_data.SHARED_PREFIX_SOURCE_ROW_INDEX]
+    cfg = {
+        **cfg,
+        "shared_prefix_training": {"mode": "train"},
+        "dynamic_batching": {"enabled": False},
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+        },
+    }
+
+    def build(execution_units):
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.make_processed_microbatch_iterator",
+                return_value=iter(()),
+            ) as make_iterator,
+            patch(
+                "nemo_rl.models.megatron.data._get_pack_sequence_parameters_for_megatron",
+                return_value=(1, 1, None),
+            ),
+            patch.object(
+                megatron_data,
+                "_plan_prescribed_shared_prefix_execution_units",
+                wraps=megatron_data._plan_prescribed_shared_prefix_execution_units,
+            ) as planner,
+        ):
+            (
+                _iterator,
+                data_iterator_len,
+                micro_batch_size,
+                seq_dim_size,
+                padded_seq_length,
+            ) = get_microbatch_iterator(
+                batch,
+                cfg,
+                1,
+                straggler_timer=None,
+                shared_prefix_bin_capacity=16,
+                shared_prefix_execution_units=execution_units,
+            )
+        forwarded_units = make_iterator.call_args.kwargs[
+            "shared_prefix_execution_units"
+        ]
+        return (
+            (data_iterator_len, micro_batch_size, seq_dim_size, padded_seq_length),
+            forwarded_units,
+            planner.call_count,
+        )
+
+    planned_shape, planned_units, planned_calls = build(None)
+    precomputed = plan_shared_prefix_execution_units(batch, cfg=cfg, bin_capacity=16)
+    reused_shape, reused_units, reused_calls = build(precomputed)
+
+    assert planned_calls == 1
+    assert reused_calls == 0
+    assert planned_shape == reused_shape == (3, 1, 6, 9)
+    assert planned_units == precomputed
+    assert reused_units is precomputed
+
+    # A plan for a different batch is rejected rather than silently applied.
+    with pytest.raises(ValueError, match="cover every local row exactly once"):
+        build(precomputed[:-1])
+    foreign_unit = _SharedPrefixExecutionUnit(
+        row_indices=(0, 1, 2, 3, 4, 5),
+        shared_layout=None,
+        physical_length=6,
+    )
+    with pytest.raises(ValueError, match="cover every local row exactly once"):
+        build((foreign_unit,))
+
+    # Precomputed units are meaningless outside train mode.
+    disabled_cfg = {**cfg, "shared_prefix_training": {"mode": "disabled"}}
+    with pytest.raises(ValueError, match="only meaningful in shared-prefix train"):
+        get_microbatch_iterator(
+            batch,
+            disabled_cfg,
+            1,
+            straggler_timer=None,
+            shared_prefix_execution_units=precomputed,
+        )
 
 
 @pytest.mark.mcore

@@ -269,6 +269,25 @@ def model_forward(
     return output_tensor
 
 
+SHARED_PREFIX_SYNC_FREE_CHECKS_ENV = "NEMORL_SHARED_PREFIX_SYNC_FREE_CHECKS"
+
+
+def _shared_prefix_sync_free_checks_enabled() -> bool:
+    """Whether :func:`shared_prefix_next_token_logprobs` skips its host syncs.
+
+    Off by default: the function keeps its descriptive host-side
+    ``ValueError`` checks (one ``.item()`` each per microbatch), so a bad
+    target token fails with a legible message and a still-usable CUDA
+    context. ``NEMORL_SHARED_PREFIX_SYNC_FREE_CHECKS=1`` opts a perf run into
+    the sync-free variant: the vocab guard becomes a device-side assertion
+    (a violation then surfaces as a sticky ``CUDA error: device-side assert
+    triggered`` whose text only reaches the worker's stderr) and the provably
+    redundant scatter-width check is skipped. Read per call so tests and
+    operators can flip it without re-importing.
+    """
+    return os.environ.get(SHARED_PREFIX_SYNC_FREE_CHECKS_ENV, "0") == "1"
+
+
 def shared_prefix_next_token_logprobs(
     packed_logits: torch.Tensor,
     shared_prefix: SharedPrefixForwardMetadata,
@@ -412,14 +431,26 @@ def shared_prefix_next_token_logprobs(
     )
     local_vocab_size = packed_logits.shape[-1]
     global_padded_vocab_size = local_vocab_size * tp_size
-    if target_tokens.numel() and bool(
-        torch.any(
-            (target_tokens < 0) | (target_tokens >= global_padded_vocab_size)
-        ).item()
-    ):
+    # This guard protects against silent corruption, so it stays: with TP>1,
+    # DistributedLogprob masks a target outside every vocabulary shard to
+    # logprob 0 instead of failing (TP1's gather would device-assert on its
+    # own). Nothing upstream bounds token ids against the model's padded vocab.
+    # By default it is the descriptive host-side check (one ``.item()`` per
+    # microbatch). NEMORL_SHARED_PREFIX_SYNC_FREE_CHECKS=1 swaps in a
+    # device-side assertion that costs no host sync but reports a violation
+    # only as a generic, context-poisoning CUDA device-side assert.
+    target_tokens_in_vocab = (
+        (target_tokens >= 0) & (target_tokens < global_padded_vocab_size)
+    ).all()
+    if _shared_prefix_sync_free_checks_enabled():
+        torch._assert_async(
+            target_tokens_in_vocab,
+            "shared-prefix target token is outside the TP-sharded padded vocabulary",
+        )
+    elif target_tokens.numel() and not bool(target_tokens_in_vocab.item()):
         raise ValueError(
-            "shared-prefix target token is outside the TP-sharded padded vocabulary: "
-            f"padded_vocab={global_padded_vocab_size}"
+            "shared-prefix target token is outside the TP-sharded padded "
+            f"vocabulary: padded_vocab={global_padded_vocab_size}"
         )
 
     prediction_count = predictor_positions.numel()
@@ -456,6 +487,10 @@ def shared_prefix_next_token_logprobs(
             device=device,
         )
         local_predictor_positions = global_to_local.index_select(0, predictor_positions)
+        # Load-bearing host sync: ``nonzero`` selects the predictor rows whose
+        # logits live on this CP rank, and its output size is data dependent
+        # (the rank's share of the zigzag shard), so it cannot be replaced by a
+        # fixed-shape masked op without materializing every predictor row.
         owned_prediction_indices = torch.nonzero(
             local_predictor_positions >= 0,
             as_tuple=False,
@@ -547,7 +582,15 @@ def shared_prefix_next_token_logprobs(
         device=device,
     )
     scatter_columns = tensor_indices.completion_scatter_columns.to(device=device)
-    if bool(torch.any(scatter_columns >= sequence_length - 1).item()):
+    # Defensive only, so skipped in sync-free mode: the planner emits column
+    # ``prompt_length + offset - 1 <= total_length - 2`` and
+    # ``materialize_shared_prefix_layout`` already rejected any row whose
+    # total_length exceeds its input length (<= the source width), so every
+    # column is inside ``restored``'s width by construction; an out-of-range
+    # column would also fail loudly in the indexed assignment below.
+    if not _shared_prefix_sync_free_checks_enabled() and bool(
+        torch.any(scatter_columns >= sequence_length - 1).item()
+    ):
         raise ValueError("shared-prefix completion scatter exceeds source width")
     restored[scatter_rows, scatter_columns] = packed_logprobs[prompt_prediction_count:]
     return restored

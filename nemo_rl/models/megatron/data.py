@@ -155,6 +155,9 @@ def make_processed_microbatch_iterator(
     model_slices_context_parallel_inputs: bool = False,
     shared_prefix_bin_capacity: Optional[int] = None,
     shared_prefix_padding_multiple: Optional[int] = None,
+    shared_prefix_execution_units: Optional[
+        tuple["_SharedPrefixExecutionUnit", ...]
+    ] = None,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -169,6 +172,10 @@ def make_processed_microbatch_iterator(
         pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
         pad_packed_seq_to_multiple_of: Padding multiple for packed sequences
         pad_full_seq_to: Target length for full sequence padding (optional)
+        shared_prefix_execution_units: Already-planned shared-prefix forwards
+            for the single raw batch this iterator wraps in train mode. When
+            given, :func:`process_shared_prefix_microbatch` reuses them instead
+            of re-planning on the device copy of the batch.
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -196,6 +203,7 @@ def make_processed_microbatch_iterator(
                 pad_full_seq_to=pad_full_seq_to,
                 straggler_timer=straggler_timer,
                 padding_multiple=shared_prefix_padding_multiple,
+                execution_units=shared_prefix_execution_units,
             )
             continue
 
@@ -239,6 +247,9 @@ def get_microbatch_iterator(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     shared_prefix_bin_capacity: Optional[int] = None,
+    shared_prefix_execution_units: Optional[
+        tuple["_SharedPrefixExecutionUnit", ...]
+    ] = None,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -251,6 +262,11 @@ def get_microbatch_iterator(
         cfg: Configuration dictionary
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
+        shared_prefix_execution_units: Optional output of
+            :func:`plan_shared_prefix_execution_units` for ``data``. Shared-prefix
+            train mode plans exactly once per call either way; passing the units
+            lets the worker run that planning under its own timer and reuse the
+            result for the forward-count barrier and the iterator.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -274,6 +290,11 @@ def get_microbatch_iterator(
 
     shared_prefix_train = get_shared_prefix_training_config(cfg).mode == "train"
     shared_prefix_padding_multiple: Optional[int] = None
+    if shared_prefix_execution_units is not None and not shared_prefix_train:
+        raise ValueError(
+            "shared_prefix_execution_units are only meaningful in shared-prefix "
+            "train mode"
+        )
     if shared_prefix_train:
         if shared_prefix_bin_capacity is None:
             raise ValueError(
@@ -307,15 +328,27 @@ def get_microbatch_iterator(
             shared_prefix_padding_multiple,
         ) = _resolve_shared_prefix_execution_topology(cfg)
         raw_iterator = iter((working_data,))
-        (
-            data_iterator_len,
-            max_execution_length,
-        ) = _get_shared_prefix_execution_shape(
-            working_data,
-            cfg=cfg,
-            bin_capacity=shared_prefix_bin_capacity,
-            padding_multiple=shared_prefix_padding_multiple,
-        )
+        if shared_prefix_execution_units is None:
+            execution_plan = _get_shared_prefix_execution_shape(
+                working_data,
+                cfg=cfg,
+                bin_capacity=shared_prefix_bin_capacity,
+                padding_multiple=shared_prefix_padding_multiple,
+            )
+            shared_prefix_execution_units = execution_plan.units
+        else:
+            # ``working_data`` keeps the caller's row order, so units planned on
+            # ``data`` address it directly; only guard against a plan for a
+            # different batch.
+            _validate_precomputed_shared_prefix_execution_units(
+                shared_prefix_execution_units,
+                batch_size=data.size,
+            )
+            execution_plan = SharedPrefixExecutionPlan(
+                units=shared_prefix_execution_units
+            )
+        data_iterator_len = execution_plan.num_units
+        max_execution_length = execution_plan.max_physical_length
         (
             pad_factor,
             pad_packed_seq_to_multiple_of,
@@ -362,6 +395,7 @@ def get_microbatch_iterator(
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
         shared_prefix_bin_capacity=shared_prefix_bin_capacity,
         shared_prefix_padding_multiple=shared_prefix_padding_multiple,
+        shared_prefix_execution_units=shared_prefix_execution_units,
     )
 
     # Compute padded sequence length for pipeline parallelism
@@ -471,14 +505,21 @@ def _build_shared_prefix_rows(
     ):
         raise ValueError("shared-prefix metadata must have one entry per input row")
 
+    # One host copy of the token matrix (the exact prompt tuples need it) and
+    # one ``.tolist()`` per length vector. The former per-row ``.item()`` calls
+    # ran on these CPU copies, so they were pure Python overhead proportional
+    # to the local batch rather than device syncs; the values are unchanged.
     input_ids_cpu = input_ids.detach().cpu()
-    input_lengths_cpu = input_lengths.detach().cpu().to(torch.long)
-    prompt_lengths_cpu = prompt_lengths.detach().cpu().to(torch.long)
+    input_length_values = input_lengths.detach().cpu().to(torch.long).tolist()
+    prompt_length_values = prompt_lengths.detach().cpu().to(torch.long).tolist()
+    sequence_width = input_ids.shape[1]
     rows: list[SharedPrefixRow] = []
-    for row_index in range(input_ids.shape[0]):
-        input_length = int(input_lengths_cpu[row_index].item())
-        prompt_length = int(prompt_lengths_cpu[row_index].item())
-        if input_length < 0 or input_length > input_ids.shape[1]:
+    for row_index, (input_length, prompt_length) in enumerate(
+        zip(input_length_values, prompt_length_values, strict=True)
+    ):
+        input_length = int(input_length)
+        prompt_length = int(prompt_length)
+        if input_length < 0 or input_length > sequence_width:
             raise ValueError(
                 f"input length for row {row_index} is outside input_ids width"
             )
@@ -512,6 +553,48 @@ class _SharedPrefixExecutionUnit:
     row_indices: tuple[int, ...]
     shared_layout: Optional[SharedPrefixLayout]
     physical_length: int
+
+
+@dataclass(frozen=True, slots=True)
+class SharedPrefixExecutionPlan:
+    """Planned physical forwards for one local shared-prefix batch.
+
+    ``units`` is the driver-prescribed execution order consumed by
+    :func:`process_shared_prefix_microbatch`. ``num_units`` is the rank-local
+    forward count the worker barrier compares across the model world, and
+    ``max_physical_length`` bounds the padded microbatch width.
+    """
+
+    units: tuple[_SharedPrefixExecutionUnit, ...]
+
+    def __post_init__(self) -> None:
+        if not self.units:
+            raise ValueError("shared-prefix train mode received an empty local batch")
+
+    @property
+    def num_units(self) -> int:
+        return len(self.units)
+
+    @property
+    def max_physical_length(self) -> int:
+        return max(unit.physical_length for unit in self.units)
+
+
+def _validate_precomputed_shared_prefix_execution_units(
+    units: tuple[_SharedPrefixExecutionUnit, ...],
+    *,
+    batch_size: int,
+) -> None:
+    """Reject a precomputed plan that does not cover this batch exactly once."""
+    if not units:
+        raise ValueError("shared-prefix train mode received an empty local batch")
+    covered_rows = sorted(index for unit in units for index in unit.row_indices)
+    if covered_rows != list(range(batch_size)):
+        raise ValueError(
+            "precomputed shared-prefix execution units must cover every local "
+            f"row exactly once; batch has {batch_size} rows, units cover "
+            f"{covered_rows}"
+        )
 
 
 def _get_shared_prefix_execution_topology(
@@ -622,7 +705,6 @@ def _plan_prescribed_shared_prefix_execution_units(
     rows_by_index = {row.row_index: row for row in rows}
     if padding_multiple is None:
         *_topology, padding_multiple = _resolve_shared_prefix_execution_topology(cfg)
-    input_lengths = data_dict["input_lengths"].detach().cpu().to(torch.long)
     units: list[_SharedPrefixExecutionUnit] = []
     for row_indices in _iter_prescribed_shared_prefix_slots(data_dict):
         slot_rows = [rows_by_index[index] for index in row_indices]
@@ -647,8 +729,11 @@ def _plan_prescribed_shared_prefix_execution_units(
             )
             continue
 
+        # ``SharedPrefixRow.total_length`` is exactly the validated input
+        # length of that row, so no second host copy of ``input_lengths`` and
+        # no per-row ``.item()`` are needed here.
         fallback_length = sum(
-            _round_up_to_multiple(int(input_lengths[index].item()), padding_multiple)
+            _round_up_to_multiple(rows_by_index[index].total_length, padding_multiple)
             for index in row_indices
         )
         if fallback_length > bin_capacity:
@@ -675,15 +760,47 @@ def _get_shared_prefix_execution_shape(
     cfg: PolicyConfig,
     bin_capacity: int,
     padding_multiple: Optional[int] = None,
-) -> tuple[int, int]:
-    """Return execution-unit count and maximum physical token length."""
+) -> SharedPrefixExecutionPlan:
+    """Plan once and return count, maximum physical length, and the units.
+
+    The units are returned alongside the shape so callers can hand them back to
+    :func:`get_microbatch_iterator` / :func:`process_shared_prefix_microbatch`
+    instead of planning the same batch a second time.
+    """
     units = _plan_prescribed_shared_prefix_execution_units(
         data_dict,
         cfg=cfg,
         bin_capacity=bin_capacity,
         padding_multiple=padding_multiple,
     )
-    return len(units), max(unit.physical_length for unit in units)
+    return SharedPrefixExecutionPlan(units=units)
+
+
+def plan_shared_prefix_execution_units(
+    data: BatchedDataDict[Any],
+    *,
+    cfg: PolicyConfig,
+    bin_capacity: int,
+) -> tuple[_SharedPrefixExecutionUnit, ...]:
+    """Plan a local batch's shared-prefix forwards once for reuse by the iterator.
+
+    Workers call this before :func:`get_microbatch_iterator` so the CPU planning
+    (one host copy of ``input_ids`` plus the exact per-row prompt tuples) runs a
+    single time per call. The returned tuple is passed back through
+    ``shared_prefix_execution_units`` and reused by
+    :func:`process_shared_prefix_microbatch` instead of re-planning on the
+    device copy of the batch. Row indices address ``data`` in its given order,
+    which :func:`get_microbatch_iterator` preserves. The topology-derived
+    padding multiple is resolved here exactly as the iterator resolves it.
+    """
+    normalized_data = _normalize_shared_prefix_group_ids(data)
+    *_topology, padding_multiple = _resolve_shared_prefix_execution_topology(cfg)
+    return _get_shared_prefix_execution_shape(
+        normalized_data,
+        cfg=cfg,
+        bin_capacity=bin_capacity,
+        padding_multiple=padding_multiple,
+    ).units
 
 
 def process_shared_prefix_microbatch(
@@ -697,8 +814,15 @@ def process_shared_prefix_microbatch(
     pad_full_seq_to: Optional[int],
     straggler_timer: Optional[StragglerDetector],
     padding_multiple: Optional[int] = None,
+    execution_units: Optional[tuple[_SharedPrefixExecutionUnit, ...]] = None,
 ) -> Iterator[ProcessedMicrobatch]:
-    """Expand one conventional local batch into star and fallback forwards."""
+    """Expand one conventional local batch into star and fallback forwards.
+
+    ``execution_units`` may carry the plan already produced for this exact batch
+    (see :func:`plan_shared_prefix_execution_units`); otherwise the batch is
+    planned here. Planning validates the metadata and copies ``input_ids`` to
+    the host, so callers that already planned should pass the units along.
+    """
     data_dict = _normalize_shared_prefix_group_ids(data_dict)
     if data_dict.get_multimodal_dict():
         raise NotImplementedError(
@@ -728,12 +852,13 @@ def process_shared_prefix_microbatch(
             cp_size=cp_size,
             padding_multiple=padding_multiple,
         )
-    execution_units = _plan_prescribed_shared_prefix_execution_units(
-        data_dict,
-        cfg=cfg,
-        bin_capacity=bin_capacity,
-        padding_multiple=resolved_padding_multiple,
-    )
+    if execution_units is None:
+        execution_units = _plan_prescribed_shared_prefix_execution_units(
+            data_dict,
+            cfg=cfg,
+            bin_capacity=bin_capacity,
+            padding_multiple=resolved_padding_multiple,
+        )
     cp_rank = get_context_parallel_rank() if cp_size > 1 else 0
     source_sequence_length = data_dict["input_ids"].shape[1]
     for unit in execution_units:
