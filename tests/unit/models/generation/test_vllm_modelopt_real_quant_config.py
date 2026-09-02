@@ -1412,6 +1412,21 @@ def test_real_quant_pre_ack_fence_is_device_wide_and_load_does_not_fence(
     assert events == ["load", "detach", "sync"]
 
 
+def test_non_real_quant_refit_preserves_base_fatal_state(monkeypatch):
+    """The ModelOpt subclass must not hide a poisoned unquantized-MoE refit."""
+    backend = _import_vllm_quant_backend(monkeypatch)
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension._nrl_routed_expert_refit_fatal = True
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda _self: False,
+    )
+
+    assert extension._weight_update_errors_are_fatal() is True
+
+
 @pytest.mark.parametrize("load_numel", [0, 10])
 def test_real_quant_rejects_incomplete_modelopt_layerwise_reload(
     monkeypatch, load_numel

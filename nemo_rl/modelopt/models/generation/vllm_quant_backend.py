@@ -519,7 +519,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             raise
 
     def _weight_update_errors_are_fatal(self) -> bool:
-        return self._is_real_quant_model()
+        return self._is_real_quant_model() or super()._weight_update_errors_are_fatal()
 
     def _synchronize_before_ipc_data_ack(self) -> None:
         """Fence all accelerator streams used by ModelOpt post-load methods."""

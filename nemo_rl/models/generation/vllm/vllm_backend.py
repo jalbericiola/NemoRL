@@ -17,6 +17,7 @@ import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
@@ -63,6 +64,230 @@ WeightUpdateFinalizer = Callable[[], None]
 _NATIVE_MTP_PARAMETER_RE = re.compile(r"(?:^|\.)mtp(?:\.|$)")
 
 
+@dataclass(frozen=True)
+class _LayerwiseReloadRoot:
+    """One vLLM runtime-layout owner participating in an online refit."""
+
+    owner: str
+    label: str
+    module: torch.nn.Module
+    model_config: Any
+    kernel_parameters: tuple[tuple[str, torch.nn.Parameter, int], ...]
+
+
+def _detach_pending_layerwise_weights(
+    reload_roots: Sequence[torch.nn.Module],
+    source_storage_ptrs: set[int],
+) -> bool:
+    """Own deferred loader inputs before a transport buffer may be reused."""
+    if not source_storage_ptrs:
+        return False
+
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    detached_accelerator_weight = False
+    for reload_root in reload_roots:
+        for module in reload_root.modules():
+            info = get_layerwise_info(module)
+            for _, arguments in info.loaded_weights:
+                loaded_weight = arguments.arguments.get("loaded_weight")
+                if not isinstance(loaded_weight, torch.Tensor):
+                    continue
+                if loaded_weight.untyped_storage().data_ptr() in source_storage_ptrs:
+                    arguments.arguments["loaded_weight"] = loaded_weight.clone()
+                    detached_accelerator_weight |= loaded_weight.device.type != "cpu"
+    return detached_accelerator_weight
+
+
+def _find_unquantized_routed_expert_roots(
+    model: torch.nn.Module,
+    *,
+    owner: str,
+    model_config: Any,
+) -> list[_LayerwiseReloadRoot]:
+    """Find vLLM modules whose checkpoint and runtime layouts differ."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    roots: list[_LayerwiseReloadRoot] = []
+    seen: set[int] = set()
+    for module_name, module in model.named_modules():
+        if not isinstance(
+            getattr(module, "quant_method", None), UnquantizedFusedMoEMethod
+        ):
+            continue
+        if not isinstance(module, RoutedExperts):
+            raise RuntimeError(
+                "vLLM unquantized fused-MoE refit found an unsupported owner: "
+                f"{owner}.{module_name or '<root>'} ({type(module).__name__})"
+            )
+        if module.moe_config.has_bias:
+            raise RuntimeError(
+                "vLLM routed-expert refit does not yet cover expert biases: "
+                f"{owner}.{module_name or '<root>'}"
+            )
+        module_id = id(module)
+        if module_id in seen:
+            continue
+        seen.add(module_id)
+        roots.append(
+            _LayerwiseReloadRoot(
+                owner=owner,
+                label=f"{owner}.{module_name or '<root>'}",
+                module=module,
+                model_config=model_config,
+                kernel_parameters=tuple(
+                    (
+                        param_name,
+                        getattr(module, param_name),
+                        getattr(module, param_name).data_ptr(),
+                    )
+                    for param_name in ("w13_weight", "w2_weight")
+                ),
+            )
+        )
+    return roots
+
+
+def _require_routed_expert_reload_metadata(root: _LayerwiseReloadRoot) -> None:
+    """Reject a reload root without canonical pre-processing metadata."""
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    info = get_layerwise_info(root.module)
+    restore_params, _restore_buffers = info.restore_metadata
+    required_params = {"w13_weight", "w2_weight"}
+    missing = required_params - set(restore_params)
+    intermediate_size = getattr(
+        root.module.moe_config,
+        "intermediate_size_per_partition_unpadded",
+        None,
+    )
+    hidden_size = getattr(root.module.moe_config, "hidden_dim_unpadded", None)
+    if not isinstance(intermediate_size, int) or not isinstance(hidden_size, int):
+        raise RuntimeError(
+            "vLLM routed-expert refit requires explicit unpadded dimensions for "
+            f"{root.label}"
+        )
+    w13_intermediate_size = intermediate_size * (
+        2 if root.module.moe_config.is_act_and_mul else 1
+    )
+    expected_shapes = {
+        "w13_weight": (
+            root.module.local_num_experts,
+            w13_intermediate_size,
+            hidden_size,
+        ),
+        "w2_weight": (
+            root.module.local_num_experts,
+            hidden_size,
+            intermediate_size,
+        ),
+    }
+    malformed = {
+        name
+        for name in required_params & set(restore_params)
+        if not restore_params[name].is_meta
+        or tuple(restore_params[name].shape) != expected_shapes[name]
+    }
+    if missing or malformed:
+        raise RuntimeError(
+            "vLLM layerwise refit metadata is unavailable or non-canonical for "
+            f"{root.label}: missing={sorted(missing)}, malformed={sorted(malformed)}"
+        )
+    if info.can_load() or info.kernel_tensors is not None or info.loaded_weights:
+        raise RuntimeError(
+            f"vLLM layerwise refit root is already active or dirty: {root.label}"
+        )
+
+
+def _require_routed_expert_kernel_storage_preserved(
+    roots: Sequence[_LayerwiseReloadRoot],
+) -> None:
+    """Require reload to retain the parameters captured by CUDA graphs."""
+    changed: list[str] = []
+    for root in roots:
+        for name, original_parameter, original_data_ptr in root.kernel_parameters:
+            current_parameter = getattr(root.module, name, None)
+            if (
+                current_parameter is not original_parameter
+                or current_parameter.data_ptr() != original_data_ptr
+            ):
+                changed.append(f"{root.label}.{name}")
+    if changed:
+        raise RuntimeError(
+            f"vLLM routed-expert refit replaced captured kernel storage: {changed[:8]}"
+        )
+
+
+@contextmanager
+def _mask_routed_expert_quant_methods(
+    roots: Sequence[_LayerwiseReloadRoot],
+) -> Iterator[None]:
+    """Exclude already-finalized roots from whole-model post-processing."""
+    original_methods: list[tuple[torch.nn.Module, Any]] = []
+    try:
+        for root in roots:
+            quant_method = getattr(root.module, "quant_method", None)
+            if quant_method is None:
+                raise RuntimeError(
+                    f"vLLM routed-expert quant method is unavailable: {root.label}"
+                )
+            original_methods.append((root.module, quant_method))
+            root.module.quant_method = None
+        yield
+    finally:
+        for module, quant_method in reversed(original_methods):
+            module.quant_method = quant_method
+
+
+def _require_complete_routed_expert_roots(
+    roots: Sequence[_LayerwiseReloadRoot],
+) -> None:
+    """Fail closed when COMPLETE arrives before every reload root finalized."""
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    incomplete: list[str] = []
+    for root in roots:
+        info = get_layerwise_info(root.module)
+        if not info.can_load():
+            continue
+        buffered_names = sorted({name for name, _ in info.loaded_weights})
+        incomplete.append(
+            f"{root.label}: loaded={info.load_numel}/"
+            f"{info.load_numel_total}, buffered={buffered_names}"
+        )
+    if incomplete:
+        details = "; ".join(incomplete[:8])
+        suffix = "; ..." if len(incomplete) > 8 else ""
+        raise RuntimeError(
+            "vLLM routed-expert layerwise refit is incomplete for "
+            f"{len(incomplete)} root(s): {details}{suffix}"
+        )
+
+
+def _require_bounded_routed_expert_retention(
+    roots: Sequence[_LayerwiseReloadRoot],
+) -> None:
+    """Reject a reordered stream that retains multiple roots per model owner."""
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    started_by_owner: dict[str, list[str]] = {}
+    for root in roots:
+        info = get_layerwise_info(root.module)
+        if info.can_load() and info.loaded_weights:
+            started_by_owner.setdefault(root.owner, []).append(root.label)
+    violations = {
+        owner: labels for owner, labels in started_by_owner.items() if len(labels) > 1
+    }
+    if violations:
+        raise RuntimeError(
+            "vLLM routed-expert refit retained multiple partial roots for one "
+            f"owner; checkpoint weights must be layer ordered: {violations}"
+        )
+
+
 def _format_refit_key_error(label: str, keys: set[str]) -> str:
     """Format a bounded refit-key diagnostic."""
     ordered = sorted(keys)
@@ -90,9 +315,7 @@ def _split_main_and_native_mtp_weights(
     native_mtp_weights: list[tuple[str, torch.Tensor]] = []
     for name, tensor in weights:
         destination = (
-            native_mtp_weights
-            if _is_native_mtp_parameter_name(name)
-            else main_weights
+            native_mtp_weights if _is_native_mtp_parameter_name(name) else main_weights
         )
         destination.append((name, tensor))
     return main_weights, native_mtp_weights
@@ -231,6 +454,8 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+    _nrl_active_routed_expert_reload_roots: tuple[_LayerwiseReloadRoot, ...] = ()
+    _nrl_routed_expert_refit_fatal: bool = False
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -551,6 +776,45 @@ class VllmInternalWorkerExtension:
         with set_current_vllm_config(self.model_runner.vllm_config):
             process_weights_after_loading(draft_model, draft_model_config, self.device)
 
+    def _get_routed_expert_reload_roots(
+        self,
+    ) -> tuple[_LayerwiseReloadRoot, ...]:
+        """Return disjoint main and co-trained-MTP runtime-layout roots."""
+        roots = _find_unquantized_routed_expert_roots(
+            self.model_runner.model,
+            owner="main",
+            model_config=self.model_config,
+        )
+        if self._mtp_drafter_refit_enabled():
+            draft_model = self._get_drafter_model()
+            if draft_model is None:
+                raise RuntimeError(
+                    "MTP drafter refit is enabled but its model is unavailable"
+                )
+            speculative_config = self.model_runner.vllm_config.speculative_config
+            draft_model_config = getattr(speculative_config, "draft_model_config", None)
+            if draft_model_config is None:
+                raise RuntimeError(
+                    "MTP drafter refit is enabled without a draft model config"
+                )
+            roots.extend(
+                _find_unquantized_routed_expert_roots(
+                    draft_model,
+                    owner="mtp_drafter",
+                    model_config=draft_model_config,
+                )
+            )
+
+        labels_by_id: dict[int, str] = {}
+        for root in roots:
+            existing_label = labels_by_id.setdefault(id(root.module), root.label)
+            if existing_label != root.label:
+                raise RuntimeError(
+                    "vLLM routed-expert reload root has multiple owners: "
+                    f"{existing_label}, {root.label}"
+                )
+        return tuple(roots)
+
     def load_mtp_weights_from_disk(self, model_path: str) -> bool:
         """Load only the MTP (multi-token-prediction) draft weights from disk.
 
@@ -625,24 +889,60 @@ class VllmInternalWorkerExtension:
         weights, dispatches policy weights through the configured refit loader,
         and loads draft weights into the drafter model.
         """
-        if (
-            "Gemma3ForConditionalGeneration"
-            in self.model_runner.vllm_config.model_config.architectures
-        ):
-            for idx, (key, weight) in enumerate(weights):
-                weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
+        weights = list(weights)
+        source_storage_ptrs = {
+            tensor.untyped_storage().data_ptr()
+            for _name, tensor in weights
+            if isinstance(tensor, torch.Tensor)
+        }
+        load_succeeded = False
+        detached_accelerator_weight = False
+        try:
+            if (
+                "Gemma3ForConditionalGeneration"
+                in self.model_runner.vllm_config.model_config.architectures
+            ):
+                for idx, (key, weight) in enumerate(weights):
+                    weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
-        policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
-        main_policy_weights, _native_mtp_weights = (
-            _split_main_and_native_mtp_weights(policy_weights)
-        )
-        if main_policy_weights:
-            self._load_hf_weights(main_policy_weights)
-        # Eagle3 draft weights are exported with the `draft.` prefix.
-        self._load_draft_weights(draft_weights)
-        # MTP drafters co-trained with the policy receive their weights from the
-        # policy stream (no `draft.` prefix), so feed it the policy weights too.
-        self._maybe_refit_mtp_drafter(policy_weights)
+            policy_weights, draft_weights = self._split_policy_and_draft_weights(
+                weights
+            )
+            main_policy_weights, _native_mtp_weights = (
+                _split_main_and_native_mtp_weights(policy_weights)
+            )
+            if main_policy_weights:
+                self._load_hf_weights(main_policy_weights)
+            # Eagle3 draft weights are exported with the `draft.` prefix.
+            self._load_draft_weights(draft_weights)
+            # MTP drafters co-trained with the policy receive their weights from the
+            # policy stream (no `draft.` prefix), so feed it the policy weights too.
+            self._maybe_refit_mtp_drafter(policy_weights)
+            load_succeeded = True
+        finally:
+            try:
+                detached_accelerator_weight = _detach_pending_layerwise_weights(
+                    tuple(
+                        root.module
+                        for root in self._nrl_active_routed_expert_reload_roots
+                    ),
+                    source_storage_ptrs,
+                )
+            except Exception:
+                if load_succeeded:
+                    raise
+                logger.exception(
+                    "Failed to detach deferred vLLM weights while propagating "
+                    "an earlier loader error"
+                )
+            if detached_accelerator_weight:
+                # Collective refit alternates side streams between batches.
+                # Complete this clone before the next stream can replay it.
+                torch.accelerator.synchronize()
+            if load_succeeded:
+                _require_bounded_routed_expert_retention(
+                    self._nrl_active_routed_expert_reload_roots
+                )
 
     def _get_sparse_delta_applier(self) -> Any:
         if self._sparse_delta_applier is None:
@@ -662,11 +962,112 @@ class VllmInternalWorkerExtension:
         self, transport: WeightUpdateTransport
     ) -> Iterator[WeightUpdateFinalizer]:
         """Provide setup/finalization around a transport-owned weight update."""
-        del transport
         from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
         )
+
+        if self._nrl_routed_expert_refit_fatal:
+            raise RuntimeError(
+                "vLLM worker is poisoned by an earlier routed-expert refit failure"
+            )
+
+        # nccl_reshard writes directly into final parameter storage and owns its
+        # own canonicalization. The layerwise path is for checkpoint-format
+        # batches consumed by the IPC and collective autoloaders only.
+        reload_roots: tuple[_LayerwiseReloadRoot, ...] = ()
+        if transport in ("ipc", "collective"):
+            try:
+                reload_roots = self._get_routed_expert_reload_roots()
+            except Exception:
+                # Root discovery is part of the transaction contract. If it
+                # fails for a model that may need checkpoint-layout reload,
+                # do not let the transport turn that into a recoverable False.
+                self._nrl_routed_expert_refit_fatal = True
+                raise
+        if reload_roots:
+            # Leave this set after any failure so the transport re-raises and
+            # the actor cannot keep serving a model left on meta/partial state.
+            self._nrl_routed_expert_refit_fatal = True
+            from vllm.model_executor.model_loader.reload import (
+                finalize_layerwise_reload,
+                initialize_layerwise_reload,
+            )
+
+            for root in reload_roots:
+                _require_routed_expert_reload_metadata(root)
+
+            main_root_count = sum(
+                root.label.startswith("main.") for root in reload_roots
+            )
+            draft_root_count = len(reload_roots) - main_root_count
+            finalized = False
+            transaction_succeeded = False
+
+            def finalize_routed_experts() -> None:
+                nonlocal finalized
+                if finalized:
+                    raise RuntimeError(
+                        "vLLM routed-expert refit finalizer was called more than once"
+                    )
+                with torch.device(self.device):
+                    _require_complete_routed_expert_roots(reload_roots)
+                    # Stock vLLM online loaders have already rebuilt every complete
+                    # root from its canonical (3-D, unpadded) reload metadata. The
+                    # explicit finalizer is retained for bookkeeping and backend
+                    # cleanup, but is reached only after proving no root is partial.
+                    for root in reload_roots:
+                        finalize_layerwise_reload(root.module, root.model_config)
+                    # Preserve the existing whole-model and MTP-drafter hooks for
+                    # every non-RoutedExperts module. The selected roots have
+                    # already been converted exactly once by vLLM's layerwise
+                    # finalizer, so mask only their quant methods during the pass.
+                    with _mask_routed_expert_quant_methods(reload_roots):
+                        process_weights_after_loading(
+                            self.model_runner.model, self.model_config, self.device
+                        )
+                        self._maybe_process_mtp_drafter_after_loading()
+                    _require_routed_expert_kernel_storage_preserved(reload_roots)
+                    torch.accelerator.synchronize()
+                finalized = True
+                logger.info(
+                    "VLLM_ROUTED_EXPERT_REFIT_FINALIZED transport=%s "
+                    "main_roots=%d mtp_drafter_roots=%d",
+                    transport,
+                    main_root_count,
+                    draft_root_count,
+                )
+
+            try:
+                # vLLM may reconstruct a padded runtime kernel as soon as the
+                # final logical checkpoint shard for one root arrives.
+                with set_current_vllm_config(self.model_runner.vllm_config):
+                    with torch.device(self.device):
+                        for root in reload_roots:
+                            initialize_layerwise_reload(root.module)
+                    self._nrl_active_routed_expert_reload_roots = reload_roots
+                    logger.info(
+                        "VLLM_ROUTED_EXPERT_REFIT_INITIALIZED transport=%s "
+                        "main_roots=%d mtp_drafter_roots=%d",
+                        transport,
+                        main_root_count,
+                        draft_root_count,
+                    )
+                    yield finalize_routed_experts
+                    if not finalized:
+                        raise RuntimeError(
+                            "vLLM routed-expert refit exited without finalization"
+                        )
+                    # Preserve the original post-ACK FP8-KV second pass
+                    # without converting routed-expert kernels twice.
+                    with _mask_routed_expert_quant_methods(reload_roots):
+                        self._maybe_process_fp8_kv_cache()
+                    transaction_succeeded = True
+            finally:
+                self._nrl_active_routed_expert_reload_roots = ()
+                if transaction_succeeded:
+                    self._nrl_routed_expert_refit_fatal = False
+            return
 
         def finalize() -> None:
             with set_current_vllm_config(self.model_runner.vllm_config):
@@ -682,10 +1083,15 @@ class VllmInternalWorkerExtension:
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
-        return False
+        return self._nrl_routed_expert_refit_fatal
 
     def _synchronize_before_ipc_data_ack(self) -> None:
         """Fence work consuming one IPC data batch before its acknowledgment."""
+        if self._nrl_active_routed_expert_reload_roots:
+            # FlashInfer/TRTLLM post-load conversion may dispatch outside the
+            # current stream when a logically complete root is finalized.
+            torch.accelerator.synchronize()
+            return
         torch.cuda.current_stream().synchronize()
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")

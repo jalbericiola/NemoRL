@@ -33,7 +33,7 @@ def _make_collective_update_extension(backend):
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
-    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.model_runner = SimpleNamespace(model=torch.nn.Module(), vllm_config=object())
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
@@ -87,6 +87,85 @@ def _patch_vllm_postload(monkeypatch):
     return process_weights
 
 
+def _make_padded_routed_expert_reload_fixture(monkeypatch):
+    """Build a real vLLM reload root with distinct checkpoint/kernel layouts."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        record_metadata_for_reloading,
+    )
+
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.local_num_experts = 2
+    layer.moe_config = SimpleNamespace(
+        has_bias=False,
+        is_act_and_mul=False,
+        intermediate_size_per_partition_unpadded=3,
+        hidden_dim_unpadded=4,
+    )
+    quant_method = UnquantizedFusedMoEMethod.__new__(UnquantizedFusedMoEMethod)
+    torch.nn.Module.__init__(quant_method)
+    layer.quant_method = quant_method
+
+    def expert_weight_loader(
+        param,
+        loaded_weight,
+        weight_name,
+        shard_id,
+        expert_id,
+        return_success=False,
+    ):
+        del weight_name
+        if shard_id == "w1":
+            destination = param.data[expert_id]
+        elif shard_id == "w2":
+            destination = param.data[expert_id]
+        else:
+            raise AssertionError(f"unexpected shard: {shard_id}")
+        destination.copy_(loaded_weight)
+        return True if return_success else None
+
+    for name, shape in (("w13_weight", (2, 3, 4)), ("w2_weight", (2, 4, 3))):
+        param = torch.nn.Parameter(torch.zeros(shape), requires_grad=False)
+        param.weight_loader = expert_weight_loader
+        layer.register_parameter(name, param)
+
+    # vLLM records these canonical 3-D shapes immediately after construction,
+    # before its initial checkpoint load and kernel post-processing.
+    record_metadata_for_reloading(layer)
+
+    process_calls = []
+
+    def process_weights_after_loading(_quant_method, routed_experts):
+        process_calls.append(routed_experts)
+        canonical_w13 = routed_experts.w13_weight.detach()
+        canonical_w2 = routed_experts.w2_weight.detach()
+        padded_w13 = torch.cat(
+            (canonical_w13, torch.zeros_like(canonical_w13[:, :1])), dim=1
+        ).reshape(2, 1, 4, 4)
+        padded_w2 = torch.cat(
+            (canonical_w2, torch.zeros_like(canonical_w2[..., :1])), dim=-1
+        ).reshape(2, 4, 2, 2)
+        for name, value in (("w13_weight", padded_w13), ("w2_weight", padded_w2)):
+            old_param = getattr(routed_experts, name)
+            new_param = torch.nn.Parameter(value, requires_grad=False)
+            new_param.weight_loader = old_param.weight_loader
+            setattr(routed_experts, name, new_param)
+
+    monkeypatch.setattr(
+        UnquantizedFusedMoEMethod,
+        "process_weights_after_loading",
+        process_weights_after_loading,
+    )
+    # Emulate the cold-load conversion from canonical 3-D tensors to a padded
+    # 4-D FlashInfer/TRTLLM runtime layout.
+    layer.quant_method.process_weights_after_loading(layer)
+    return layer, process_calls
+
+
 def _make_mtp_refit_extension(
     *, method="mtp", from_disk=False, has_drafter=True, draft_model_config=None
 ):
@@ -120,6 +199,289 @@ def _make_mtp_refit_extension(
 
 
 @pytest.mark.vllm
+def test_routed_expert_reload_uses_canonical_metadata_and_preserves_kernel_storage(
+    monkeypatch,
+):
+    """A padded 4-D cold kernel must accept 2-D per-expert refit shards safely."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    layer, process_calls = _make_padded_routed_expert_reload_fixture(monkeypatch)
+    extension, roots = _make_routed_expert_lifecycle_extension(vllm_backend, layer)
+    assert [root.label for root in roots] == ["main.experts"]
+    root = roots[0]
+    vllm_backend._require_routed_expert_reload_metadata(root)
+    legacy_quant_methods = []
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config",
+        lambda _config: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda _model, _config, _device: legacy_quant_methods.append(
+            layer.quant_method
+        ),
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    runtime_params = {
+        name: getattr(layer, name) for name in ("w13_weight", "w2_weight")
+    }
+    runtime_ptrs = {
+        name: param.untyped_storage().data_ptr()
+        for name, param in runtime_params.items()
+    }
+    assert tuple(runtime_params["w13_weight"].shape) == (2, 1, 4, 4)
+    assert tuple(runtime_params["w2_weight"].shape) == (2, 4, 2, 2)
+
+    expected_w13 = torch.zeros(2, 3, 4)
+    expected_w2 = torch.zeros(2, 4, 3)
+
+    def load(name, tensor, shard_id, expert_id):
+        param = getattr(layer, name)
+        param.weight_loader(
+            param,
+            tensor,
+            f"experts.{expert_id}.{shard_id}.weight",
+            shard_id,
+            expert_id,
+        )
+
+    with extension._weight_update_lifecycle("ipc") as finish:
+        info = get_layerwise_info(layer)
+        restore_params, _ = info.restore_metadata
+        assert tuple(restore_params["w13_weight"].shape) == (2, 3, 4)
+        assert tuple(restore_params["w2_weight"].shape) == (2, 4, 3)
+        assert info.load_numel_total == 48
+
+        # Split the first root across an IPC-style batch boundary. The deferred
+        # BoundArguments must own a clone before the sender reuses this storage.
+        up0 = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        expected_w13[0].copy_(up0)
+        load("w13_weight", up0, "w1", 0)
+        vllm_backend._detach_pending_layerwise_weights(
+            (layer,), {up0.untyped_storage().data_ptr()}
+        )
+        deferred_up0 = info.loaded_weights[0][1].arguments["loaded_weight"]
+        assert (
+            deferred_up0.untyped_storage().data_ptr()
+            != up0.untyped_storage().data_ptr()
+        )
+        up0.fill_(-999)
+
+        values = [
+            ("w2_weight", torch.full((4, 3), 30.0), "w2", 0),
+            ("w13_weight", torch.full((3, 4), 40.0), "w1", 1),
+            ("w2_weight", torch.full((4, 3), 60.0), "w2", 1),
+        ]
+        for name, tensor, shard_id, expert_id in values:
+            if shard_id == "w1":
+                expected_w13[expert_id].copy_(tensor)
+            else:
+                expected_w2[expert_id].copy_(tensor)
+            load(name, tensor, shard_id, expert_id)
+
+        assert info.can_load() is False
+        finish()
+
+    # Stock vLLM reaches the exact canonical total (unpadded 464 in the real
+    # model), converts once, copies into cold kernel storage, and resets itself.
+    assert info.can_load() is False
+    assert len(process_calls) == 2
+    assert legacy_quant_methods == [None]
+    assert extension._weight_update_errors_are_fatal() is False
+    for name, param in runtime_params.items():
+        assert getattr(layer, name) is param
+        assert param.untyped_storage().data_ptr() == runtime_ptrs[name]
+
+    expected_padded_w13 = torch.cat(
+        (expected_w13, torch.zeros_like(expected_w13[:, :1])), dim=1
+    ).reshape(2, 1, 4, 4)
+    expected_padded_w2 = torch.cat(
+        (expected_w2, torch.zeros_like(expected_w2[..., :1])), dim=-1
+    ).reshape(2, 4, 2, 2)
+    torch.testing.assert_close(layer.w13_weight, expected_padded_w13)
+    torch.testing.assert_close(layer.w2_weight, expected_padded_w2)
+
+    assert layer.quant_method is not None
+
+
+def _make_routed_expert_lifecycle_extension(backend, layer):
+    model = torch.nn.Module()
+    model.add_module("experts", layer)
+    model_config = SimpleNamespace(quantization=None, dtype=torch.float32)
+    vllm_config = object()
+    extension = backend.VllmInternalWorkerExtension.__new__(
+        backend.VllmInternalWorkerExtension
+    )
+    extension.device = torch.device("cpu")
+    extension.model_config = model_config
+    extension.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    extension._nrl_active_routed_expert_reload_roots = ()
+    extension._nrl_routed_expert_refit_fatal = False
+    extension._maybe_process_mtp_drafter_after_loading = MagicMock()
+    extension._maybe_process_fp8_kv_cache = MagicMock()
+    roots = tuple(
+        backend._find_unquantized_routed_expert_roots(
+            model,
+            owner="main",
+            model_config=model_config,
+        )
+    )
+    extension._get_routed_expert_reload_roots = MagicMock(return_value=roots)
+    return extension, roots
+
+
+@pytest.mark.vllm
+def test_routed_expert_roots_include_mtp_drafter_but_not_mamba(monkeypatch):
+    """Only main/draft expert owners enter reload; ordinary Mamba state does not."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    main_experts, _ = _make_padded_routed_expert_reload_fixture(monkeypatch)
+    draft_experts, _ = _make_padded_routed_expert_reload_fixture(monkeypatch)
+    main_model = torch.nn.Module()
+    main_model.add_module("experts", main_experts)
+    main_model.add_module("mamba_conv", torch.nn.Conv1d(2, 2, 3, groups=2))
+    draft_model = torch.nn.Module()
+    draft_model.add_module("experts", draft_experts)
+    draft_model_config = object()
+    extension = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    extension.model_config = object()
+    extension._mtp_drafter_from_disk = False
+    extension.model_runner = SimpleNamespace(
+        model=main_model,
+        drafter=SimpleNamespace(model=draft_model),
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="mtp", draft_model_config=draft_model_config
+            )
+        ),
+    )
+    conv_parameter = main_model.mamba_conv.weight
+
+    roots = extension._get_routed_expert_reload_roots()
+
+    assert [(root.owner, root.label) for root in roots] == [
+        ("main", "main.experts"),
+        ("mtp_drafter", "mtp_drafter.experts"),
+    ]
+    assert [root.module for root in roots] == [main_experts, draft_experts]
+    assert roots[1].model_config is draft_model_config
+    assert main_model.mamba_conv.weight is conv_parameter
+
+
+@pytest.mark.vllm
+def test_routed_expert_lifecycle_rejects_partial_root_and_stays_fatal(monkeypatch):
+    """COMPLETE cannot process a partially loaded root or leave it recoverable."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from vllm.model_executor.model_loader import reload as reload_module
+
+    layer, _ = _make_padded_routed_expert_reload_fixture(monkeypatch)
+    extension, _roots = _make_routed_expert_lifecycle_extension(vllm_backend, layer)
+    native_finalize = MagicMock()
+    monkeypatch.setattr(reload_module, "finalize_layerwise_reload", native_finalize)
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config",
+        lambda _config: contextlib.nullcontext(),
+    )
+
+    with pytest.raises(RuntimeError, match="layerwise refit is incomplete"):
+        with extension._weight_update_lifecycle("collective") as finish:
+            param = layer.w13_weight
+            param.weight_loader(
+                param,
+                torch.ones(3, 4),
+                "experts.0.up_proj.weight",
+                "w1",
+                0,
+            )
+            finish()
+
+    native_finalize.assert_not_called()
+    assert extension._weight_update_errors_are_fatal() is True
+    assert extension._nrl_active_routed_expert_reload_roots == ()
+    with pytest.raises(RuntimeError, match="poisoned by an earlier"):
+        with extension._weight_update_lifecycle("nccl_reshard"):
+            pytest.fail("a poisoned worker must reject every later transport")
+
+
+@pytest.mark.vllm
+def test_routed_expert_lifecycle_keeps_poison_when_fp8_postpass_fails(monkeypatch):
+    """A failure after COMPLETE must still prevent the worker from serving."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from vllm.model_executor.model_loader import reload as reload_module
+
+    layer, _ = _make_padded_routed_expert_reload_fixture(monkeypatch)
+    extension, _roots = _make_routed_expert_lifecycle_extension(vllm_backend, layer)
+    extension._maybe_process_fp8_kv_cache.side_effect = RuntimeError("kv failed")
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config",
+        lambda _config: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        reload_module, "initialize_layerwise_reload", lambda _root: None
+    )
+    monkeypatch.setattr(
+        reload_module,
+        "finalize_layerwise_reload",
+        lambda _root, _config: None,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda _model, _config, _device: None,
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    with pytest.raises(RuntimeError, match="kv failed"):
+        with extension._weight_update_lifecycle("ipc") as finish:
+            finish()
+
+    assert extension._weight_update_errors_are_fatal() is True
+    assert extension._nrl_active_routed_expert_reload_roots == ()
+
+
+@pytest.mark.vllm
+def test_nccl_reshard_does_not_enter_routed_expert_layerwise_reload(monkeypatch):
+    """The bulk in-place transport keeps its existing non-layerwise lifecycle."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    extension = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    extension.device = torch.device("cpu")
+    extension.model_config = SimpleNamespace(quantization=None, dtype=torch.float32)
+    extension.model_runner = SimpleNamespace(
+        model=torch.nn.Module(), vllm_config=object()
+    )
+    extension._nrl_routed_expert_refit_fatal = False
+    extension._get_routed_expert_reload_roots = MagicMock()
+    extension._maybe_process_mtp_drafter_after_loading = MagicMock()
+    extension._maybe_process_fp8_kv_cache = MagicMock()
+    process_weights = MagicMock()
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config",
+        lambda _config: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process_weights,
+    )
+
+    with extension._weight_update_lifecycle("nccl_reshard") as finish:
+        finish()
+
+    extension._get_routed_expert_reload_roots.assert_not_called()
+    process_weights.assert_called_once_with(
+        extension.model_runner.model,
+        extension.model_config,
+        extension.device,
+    )
+    extension._maybe_process_fp8_kv_cache.assert_called_once_with()
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize("with_mtp", [False, True])
 def test_update_weights_from_collective_processes_weights_after_loading(
     monkeypatch, with_mtp
@@ -128,7 +490,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(
 
     call_order = []
     process_calls = []
-    draft_model = object() if with_mtp else None
+    draft_model = torch.nn.Module() if with_mtp else None
     draft_model_config = object() if with_mtp else None
 
     def process_weights_after_loading(model, model_config, device):
@@ -530,8 +892,49 @@ def test_load_weights_with_only_native_mtp_weights_skips_main_loader(monkeypatch
     ext._load_weights(native_mtp_weights)
 
     main_model.load_weights.assert_not_called()
-    ext._load_draft_weights.assert_not_called()
+    # The legacy dispatcher calls the Eagle3 loader for every bucket; the
+    # production loader treats an empty list as a no-op.
+    ext._load_draft_weights.assert_called_once_with([])
     ext._maybe_refit_mtp_drafter.assert_called_once_with(native_mtp_weights)
+
+
+@pytest.mark.vllm
+def test_load_weights_fences_detached_accelerator_clone_before_return(monkeypatch):
+    """An alternating collective stream cannot consume an unfinished clone."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    extension = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    extension.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(model_config=SimpleNamespace(architectures=[]))
+    )
+    extension._nrl_active_routed_expert_reload_roots = (
+        SimpleNamespace(module=object()),
+    )
+    events = []
+    extension._load_hf_weights = lambda _weights: events.append("load")
+    extension._load_draft_weights = lambda _weights: None
+    extension._maybe_refit_mtp_drafter = lambda _weights: None
+    monkeypatch.setattr(
+        vllm_backend,
+        "_detach_pending_layerwise_weights",
+        lambda _roots, _ptrs: events.append("clone") or True,
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "_require_bounded_routed_expert_retention",
+        lambda _roots: events.append("bounded"),
+    )
+    monkeypatch.setattr(
+        vllm_backend.torch.accelerator,
+        "synchronize",
+        lambda: events.append("sync"),
+    )
+
+    extension._load_weights([("model.weight", torch.ones(1))])
+
+    assert events == ["load", "clone", "sync", "bounded"]
 
 
 @pytest.mark.vllm
