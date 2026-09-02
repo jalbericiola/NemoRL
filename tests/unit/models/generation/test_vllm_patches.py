@@ -29,13 +29,17 @@ The two port patches ship their own suites. These cover the remaining two:
 """
 
 import ast
+import builtins
 import logging
 import os
+import sys
+import types
 
 import pytest
 
 from nemo_rl.models.generation.vllm import patches
 from tests.unit.models.generation.vllm_patch_source_utils import (
+    patch_snippets,
     write_unpatched_copy,
 )
 
@@ -52,7 +56,7 @@ def patched_tool_parser_source(tmp_path, monkeypatch):
     """The installed tool_parsers/utils.py, unpatched then patched in tmp."""
     copied = write_unpatched_copy(_TOOL_PARSER_SOURCE, _PATCH_FN, tmp_path / "utils.py")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
-    patches._patch_vllm_tool_parser_namespace_tool(logging.getLogger(__name__))
+    assert patches._patch_vllm_tool_parser_namespace_tool(logging.getLogger(__name__))
     return copied
 
 
@@ -86,8 +90,277 @@ def test_namespace_tool_patch_is_idempotent(patched_tool_parser_source, monkeypa
     monkeypatch.setattr(
         patches, "_get_vllm_file", lambda _relative: str(patched_tool_parser_source)
     )
-    patches._patch_vllm_tool_parser_namespace_tool(logging.getLogger(__name__))
+    assert patches._patch_vllm_tool_parser_namespace_tool(logging.getLogger(__name__))
     assert patched_tool_parser_source.read_text() == before
+
+
+def test_namespace_tool_patch_reports_unknown_source(monkeypatch, tmp_path, caplog):
+    """A moved source anchor must be a hard result, not a warning-only no-op."""
+    tool_parser_source = tmp_path / "utils.py"
+    tool_parser_source.write_text("from openai.types.responses import FunctionTool\n")
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(tool_parser_source)
+    )
+
+    with caplog.at_level(logging.ERROR):
+        applied = patches._patch_vllm_tool_parser_namespace_tool(
+            logging.getLogger(__name__)
+        )
+
+    assert applied is False
+    assert "expected import block not found" in caplog.text
+
+
+def test_namespace_tool_compat_fails_closed(monkeypatch):
+    monkeypatch.delitem(sys.modules, "vllm.tool_parsers.utils", raising=False)
+    monkeypatch.setattr(patches, "_namespace_tool_compat_installed_path", None)
+    monkeypatch.setattr(
+        patches,
+        "version",
+        lambda _distribution: patches._NAMESPACE_TOOL_COMPAT_VLLM_VERSION,
+    )
+    monkeypatch.setattr(
+        patches, "_patch_vllm_tool_parser_namespace_tool", lambda _logger: False
+    )
+
+    with pytest.raises(RuntimeError, match="before importing vLLM"):
+        patches._ensure_vllm_tool_parser_namespace_tool()
+
+
+def test_namespace_tool_compat_rejects_wrong_vllm_version(monkeypatch):
+    monkeypatch.delitem(sys.modules, "vllm.tool_parsers.utils", raising=False)
+    monkeypatch.setattr(patches, "_namespace_tool_compat_installed_path", None)
+    monkeypatch.setattr(patches, "version", lambda _distribution: "0.25.2")
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_tool_parser_namespace_tool",
+        lambda _logger: pytest.fail("source must not be edited for an unknown version"),
+    )
+
+    with pytest.raises(RuntimeError, match="pinned to vLLM 0.25.1, but found 0.25.2"):
+        patches._ensure_vllm_tool_parser_namespace_tool()
+
+
+def test_namespace_tool_compat_rejects_late_install(monkeypatch):
+    monkeypatch.setattr(patches, "_namespace_tool_compat_installed_path", None)
+    monkeypatch.setattr(
+        patches,
+        "version",
+        lambda _distribution: patches._NAMESPACE_TOOL_COMPAT_VLLM_VERSION,
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.tool_parsers.utils", types.ModuleType("tool_parser")
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_tool_parser_namespace_tool",
+        lambda _logger: pytest.fail("late source mutation must not be attempted"),
+    )
+
+    with pytest.raises(RuntimeError, match="imported before"):
+        patches._ensure_vllm_tool_parser_namespace_tool()
+
+
+def test_namespace_tool_compat_allows_repeat_after_safe_import(monkeypatch, tmp_path):
+    monkeypatch.delitem(sys.modules, "vllm.tool_parsers.utils", raising=False)
+    tool_parser_source = tmp_path / "utils.py"
+    tool_parser_source.write_text("patched\n")
+    patch_calls = []
+    monkeypatch.setattr(patches, "_namespace_tool_compat_installed_path", None)
+    monkeypatch.setattr(
+        patches,
+        "version",
+        lambda _distribution: patches._NAMESPACE_TOOL_COMPAT_VLLM_VERSION,
+    )
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(tool_parser_source)
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_tool_parser_namespace_tool",
+        lambda _logger: patch_calls.append("patch") or True,
+    )
+
+    first_logger = patches._ensure_vllm_tool_parser_namespace_tool()
+    loaded_module = types.ModuleType("vllm.tool_parsers.utils")
+    loaded_module.__file__ = str(tool_parser_source)
+    monkeypatch.setitem(sys.modules, "vllm.tool_parsers.utils", loaded_module)
+    second_logger = patches._ensure_vllm_tool_parser_namespace_tool()
+
+    assert second_logger is first_logger
+    assert patch_calls == ["patch"]
+
+
+def test_namespace_tool_compat_rejects_repeat_from_other_origin(monkeypatch, tmp_path):
+    installed_source = tmp_path / "installed" / "utils.py"
+    loaded_source = tmp_path / "loaded" / "utils.py"
+    installed_source.parent.mkdir()
+    loaded_source.parent.mkdir()
+    installed_source.write_text("patched\n")
+    loaded_source.write_text("other\n")
+    monkeypatch.setattr(
+        patches, "_namespace_tool_compat_installed_path", str(installed_source)
+    )
+    monkeypatch.setattr(
+        patches,
+        "version",
+        lambda _distribution: patches._NAMESPACE_TOOL_COMPAT_VLLM_VERSION,
+    )
+    loaded_module = types.ModuleType("vllm.tool_parsers.utils")
+    loaded_module.__file__ = str(loaded_source)
+    monkeypatch.setitem(sys.modules, "vllm.tool_parsers.utils", loaded_module)
+
+    with pytest.raises(RuntimeError, match="unverified path"):
+        patches._ensure_vllm_tool_parser_namespace_tool()
+
+
+def test_locked_file_patch_replaces_atomically_and_preserves_mode(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "source.py"
+    source.write_text("old\n")
+    source.chmod(0o640)
+    real_replace = os.replace
+    replacements = []
+
+    def recording_replace(source_path, destination_path):
+        replacements.append((source_path, destination_path))
+        real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(patches.os, "replace", recording_replace)
+
+    with patches._locked_file_patch(str(source)) as (content, write_back):
+        assert content == "old\n"
+        write_back("new\n")
+
+    assert source.read_text() == "new\n"
+    assert source.stat().st_mode & 0o777 == 0o640
+    assert len(replacements) == 1
+    assert replacements[0][1] == str(source)
+    assert not list(tmp_path.glob(".source.py.patch-*"))
+
+
+def test_apply_patches_installs_namespace_guard_before_first_vllm_import(monkeypatch):
+    """The compatibility source edit must precede vLLM package initialization."""
+    events = []
+
+    monkeypatch.setattr(
+        patches,
+        "_ensure_vllm_tool_parser_namespace_tool",
+        lambda: events.append("namespace-guard"),
+    )
+    monkeypatch.setattr(
+        patches, "_patch_vllm_init_workers_ray", lambda _python, _env: True
+    )
+    for patch_name in (
+        "_patch_vllm_llama_eagle3_own_lm_head",
+        "_patch_vllm_ray_executor_v2_tcpstore_port",
+        "_patch_vllm_shm_broadcast_bind_retry",
+        "_patch_vllm_radio_layerscale_loader",
+    ):
+        monkeypatch.setattr(patches, patch_name, lambda _logger: None)
+
+    fake_envs = types.ModuleType("vllm.envs")
+    fake_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND = True
+    fake_logger = types.ModuleType("vllm.logger")
+    fake_logger.init_logger = logging.getLogger
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.__path__ = []
+    fake_vllm.envs = fake_envs
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.envs", fake_envs)
+    monkeypatch.setitem(sys.modules, "vllm.logger", fake_logger)
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "vllm" or name.startswith("vllm."):
+            if not any(event.startswith("import:") for event in events):
+                assert events == ["namespace-guard"]
+            events.append(f"import:{name}")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    patches._apply_vllm_patches("python")
+
+    assert events[:2] == ["namespace-guard", "import:vllm.envs"]
+
+
+def test_apply_patches_repeats_after_safe_tool_parser_import(monkeypatch, tmp_path):
+    """A second worker setup in one process must recognize its own safe install."""
+    monkeypatch.delitem(sys.modules, "vllm.tool_parsers.utils", raising=False)
+    old_snippet, new_snippet = patch_snippets(_PATCH_FN)
+    tool_parser_source = tmp_path / "utils.py"
+    tool_parser_source.write_text(old_snippet)
+    monkeypatch.setattr(patches, "_namespace_tool_compat_installed_path", None)
+    monkeypatch.setattr(
+        patches,
+        "version",
+        lambda _distribution: patches._NAMESPACE_TOOL_COMPAT_VLLM_VERSION,
+    )
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(tool_parser_source)
+    )
+    monkeypatch.setattr(
+        patches, "_patch_vllm_init_workers_ray", lambda _python, _env: True
+    )
+    for patch_name in (
+        "_patch_vllm_llama_eagle3_own_lm_head",
+        "_patch_vllm_ray_executor_v2_tcpstore_port",
+        "_patch_vllm_shm_broadcast_bind_retry",
+        "_patch_vllm_radio_layerscale_loader",
+    ):
+        monkeypatch.setattr(patches, patch_name, lambda _logger: None)
+
+    fake_envs = types.ModuleType("vllm.envs")
+    fake_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND = True
+    fake_logger = types.ModuleType("vllm.logger")
+    fake_logger.init_logger = logging.getLogger
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.__path__ = []
+    fake_vllm.envs = fake_envs
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.envs", fake_envs)
+    monkeypatch.setitem(sys.modules, "vllm.logger", fake_logger)
+
+    patches._apply_vllm_patches("python")
+    first_content = tool_parser_source.read_text()
+    assert new_snippet in first_content
+
+    loaded_module = types.ModuleType("vllm.tool_parsers.utils")
+    loaded_module.__file__ = str(tool_parser_source)
+    monkeypatch.setitem(sys.modules, "vllm.tool_parsers.utils", loaded_module)
+    patches._apply_vllm_patches("python")
+
+    assert tool_parser_source.read_text() == first_content
+
+
+def test_direct_source_compat_does_not_import_vllm_before_patching(monkeypatch):
+    """Raw ``vllm.LLM`` callers use this helper before their first import."""
+    events = []
+    monkeypatch.setattr(
+        patches,
+        "_ensure_vllm_tool_parser_namespace_tool",
+        lambda: events.append("namespace-guard") or logging.getLogger(__name__),
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_radio_layerscale_loader",
+        lambda _logger: events.append("radio-patch"),
+    )
+
+    real_import = builtins.__import__
+
+    def reject_vllm_import(name, globals=None, locals=None, fromlist=(), level=0):
+        assert not (name == "vllm" or name.startswith("vllm."))
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_vllm_import)
+
+    patches.ensure_vllm_source_compat()
+
+    assert events == ["namespace-guard", "radio-patch"]
 
 
 @pytest.mark.vllm
