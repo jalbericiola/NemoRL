@@ -132,6 +132,12 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
+from nemo_rl.utils.shared_prefix_determinism import (
+    SHARED_PREFIX_DETERMINISM_RECEIPT_DIR_ENV_VAR_NAME,
+    SHARED_PREFIX_DETERMINISM_RECEIPT_PATH_ENV_VAR_NAMES,
+    SHARED_PREFIX_RESULTS_DIR_ENV_VAR_NAME,
+    publish_shared_prefix_determinism_receipt,
+)
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     HFToLocalParamMap,
@@ -223,12 +229,65 @@ def _enable_shared_prefix_deterministic_execution(config: PolicyConfig) -> None:
             "torch deterministic algorithms were not enabled for the "
             f"shared-prefix mode={mode} deterministic worker"
         )
-    log.info(
-        "SHARED_PREFIX_DETERMINISM_ATTESTED mode=%s env_controls=4 "
-        "triton_autotune=absent model_overrides=3 torch_deterministic=true "
-        "total_controls=8",
-        mode,
-    )
+
+    try:
+        configured_env_vars = config["megatron_cfg"]["env_vars"]
+    except KeyError as error:
+        raise RuntimeError(
+            f"shared-prefix mode={mode} deterministic worker requires "
+            "policy.megatron_cfg.env_vars to contain the receipt path contract"
+        ) from error
+    if not isinstance(configured_env_vars, Mapping):
+        raise RuntimeError(
+            f"shared-prefix mode={mode} deterministic worker requires "
+            "policy.megatron_cfg.env_vars to be a mapping"
+        )
+    configured_receipt_paths: dict[str, str] = {}
+    for name in SHARED_PREFIX_DETERMINISM_RECEIPT_PATH_ENV_VAR_NAMES:
+        if name not in configured_env_vars:
+            raise RuntimeError(
+                f"shared-prefix mode={mode} deterministic worker requires "
+                f"policy.megatron_cfg.env_vars.{name}; the field is missing"
+            )
+        configured_value = configured_env_vars[name]
+        if type(configured_value) is not str:
+            raise RuntimeError(
+                f"shared-prefix mode={mode} deterministic worker requires "
+                f"policy.megatron_cfg.env_vars.{name} to be a string; got "
+                f"{configured_value!r}"
+            )
+        effective_value = os.environ.get(name)
+        if effective_value != configured_value:
+            raise RuntimeError(
+                f"shared-prefix mode={mode} deterministic worker requires "
+                f"effective {name} to equal the configured value "
+                f"{configured_value!r}; got {effective_value!r}"
+            )
+        configured_receipt_paths[name] = configured_value
+
+    rank = os.environ.get("RANK")
+    if rank is None:
+        raise RuntimeError(
+            f"shared-prefix mode={mode} deterministic worker requires RANK for "
+            "unique receipt publication"
+        )
+    try:
+        marker = publish_shared_prefix_determinism_receipt(
+            results_dir=configured_receipt_paths[
+                SHARED_PREFIX_RESULTS_DIR_ENV_VAR_NAME
+            ],
+            receipt_dir=configured_receipt_paths[
+                SHARED_PREFIX_DETERMINISM_RECEIPT_DIR_ENV_VAR_NAME
+            ],
+            mode=mode,
+            rank=rank,
+        )
+    except OSError as error:
+        raise RuntimeError(
+            f"shared-prefix mode={mode} deterministic worker could not publish "
+            f"its rank={rank} receipt: {error}"
+        ) from error
+    log.info("%s", marker)
 
 
 def _should_use_router_replay(

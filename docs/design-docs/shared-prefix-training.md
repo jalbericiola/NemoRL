@@ -69,6 +69,8 @@ policy:
       NVTE_ALLOW_NONDETERMINISTIC_ALGO: "0"
       CUBLAS_WORKSPACE_CONFIG: ":4096:8"
       NCCL_ALGO: "Ring"
+      RESULTS_DIR: "/absolute/path/to/arm-results"
+      NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR: "/absolute/path/to/arm-results/shared_prefix_determinism_receipts/job-restart"
     model_overrides:
       deterministic_mode: true
       cross_entropy_loss_fusion: false
@@ -79,6 +81,16 @@ Triton cache autotuning and `TRITON_AUTOTUNE_BLOCK*` overrides must be absent.
 The driver validates the configured values, the worker re-attests the effective
 import-time environment before touching CUDA, and the resolved Megatron Bridge
 provider is checked before model construction continues.
+
+Strict arms must configure both receipt paths above rather than relying on the
+submit shell environment. Each worker verifies that Ray propagated the exact
+configured values, rejects path aliases, traversal, or symlinked directories,
+and atomically creates one read-only receipt named
+`shared_prefix_determinism.<mode>.rank-<RANK>.receipt`. The file contains the
+exact `SHARED_PREFIX_DETERMINISM_ATTESTED ... total_controls=8` log marker with
+no trailing newline. The launcher must provide a new empty receipt directory
+for every job/restart and verify its rank inventory after the process group
+exits.
 
 ## Group Identity and Correctness
 

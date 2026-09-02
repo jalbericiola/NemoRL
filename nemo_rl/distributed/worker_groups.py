@@ -33,6 +33,7 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
 from nemo_rl.utils.shared_prefix_determinism import (
     SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES,
+    SHARED_PREFIX_DETERMINISM_RECEIPT_PATH_ENV_VAR_NAMES,
     SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES,
     SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES,
 )
@@ -51,6 +52,7 @@ _INITIALIZER_IMPORT_ENV_VAR_NAMES = (
 )
 _DETERMINISTIC_INITIALIZER_IMPORT_ENV_VAR_NAMES = (
     *SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES,
+    *SHARED_PREFIX_DETERMINISM_RECEIPT_PATH_ENV_VAR_NAMES,
 )
 
 

@@ -46,7 +46,7 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
-def _set_deterministic_worker_environment(monkeypatch):
+def _set_deterministic_worker_environment(monkeypatch, tmp_path):
     from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
 
     for name in list(os.environ):
@@ -60,6 +60,18 @@ def _set_deterministic_worker_environment(monkeypatch):
             monkeypatch.delenv(name)
     for name, value in worker_module.SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES.items():
         monkeypatch.setenv(name, value)
+    results_dir = tmp_path / "results"
+    receipt_dir = results_dir / "shared_prefix_determinism_receipts" / "123-0"
+    receipt_dir.mkdir(parents=True)
+    monkeypatch.setenv(
+        worker_module.SHARED_PREFIX_RESULTS_DIR_ENV_VAR_NAME,
+        str(results_dir),
+    )
+    monkeypatch.setenv(
+        worker_module.SHARED_PREFIX_DETERMINISM_RECEIPT_DIR_ENV_VAR_NAME,
+        str(receipt_dir),
+    )
+    monkeypatch.setenv("RANK", "0")
     return worker_module
 
 
@@ -67,9 +79,16 @@ def _deterministic_worker_config(worker_module, shared_prefix_config):
     return {
         "shared_prefix_training": shared_prefix_config,
         "megatron_cfg": {
+            "env_vars": {
+                **dict(worker_module.SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES),
+                **{
+                    name: os.environ[name]
+                    for name in worker_module.SHARED_PREFIX_DETERMINISM_RECEIPT_PATH_ENV_VAR_NAMES
+                },
+            },
             "model_overrides": dict(
                 worker_module.SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES
-            )
+            ),
         },
     }
 
@@ -83,9 +102,10 @@ def _deterministic_worker_config(worker_module, shared_prefix_config):
 )
 def test_shared_prefix_worker_enables_torch_determinism_before_cuda(
     monkeypatch,
+    tmp_path,
     shared_prefix_config,
 ) -> None:
-    worker_module = _set_deterministic_worker_environment(monkeypatch)
+    worker_module = _set_deterministic_worker_environment(monkeypatch, tmp_path)
     enable_determinism = MagicMock()
     monkeypatch.setattr(
         worker_module.torch,
@@ -106,11 +126,20 @@ def test_shared_prefix_worker_enables_torch_determinism_before_cuda(
 
     enable_determinism.assert_called_once_with(True)
     log_info.assert_called_once_with(
-        "SHARED_PREFIX_DETERMINISM_ATTESTED mode=%s env_controls=4 "
+        "%s",
+        "SHARED_PREFIX_DETERMINISM_ATTESTED "
+        f"mode={shared_prefix_config['mode']} env_controls=4 "
         "triton_autotune=absent model_overrides=3 torch_deterministic=true "
         "total_controls=8",
-        shared_prefix_config["mode"],
     )
+    receipt_path = (
+        tmp_path
+        / "results"
+        / "shared_prefix_determinism_receipts"
+        / "123-0"
+        / f"shared_prefix_determinism.{shared_prefix_config['mode']}.rank-0.receipt"
+    )
+    assert receipt_path.read_text() == log_info.call_args.args[1]
 
 
 def test_worker_constructor_attests_determinism_before_any_other_action() -> None:
@@ -170,8 +199,11 @@ def test_uncontrolled_worker_does_not_change_torch_determinism(
     enable_determinism.assert_not_called()
 
 
-def test_strict_observe_worker_rejects_wrong_effective_environment(monkeypatch) -> None:
-    worker_module = _set_deterministic_worker_environment(monkeypatch)
+def test_strict_observe_worker_rejects_wrong_effective_environment(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    worker_module = _set_deterministic_worker_environment(monkeypatch, tmp_path)
     monkeypatch.setenv("MAMBA_DETERMINISTIC", "0")
     enable_determinism = MagicMock()
     monkeypatch.setattr(
@@ -204,11 +236,12 @@ def test_strict_observe_worker_rejects_wrong_effective_environment(monkeypatch) 
 )
 def test_shared_prefix_worker_rejects_missing_or_wrong_deterministic_override(
     monkeypatch,
+    tmp_path,
     override: str,
     value: object,
     expected_error: str,
 ) -> None:
-    worker_module = _set_deterministic_worker_environment(monkeypatch)
+    worker_module = _set_deterministic_worker_environment(monkeypatch, tmp_path)
     config = _deterministic_worker_config(
         worker_module,
         {"mode": "train"},
@@ -229,6 +262,86 @@ def test_shared_prefix_worker_rejects_missing_or_wrong_deterministic_override(
         worker_module._enable_shared_prefix_deterministic_execution(config)
 
     enable_determinism.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "RESULTS_DIR",
+        "NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR",
+    ],
+)
+def test_shared_prefix_worker_rejects_missing_configured_receipt_path(
+    monkeypatch,
+    tmp_path,
+    name: str,
+) -> None:
+    worker_module = _set_deterministic_worker_environment(monkeypatch, tmp_path)
+    config = _deterministic_worker_config(worker_module, {"mode": "train"})
+    config["megatron_cfg"]["env_vars"].pop(name)
+    monkeypatch.setattr(
+        worker_module.torch,
+        "use_deterministic_algorithms",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        worker_module.torch,
+        "are_deterministic_algorithms_enabled",
+        lambda: True,
+    )
+
+    with pytest.raises(RuntimeError, match=rf"env_vars\.{name}.*missing"):
+        worker_module._enable_shared_prefix_deterministic_execution(config)
+
+
+def test_shared_prefix_worker_rejects_configured_effective_receipt_path_drift(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    worker_module = _set_deterministic_worker_environment(monkeypatch, tmp_path)
+    config = _deterministic_worker_config(worker_module, {"mode": "train"})
+    config["megatron_cfg"]["env_vars"][
+        worker_module.SHARED_PREFIX_DETERMINISM_RECEIPT_DIR_ENV_VAR_NAME
+    ] = str(tmp_path / "results" / "other-receipts")
+    monkeypatch.setattr(
+        worker_module.torch,
+        "use_deterministic_algorithms",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        worker_module.torch,
+        "are_deterministic_algorithms_enabled",
+        lambda: True,
+    )
+
+    with pytest.raises(RuntimeError, match="effective NRL_SHARED_PREFIX.*configured"):
+        worker_module._enable_shared_prefix_deterministic_execution(config)
+
+
+def test_shared_prefix_worker_receipt_collision_is_fail_closed(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    worker_module = _set_deterministic_worker_environment(monkeypatch, tmp_path)
+    config = _deterministic_worker_config(worker_module, {"mode": "train"})
+    monkeypatch.setattr(
+        worker_module.torch,
+        "use_deterministic_algorithms",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        worker_module.torch,
+        "are_deterministic_algorithms_enabled",
+        lambda: True,
+    )
+    log_info = MagicMock()
+    monkeypatch.setattr(worker_module.log, "info", log_info)
+
+    worker_module._enable_shared_prefix_deterministic_execution(config)
+    with pytest.raises(RuntimeError, match="receipt already exists"):
+        worker_module._enable_shared_prefix_deterministic_execution(config)
+
+    log_info.assert_called_once()
 
 
 def test_shared_prefix_logprobs_restore_original_row_order():

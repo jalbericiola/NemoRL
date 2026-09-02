@@ -24,10 +24,14 @@ from nemo_rl.data.packing.shared_prefix_tensors import (
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 from nemo_rl.utils.shared_prefix_determinism import (
+    SHARED_PREFIX_DETERMINISM_RECEIPT_DIR_ENV_VAR_NAME,
+    SHARED_PREFIX_DETERMINISM_RECEIPT_PATH_ENV_VAR_NAMES,
     SHARED_PREFIX_DETERMINISM_ENV_VAR_VALUES,
     SHARED_PREFIX_DETERMINISM_MODEL_OVERRIDE_VALUES,
     SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_NAMES,
     SHARED_PREFIX_FORBIDDEN_DETERMINISM_ENV_VAR_PREFIXES,
+    SHARED_PREFIX_RESULTS_DIR_ENV_VAR_NAME,
+    validate_shared_prefix_determinism_receipt_paths,
 )
 
 
@@ -829,6 +833,30 @@ def validate_shared_prefix_training_config(
                 f"policy.megatron_cfg.env_vars.{name}={expected_value!r}; "
                 f"got {actual_value!r}."
             )
+
+    receipt_path_values: dict[str, str] = {}
+    for name in SHARED_PREFIX_DETERMINISM_RECEIPT_PATH_ENV_VAR_NAMES:
+        if name not in env_vars:
+            raise ValueError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} "
+                "with deterministic execution requires "
+                f"policy.megatron_cfg.env_vars.{name}; the field is missing."
+            )
+        actual_value = env_vars[name]
+        if type(actual_value) is not str:
+            raise ValueError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} "
+                "with deterministic execution requires "
+                f"policy.megatron_cfg.env_vars.{name} to be a string; got "
+                f"{actual_value!r}."
+            )
+        receipt_path_values[name] = actual_value
+    validate_shared_prefix_determinism_receipt_paths(
+        results_dir=receipt_path_values[SHARED_PREFIX_RESULTS_DIR_ENV_VAR_NAME],
+        receipt_dir=receipt_path_values[
+            SHARED_PREFIX_DETERMINISM_RECEIPT_DIR_ENV_VAR_NAME
+        ],
+    )
 
     model_overrides = megatron_config.get("model_overrides")
     if not isinstance(model_overrides, Mapping):

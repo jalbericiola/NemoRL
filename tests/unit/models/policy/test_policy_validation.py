@@ -188,6 +188,10 @@ def _add_shared_prefix_determinism_contract(config: PolicyConfig) -> PolicyConfi
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "NCCL_ALGO": "Ring",
+        "RESULTS_DIR": "/tmp/nemo-rl-results",
+        "NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR": (
+            "/tmp/nemo-rl-results/shared_prefix_determinism_receipts/123-0"
+        ),
     }
     megatron_config["model_overrides"] = {
         "deterministic_mode": True,
@@ -375,6 +379,51 @@ def test_shared_prefix_train_requires_exact_determinism_environment(
         env_vars[name] = value
 
     with pytest.raises(ValueError, match=rf"env_vars\.{name}="):
+        validate_shared_prefix_training_config(config)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "RESULTS_DIR",
+        "NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR",
+    ],
+)
+def test_shared_prefix_train_requires_explicit_determinism_receipt_paths(
+    name: str,
+) -> None:
+    config = create_shared_prefix_train_config()
+    env_vars = cast(dict[str, Any], config["megatron_cfg"])["env_vars"]
+    env_vars.pop(name)
+
+    with pytest.raises(ValueError, match=rf"env_vars\.{name}.*missing"):
+        validate_shared_prefix_training_config(config)
+
+
+@pytest.mark.parametrize(
+    ("results_dir", "receipt_dir", "expected_error"),
+    [
+        ("relative", "/tmp/results/receipts", "RESULTS_DIR must be an absolute"),
+        ("/tmp/results", "/tmp/results", "strictly below RESULTS_DIR"),
+        ("/tmp/results", "/tmp/outside", "strictly below RESULTS_DIR"),
+        (
+            "/tmp/results",
+            "/tmp/results/child/../receipts",
+            "canonical path",
+        ),
+    ],
+)
+def test_shared_prefix_train_rejects_unsafe_determinism_receipt_paths(
+    results_dir: str,
+    receipt_dir: str,
+    expected_error: str,
+) -> None:
+    config = create_shared_prefix_train_config()
+    env_vars = cast(dict[str, Any], config["megatron_cfg"])["env_vars"]
+    env_vars["RESULTS_DIR"] = results_dir
+    env_vars["NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR"] = receipt_dir
+
+    with pytest.raises(ValueError, match=expected_error):
         validate_shared_prefix_training_config(config)
 
 
