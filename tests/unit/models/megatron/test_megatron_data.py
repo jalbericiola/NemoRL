@@ -397,6 +397,14 @@ def test_shared_prefix_microbatch_keeps_m128_branches_and_q8_global_star():
                 ]
             ),
             "input_lengths": torch.tensor([7, 8, 9, 6]),
+            "mtp_loss_mask": torch.tensor(
+                [
+                    [0, 0, 0, 0, 1, 1, 1, 9, 9],
+                    [0, 0, 0, 0, 1, 1, 1, 1, 9],
+                    [0, 0, 0, 0, 1, 1, 1, 1, 1],
+                    [0, 0, 0, 0, 1, 1, 9, 9, 9],
+                ]
+            ),
             SHARED_PREFIX_PROMPT_LENGTHS: torch.tensor([4, 4, 4, 4]),
             SHARED_PREFIX_GROUP_ID: ["g", "g", "g", "g"],
             SHARED_PREFIX_EXECUTION_SLOT: torch.tensor([0, 0, 0, 0]),
@@ -429,6 +437,22 @@ def test_shared_prefix_microbatch_keeps_m128_branches_and_q8_global_star():
                 straggler_timer=None,
             )
         )
+    with patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_rank",
+        return_value=0,
+    ):
+        (rank_zero_microbatch,) = list(
+            process_shared_prefix_microbatch(
+                data_dict=batch,
+                cfg=cfg,
+                bin_capacity=512,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=128,
+                pad_packed_seq_to_multiple_of=1,
+                pad_full_seq_to=None,
+                straggler_timer=None,
+            )
+        )
 
     assert microbatch.shared_prefix is not None
     assert microbatch.shared_prefix.padding_multiple == 128
@@ -438,6 +462,35 @@ def test_shared_prefix_microbatch_keeps_m128_branches_and_q8_global_star():
     assert microbatch.shared_prefix.tensor_bin.layout.physical_total_length == 500
     assert microbatch.shared_prefix.padded_total_length == 504
     assert microbatch.input_ids_cp_sharded.shape == (1, 252)
+    assert microbatch.mtp_loss_mask is not None
+    assert microbatch.mtp_loss_mask.shape == (1, 252)
+    assert torch.nonzero(
+        microbatch.mtp_loss_mask,
+        as_tuple=False,
+    ).tolist() == [
+        [0, 2],
+        [0, 3],
+        [0, 4],
+        [0, 5],
+        [0, 126],
+        [0, 127],
+        [0, 128],
+        [0, 250],
+        [0, 251],
+    ]
+    assert rank_zero_microbatch.mtp_loss_mask is not None
+    assert torch.nonzero(
+        rank_zero_microbatch.mtp_loss_mask,
+        as_tuple=False,
+    ).tolist() == [[0, 4], [0, 5], [0, 6], [0, 7], [0, 8]]
+    assert rank_zero_microbatch.mtp_loss_mask[0, -4:].tolist() == [0, 0, 0, 0]
+    assert (
+        torch.count_nonzero(microbatch.mtp_loss_mask).item()
+        + torch.count_nonzero(rank_zero_microbatch.mtp_loss_mask).item()
+        == 14
+    )
+    assert torch.unique(microbatch.mtp_loss_mask).tolist() == [0, 1]
+    assert torch.unique(rank_zero_microbatch.mtp_loss_mask).tolist() == [0, 1]
 
 
 def test_shared_prefix_supplied_topology_fails_loudly_on_missing_keys():
