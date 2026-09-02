@@ -1769,6 +1769,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         command = _command_for_mode(commands, mode)
         required_once = (
             f"{uv_shim} run ./examples/run_grpo_single_controller.py",
+            "UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-${STRICT_PAIR_BOUND_JOB_ID}",
             "--config examples/nemo_gym/nemotron-3.5-nano/"
             "single_env_reasoning_gym_sc.yaml",
             f"policy.shared_prefix_training.mode={mode}",
@@ -1793,6 +1794,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         )
         for token in required_once:
             assert command.count(token) == 1, token
+        assert "SLURM_JOB_ID:-default" not in command
         assert " uv run " not in f" {command} "
         assert command.count(f"{uv_shim} run ") == 1
         train_path = command.split("data.train.data_path=", maxsplit=1)[1].split()[0]

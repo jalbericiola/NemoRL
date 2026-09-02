@@ -1298,8 +1298,14 @@ export SETUP_COMMAND
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
 UV_RUNNER=uv
+UV_CACHE_JOB_ID_EXPR="\${SLURM_JOB_ID:-default}"
 if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
   UV_RUNNER="${STRICT_PAIR_UV_SHIM}"
+  # The external job wrapper authenticates the live scheduler ID, exports it
+  # as STRICT_PAIR_BOUND_JOB_ID, and deliberately scrubs SLURM_JOB_ID before
+  # the driver.  Keep the expansion deferred until that sealed job boundary;
+  # a fallback would alias every strict job to one shared /tmp cache.
+  UV_CACHE_JOB_ID_EXPR="\${STRICT_PAIR_BOUND_JOB_ID}"
 fi
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${VLLM_ENV_SOURCE}\
@@ -1311,7 +1317,7 @@ NRL_VLLM_CACHE_SEED_DIR=${NRL_VLLM_CACHE_SEED_DIR} \
 DG_JIT_CACHE_DIR=${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
 TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
-UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default} \
+UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-${UV_CACHE_JOB_ID_EXPR} \
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
