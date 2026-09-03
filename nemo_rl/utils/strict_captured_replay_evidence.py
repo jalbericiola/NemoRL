@@ -722,25 +722,56 @@ def load_strict_fixture_row0(*, path: str | Path, expected_sha256: str) -> dict[
     expected = _require_digest(expected_sha256, name="fixture expected_sha256")
     parent_fd = _open_absolute_directory_without_symlinks(fixture_path.parent)
     try:
+        parent_before = os.fstat(parent_fd)
+        pre_named = os.stat(
+            fixture_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(pre_named.st_mode) or not 0 < pre_named.st_size <= _MAX_STRICT_FIXTURE_BYTES:
+            raise RuntimeError("strict fixture must be a bounded regular file")
         descriptor = os.open(
             fixture_path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=parent_fd,
         )
         try:
             before = os.fstat(descriptor)
-            if not stat.S_ISREG(before.st_mode):
-                raise RuntimeError("strict fixture must be a regular file")
-            if not 0 < before.st_size <= _MAX_STRICT_FIXTURE_BYTES:
-                raise ValueError("strict fixture size is outside the admitted range")
+            if (
+                _file_fingerprint(pre_named) != _file_fingerprint(before)
+                or not stat.S_ISREG(before.st_mode)
+                or not 0 < before.st_size <= _MAX_STRICT_FIXTURE_BYTES
+            ):
+                raise RuntimeError("strict fixture changed before stable read")
             raw = _read_all_bounded(descriptor, maximum=_MAX_STRICT_FIXTURE_BYTES)
             after = os.fstat(descriptor)
             named = os.stat(fixture_path.name, dir_fd=parent_fd, follow_symlinks=False)
         finally:
             os.close(descriptor)
+        parent_after = os.fstat(parent_fd)
+        fresh_parent_fd = _open_absolute_directory_without_symlinks(fixture_path.parent)
+        try:
+            fresh_parent = os.fstat(fresh_parent_fd)
+            fresh_named = os.stat(
+                fixture_path.name,
+                dir_fd=fresh_parent_fd,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(fresh_parent_fd)
     finally:
         os.close(parent_fd)
-    if not (_file_fingerprint(before) == _file_fingerprint(after) == _file_fingerprint(named)):
+    if not (
+        _directory_identity(parent_before) == _directory_identity(parent_after) == _directory_identity(fresh_parent)
+    ):
+        raise RuntimeError("strict fixture parent changed during stable read")
+    if not (
+        _file_fingerprint(pre_named)
+        == _file_fingerprint(before)
+        == _file_fingerprint(after)
+        == _file_fingerprint(named)
+        == _file_fingerprint(fresh_named)
+    ):
         raise RuntimeError("strict fixture changed during stable read")
     if len(raw) != after.st_size:
         raise RuntimeError("strict fixture size changed during stable read")
@@ -2382,7 +2413,8 @@ def publish_evidence_document(
     candidate_created = False
     candidate_name = f".{path.name}.candidate"
     try:
-        _require_owned_directory(os.fstat(parent_fd), name="output parent")
+        parent_initial = os.fstat(parent_fd)
+        _require_owned_directory(parent_initial, name="output parent")
         candidate_fd = os.open(
             candidate_name,
             _DOCUMENT_CREATE_FLAGS,
@@ -2417,21 +2449,63 @@ def publish_evidence_document(
         os.unlink(candidate_name, dir_fd=parent_fd)
         candidate_created = False
         os.fsync(parent_fd)
+        final_pre_named = os.stat(
+            path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(final_pre_named.st_mode)
+            or stat.S_IMODE(final_pre_named.st_mode) != 0o400
+            or final_pre_named.st_uid != os.geteuid()
+            or final_pre_named.st_nlink != 1
+            or final_pre_named.st_size != len(payload)
+        ):
+            raise RuntimeError("published evidence pathname is not the candidate regular file")
         final_fd = os.open(
             path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=parent_fd,
         )
         try:
-            final_metadata = os.fstat(final_fd)
-            actual = _read_all(final_fd)
+            final_before = os.fstat(final_fd)
+            if _file_fingerprint(final_pre_named) != _file_fingerprint(final_before) or not stat.S_ISREG(
+                final_before.st_mode
+            ):
+                raise RuntimeError("published evidence changed before exact readback")
+            actual = _read_all_bounded(final_fd, maximum=len(payload))
+            final_after = os.fstat(final_fd)
+            final_named = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
         finally:
             os.close(final_fd)
+        parent_after = os.fstat(parent_fd)
+        fresh_parent_fd = _open_absolute_directory_without_symlinks(path.parent)
+        try:
+            fresh_parent = os.fstat(fresh_parent_fd)
+            _require_owned_directory(fresh_parent, name="fresh output parent")
+            fresh_named = os.stat(
+                path.name,
+                dir_fd=fresh_parent_fd,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(fresh_parent_fd)
         if (
-            not stat.S_ISREG(final_metadata.st_mode)
-            or stat.S_IMODE(final_metadata.st_mode) != 0o400
-            or final_metadata.st_uid != os.geteuid()
-            or final_metadata.st_nlink != 1
+            _directory_identity(parent_initial) != _directory_identity(parent_after)
+            or _directory_identity(parent_after) != _directory_identity(fresh_parent)
+            or _file_fingerprint(final_pre_named) != _file_fingerprint(final_before)
+            or _file_fingerprint(final_before) != _file_fingerprint(final_after)
+            or _file_fingerprint(final_after) != _file_fingerprint(final_named)
+            or _file_fingerprint(final_named) != _file_fingerprint(fresh_named)
+            or not stat.S_ISREG(final_after.st_mode)
+            or stat.S_IMODE(final_after.st_mode) != 0o400
+            or final_after.st_uid != os.geteuid()
+            or final_after.st_nlink != 1
+            or final_after.st_size != len(payload)
             or actual != payload
             or hashlib.sha256(actual).hexdigest() != digest
         ):
@@ -2486,24 +2560,64 @@ def load_evidence_document(
     expected = _require_digest(expected_sha256, name="expected_sha256")
     parent_fd = _open_absolute_directory_without_symlinks(evidence_path.parent)
     try:
-        _require_owned_directory(os.fstat(parent_fd), name="evidence parent")
+        parent_before = os.fstat(parent_fd)
+        _require_owned_directory(parent_before, name="evidence parent")
+        pre_named = os.stat(
+            evidence_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(pre_named.st_mode)
+            or stat.S_IMODE(pre_named.st_mode) != 0o400
+            or pre_named.st_uid != os.geteuid()
+            or pre_named.st_nlink != 1
+            or not 0 < pre_named.st_size <= _MAX_EVIDENCE_DOCUMENT_BYTES
+        ):
+            raise RuntimeError("evidence must be an EUID-owned single-link mode-0400 regular file")
         descriptor = os.open(
             evidence_path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=parent_fd,
         )
         try:
             before = os.fstat(descriptor)
-            if not 0 < before.st_size <= _MAX_EVIDENCE_DOCUMENT_BYTES:
-                raise ValueError("evidence size is outside the admitted range")
+            if (
+                _file_fingerprint(pre_named) != _file_fingerprint(before)
+                or not stat.S_ISREG(before.st_mode)
+                or not 0 < before.st_size <= _MAX_EVIDENCE_DOCUMENT_BYTES
+            ):
+                raise RuntimeError("evidence changed before stable read")
             raw = _read_all_bounded(descriptor, maximum=_MAX_EVIDENCE_DOCUMENT_BYTES)
             after = os.fstat(descriptor)
             named = os.stat(evidence_path.name, dir_fd=parent_fd, follow_symlinks=False)
         finally:
             os.close(descriptor)
+        parent_after = os.fstat(parent_fd)
+        fresh_parent_fd = _open_absolute_directory_without_symlinks(evidence_path.parent)
+        try:
+            fresh_parent = os.fstat(fresh_parent_fd)
+            _require_owned_directory(fresh_parent, name="fresh evidence parent")
+            fresh_named = os.stat(
+                evidence_path.name,
+                dir_fd=fresh_parent_fd,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(fresh_parent_fd)
     finally:
         os.close(parent_fd)
-    if not (_file_fingerprint(before) == _file_fingerprint(after) == _file_fingerprint(named)):
+    if not (
+        _directory_identity(parent_before) == _directory_identity(parent_after) == _directory_identity(fresh_parent)
+    ):
+        raise RuntimeError("evidence parent changed during stable read")
+    if not (
+        _file_fingerprint(pre_named)
+        == _file_fingerprint(before)
+        == _file_fingerprint(after)
+        == _file_fingerprint(named)
+        == _file_fingerprint(fresh_named)
+    ):
         raise RuntimeError("evidence changed during stable read")
     if len(raw) != after.st_size:
         raise RuntimeError("evidence size changed during stable read")
@@ -4506,23 +4620,52 @@ def _load_bound_runtime_tool_bytes(path: Path, *, expected_sha256: str) -> bytes
     expected = _require_digest(expected_sha256, name="runtime tool SHA-256")
     parent_fd = _open_absolute_directory_without_symlinks(path.parent)
     try:
+        parent_before = os.fstat(parent_fd)
+        pre_named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(pre_named.st_mode) or not 0 < pre_named.st_size <= 64 * 1024 * 1024:
+            raise ValueError("runtime tool must be a bounded regular file")
         descriptor = os.open(
             path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=parent_fd,
         )
         try:
             before = os.fstat(descriptor)
-            if not 0 < before.st_size <= 64 * 1024 * 1024:
-                raise ValueError("runtime tool size is outside the admitted range")
+            if (
+                _file_fingerprint(pre_named) != _file_fingerprint(before)
+                or not stat.S_ISREG(before.st_mode)
+                or not 0 < before.st_size <= 64 * 1024 * 1024
+            ):
+                raise RuntimeError("runtime tool changed before stable read")
             raw = _read_all_bounded(descriptor, maximum=64 * 1024 * 1024)
             after = os.fstat(descriptor)
             named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         finally:
             os.close(descriptor)
+        parent_after = os.fstat(parent_fd)
+        fresh_parent_fd = _open_absolute_directory_without_symlinks(path.parent)
+        try:
+            fresh_parent = os.fstat(fresh_parent_fd)
+            fresh_named = os.stat(
+                path.name,
+                dir_fd=fresh_parent_fd,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(fresh_parent_fd)
     finally:
         os.close(parent_fd)
-    if not (_file_fingerprint(before) == _file_fingerprint(after) == _file_fingerprint(named)):
+    if not (
+        _directory_identity(parent_before) == _directory_identity(parent_after) == _directory_identity(fresh_parent)
+    ):
+        raise RuntimeError("runtime tool parent changed during stable read")
+    if not (
+        _file_fingerprint(pre_named)
+        == _file_fingerprint(before)
+        == _file_fingerprint(after)
+        == _file_fingerprint(named)
+        == _file_fingerprint(fresh_named)
+    ):
         raise RuntimeError("runtime tool changed during stable read")
     if len(raw) != after.st_size or not stat.S_ISREG(after.st_mode) or hashlib.sha256(raw).hexdigest() != expected:
         raise ValueError("runtime tool bytes differ from authenticated reference")
@@ -4540,24 +4683,60 @@ def _load_lifecycle_raw_bytes(path: Path, *, expected_sha256: str, maximum: int)
     expected = _require_digest(expected_sha256, name="raw expected SHA-256")
     parent_fd = _open_absolute_directory_without_symlinks(path.parent)
     try:
-        _require_owned_directory(os.fstat(parent_fd), name="raw evidence parent")
+        parent_before = os.fstat(parent_fd)
+        _require_owned_directory(parent_before, name="raw evidence parent")
+        pre_named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(pre_named.st_mode)
+            or stat.S_IMODE(pre_named.st_mode) != 0o400
+            or pre_named.st_uid != os.geteuid()
+            or pre_named.st_nlink != 1
+            or not 0 < pre_named.st_size <= maximum
+        ):
+            raise RuntimeError("raw evidence must be stable EUID-owned single-link mode-0400 bytes")
         descriptor = os.open(
             path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=parent_fd,
         )
         try:
             before = os.fstat(descriptor)
-            if not 0 < before.st_size <= maximum:
-                raise ValueError("raw evidence size is outside the admitted range")
+            if (
+                _file_fingerprint(pre_named) != _file_fingerprint(before)
+                or not stat.S_ISREG(before.st_mode)
+                or not 0 < before.st_size <= maximum
+            ):
+                raise RuntimeError("raw evidence changed before stable read")
             raw = _read_all_bounded(descriptor, maximum=maximum)
             after = os.fstat(descriptor)
             named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         finally:
             os.close(descriptor)
+        parent_after = os.fstat(parent_fd)
+        fresh_parent_fd = _open_absolute_directory_without_symlinks(path.parent)
+        try:
+            fresh_parent = os.fstat(fresh_parent_fd)
+            _require_owned_directory(fresh_parent, name="fresh raw evidence parent")
+            fresh_named = os.stat(
+                path.name,
+                dir_fd=fresh_parent_fd,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(fresh_parent_fd)
     finally:
         os.close(parent_fd)
-    if not (_file_fingerprint(before) == _file_fingerprint(after) == _file_fingerprint(named)):
+    if not (
+        _directory_identity(parent_before) == _directory_identity(parent_after) == _directory_identity(fresh_parent)
+    ):
+        raise RuntimeError("raw evidence parent changed during stable read")
+    if not (
+        _file_fingerprint(pre_named)
+        == _file_fingerprint(before)
+        == _file_fingerprint(after)
+        == _file_fingerprint(named)
+        == _file_fingerprint(fresh_named)
+    ):
         raise RuntimeError("raw evidence changed during stable read")
     if (
         len(raw) != after.st_size
@@ -4849,4 +5028,14 @@ def _file_fingerprint(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
+    )
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
     )

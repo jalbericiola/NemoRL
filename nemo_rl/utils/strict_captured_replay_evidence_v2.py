@@ -65,18 +65,25 @@ TRANSCRIPT_BUNDLE_SCHEMA = "nemo-rl-strict-step1-transcript-bundle-v4"
 MAIN_STEP1_LEDGER_SCHEMA = "nemo-rl-strict-main-step1-ledger-v5"
 CAPTURED_REPLAY_STEP1_LEDGER_SCHEMA = "nemo-rl-strict-captured-replay-step1-ledger-v5"
 MODEL_TRANSPORT_BUNDLE_SCHEMA = "nemo-rl-strict-model-transport-bundle-v1"
-REPLAY_SUBMISSION_RECEIPT_V2_SCHEMA = (
-    "nemo-rl-strict-captured-replay-submission-receipt-v5"
-)
+REPLAY_SUBMISSION_RECEIPT_V2_SCHEMA = "nemo-rl-strict-captured-replay-submission-receipt-v5"
 REPLAY_JOB_PRE_RECEIPT_V2_SCHEMA = "nemo-rl-strict-captured-replay-job-pre-receipt-v3"
 REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA = "nemo-rl-strict-captured-replay-job-exit-receipt-v6"
 REPLAY_POST_INDEX_V2_SCHEMA = "nemo-rl-strict-captured-replay-evidence-index-v4"
 REPLAY_SCHEDULER_QUERY_SCHEMA = "nemo-rl-strict-captured-replay-scheduler-query-v3"
-REPLAY_RUNTIME_ATTESTATION_V2_SCHEMA = (
-    "nemo-rl-strict-captured-replay-runtime-attestation-v2"
-)
+REPLAY_RUNTIME_ATTESTATION_V2_SCHEMA = "nemo-rl-strict-captured-replay-runtime-attestation-v2"
+REPLAY_RESULT_FINAL_RECEIPT_V2_SCHEMA = "nemo-rl-strict-captured-replay-result-final-receipt-v1"
+AUTHENTICATED_REPLAY_RESULT_SNAPSHOT_V2_SCHEMA = "nemo-rl-strict-captured-replay-authenticated-result-snapshot-v2"
+_RESULT_INVENTORY_V2_SCHEMA = "nemo-rl-strict-captured-replay-result-inventory-v2"
+_RESULT_INVENTORY_V2_FILENAME = "result-inventory-v2.json"
+_RESULT_PROFILE_IDS_V2 = {
+    "citation": "citation-string-match-v1",
+    "freeform": "freeform-regex-v1",
+}
+_AUTHENTICATED_REPLAY_RESULT_V2_MINT_TOKEN = object()
 
 __all__ = [
+    "AUTHENTICATED_REPLAY_RESULT_SNAPSHOT_V2_SCHEMA",
+    "AuthenticatedCapturedReplayResultV2",
     "REPLAY_EXIT_V2_ROOT_KEYS",
     "REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA",
     "REPLAY_JOB_PRE_RECEIPT_V2_SCHEMA",
@@ -85,6 +92,7 @@ __all__ = [
     "REPLAY_PRE_V2_ROOT_KEYS",
     "REPLAY_RUNTIME_ATTESTATION_V2_KEYS",
     "REPLAY_RUNTIME_ATTESTATION_V2_SCHEMA",
+    "REPLAY_RESULT_FINAL_RECEIPT_V2_SCHEMA",
     "REPLAY_SCHEDULER_QUERY_ROOT_KEYS",
     "REPLAY_SCHEDULER_QUERY_SCHEMA",
     "REPLAY_SUBMISSION_RECEIPT_V2_SCHEMA",
@@ -94,6 +102,9 @@ __all__ = [
     "build_captured_replay_pre_receipt_v2",
     "build_captured_replay_scheduler_query_v2",
     "build_captured_replay_submission_receipt_v2",
+    "build_captured_replay_result_final_receipt_v2",
+    "decode_evidence_document_bytes",
+    "load_authenticated_captured_replay_result_v2",
     "load_captured_replay_evidence_index_v2",
     "load_captured_replay_exit_receipt_v2",
     "load_captured_replay_pre_receipt_v2",
@@ -104,21 +115,17 @@ __all__ = [
     "publish_captured_replay_pre_receipt_v2",
     "publish_captured_replay_scheduler_query_v2",
     "publish_captured_replay_submission_receipt_v2",
+    "publish_captured_replay_result_final_receipt_v2",
+    "snapshot_authenticated_captured_replay_result_v2",
     "validate_captured_replay_evidence_index_v2",
     "validate_captured_replay_exit_receipt_v2",
     "validate_captured_replay_pre_receipt_v2",
     "validate_captured_replay_scheduler_query_v2",
     "validate_captured_replay_submission_receipt_v2",
 ]
-REPLAY_EXECUTION_MANIFEST_V2_SCHEMA = (
-    "nemo-rl-strict-captured-replay-execution-manifest-v4"
-)
-REPLAY_TRANSPORT_CONSUMPTION_V3_SCHEMA = (
-    "nemo-rl-strict-model-transport-replay-consumption-v3"
-)
-FORMAT_VERIFICATION_CALL_INDEX_SCHEMA = (
-    "nemo-rl-strict-format-verification-call-index-v1"
-)
+REPLAY_EXECUTION_MANIFEST_V2_SCHEMA = "nemo-rl-strict-captured-replay-execution-manifest-v4"
+REPLAY_TRANSPORT_CONSUMPTION_V3_SCHEMA = "nemo-rl-strict-model-transport-replay-consumption-v3"
+FORMAT_VERIFICATION_CALL_INDEX_SCHEMA = "nemo-rl-strict-format-verification-call-index-v1"
 PAIR_MANIFEST_SCHEMA = "nemo-rl-strict-single-env-pair-v2"
 PAIR_SUBMISSION_RECEIPT_SCHEMA = "nemo-rl-strict-pair-submission-receipt-v2"
 HARDWARE_OBSERVATION_SCHEMA = "nemo-rl-strict-hardware-observation-v2"
@@ -153,9 +160,7 @@ AGENT_BY_ENVIRONMENT = {
     "freeform": "freeform_formatting_simple_agent",
 }
 FIXTURE_ROW_KEYS_BY_ENVIRONMENT = {
-    "reasoning_gym": frozenset(
-        {"agent_ref", "answer", "metadata", "question", "responses_create_params"}
-    ),
+    "reasoning_gym": frozenset({"agent_ref", "answer", "metadata", "question", "responses_create_params"}),
     "citation": frozenset({"agent_ref", "responses_create_params", "verifier"}),
     "freeform": frozenset({"agent_ref", "responses_create_params", "verifier"}),
 }
@@ -309,9 +314,7 @@ TRANSCRIPT_ENTRY_KEYS = TRANSCRIPT_ENTRY_INPUT_KEYS | frozenset(
         "entry_sha256",
     }
 )
-GENERATION_KEYS = frozenset(
-    {"seed_base", "max_new_tokens", "temperature", "top_k", "top_p"}
-)
+GENERATION_KEYS = frozenset({"seed_base", "max_new_tokens", "temperature", "top_k", "top_p"})
 ARTIFACT_REFERENCE_KEYS = frozenset({"path", "schema", "sha256"})
 
 REPLAY_LEDGER_ROOT_KEYS = frozenset(
@@ -472,6 +475,30 @@ REPLAY_POST_INDEX_V2_ROOT_KEYS = frozenset(
         "identity",
     }
 )
+REPLAY_RESULT_FINAL_V2_ROOT_KEYS = frozenset(
+    {
+        "schema",
+        "hash_domain",
+        "phase",
+        "status",
+        "pair_id",
+        "environment",
+        "scorer_profile",
+        "arm",
+        "mode",
+        "attempt_id",
+        "candidate_job_id",
+        "authenticated_job_id",
+        "driver_process",
+        "original_process_reaped",
+        "replay_execution_manifest",
+        "submission_receipt",
+        "pre_receipt",
+        "exit_receipt",
+        "evidence_index",
+        "result",
+    }
+)
 REPLAY_STATIC_BOUNDARY_V2_KEYS = frozenset(
     {
         "scorer_profile",
@@ -496,8 +523,30 @@ REPLAY_OUTPUT_V2_KEYS = frozenset(
         "replay_ledger",
     }
 )
-REPLAY_POST_IDENTITY_KEYS = frozenset(
-    {"candidate_job_id", "authenticated_job_id", "driver_process", "run_id"}
+REPLAY_POST_IDENTITY_KEYS = frozenset({"candidate_job_id", "authenticated_job_id", "driver_process", "run_id"})
+_AUTHENTICATED_RESULT_SNAPSHOT_V2_KEYS = frozenset(
+    {
+        "schema",
+        "pair_id",
+        "environment",
+        "profile_id",
+        "attempt_id",
+        "candidate_job_id",
+        "authenticated_job_id",
+        "run_id",
+        "driver_process",
+        "scorer_process_identity",
+        "manifest",
+        "submission_receipt",
+        "pre_receipt",
+        "exit_receipt",
+        "result_final_receipt",
+        "result_root",
+        "result_inventory",
+        "evidence_index",
+        "outputs",
+        "samples",
+    }
 )
 REPLAY_RUNTIME_ATTESTATION_V2_KEYS = frozenset(
     {
@@ -549,12 +598,8 @@ REPLAY_SCHEDULER_QUERY_NORMALIZATION = {
     "nonfinite_numbers_rejected": True,
     "negative_zero_rejected": True,
 }
-REPLAY_ACCEPTED_ID_RECORD_KEYS = frozenset(
-    {"path", "sha256", "parsed_candidate_job_id", "format", "mode"}
-)
-REPLAY_SCHEDULER_CLIENT_ENVIRONMENT_KEYS = frozenset(
-    {"ambient_merge", "env", "variables"}
-)
+REPLAY_ACCEPTED_ID_RECORD_KEYS = frozenset({"path", "sha256", "parsed_candidate_job_id", "format", "mode"})
+REPLAY_SCHEDULER_CLIENT_ENVIRONMENT_KEYS = frozenset({"ambient_merge", "env", "variables"})
 REPLAY_SCHEDULER_CLIENT_VARIABLE_KEYS = frozenset({"LC_ALL", "SLURM_CONF"})
 REPLAY_SCHEDULER_TOOL_KEYS = frozenset({"sbatch", "scancel", "scontrol"})
 JOB_KEYS = frozenset(
@@ -638,12 +683,8 @@ _HEX40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 _GPU_UUID_RE = re.compile(r"GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
 _CANONICAL_DEVICE_COMPONENT = r"(?:0|[1-9][0-9]*)"
-_ZE_DEVICE_RE = re.compile(
-    rf"{_CANONICAL_DEVICE_COMPONENT}(?:\.{_CANONICAL_DEVICE_COMPONENT})?\Z"
-)
-_RESPONSE_UUID_RE = re.compile(
-    r"(?:resp|rs|msg)_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}\Z"
-)
+_ZE_DEVICE_RE = re.compile(rf"{_CANONICAL_DEVICE_COMPONENT}(?:\.{_CANONICAL_DEVICE_COMPONENT})?\Z")
+_RESPONSE_UUID_RE = re.compile(r"(?:resp|rs|msg)_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}\Z")
 _GYM_RESPONSE_ROOT_KEYS = frozenset(
     {
         "background",
@@ -678,9 +719,7 @@ _GYM_RESPONSE_ROOT_KEYS = frozenset(
         "user",
     }
 )
-_GYM_REASONING_KEYS = frozenset(
-    {"content", "encrypted_content", "id", "summary", "type"}
-)
+_GYM_REASONING_KEYS = frozenset({"content", "encrypted_content", "id", "summary", "type"})
 _GYM_MESSAGE_KEYS = frozenset({"content", "id", "role", "status", "type"})
 _GYM_TOKEN_KEYS = frozenset(
     {
@@ -701,11 +740,76 @@ _GYM_USAGE_KEYS = frozenset(
     }
 )
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-_DOCUMENT_CREATE_FLAGS = (
-    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-)
+_DOCUMENT_CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 _MAX_STRICT_FIXTURE_BYTES = 64 * 1024 * 1024
 _MAX_EVIDENCE_DOCUMENT_BYTES = 256 * 1024 * 1024
+
+
+class AuthenticatedCapturedReplayResultV2:
+    """Opaque in-process authority for one fully authenticated replay result."""
+
+    __slots__ = (
+        "__authenticated_source",
+        "__candidate_job_id",
+        "__expected_environment",
+        "__expected_profile_id",
+        "__final_path",
+        "__final_sha256",
+        "__manifest_raw",
+        "__pre_raw",
+        "__result_capability",
+        "__submission_raw",
+        "__exit_raw",
+        "__final_raw",
+        "__mint_token",
+        "__source_transcript_raw",
+    )
+
+    def __init__(
+        self,
+        *,
+        _mint_token: object,
+        authenticated_source: AuthenticatedOffSourceCapture,
+        candidate_job_id: str,
+        expected_environment: str,
+        expected_profile_id: str,
+        final_path: str,
+        final_sha256: str,
+        manifest_raw: bytes,
+        submission_raw: bytes,
+        pre_raw: bytes,
+        exit_raw: bytes,
+        final_raw: bytes,
+        source_transcript_raw: bytes,
+        result_capability: object,
+    ) -> None:
+        if _mint_token is not _AUTHENTICATED_REPLAY_RESULT_V2_MINT_TOKEN:
+            raise ValueError("authenticated replay result may only be minted by the public loader")
+        values = {
+            "_AuthenticatedCapturedReplayResultV2__mint_token": _mint_token,
+            "_AuthenticatedCapturedReplayResultV2__authenticated_source": authenticated_source,
+            "_AuthenticatedCapturedReplayResultV2__candidate_job_id": candidate_job_id,
+            "_AuthenticatedCapturedReplayResultV2__expected_environment": expected_environment,
+            "_AuthenticatedCapturedReplayResultV2__expected_profile_id": expected_profile_id,
+            "_AuthenticatedCapturedReplayResultV2__final_path": final_path,
+            "_AuthenticatedCapturedReplayResultV2__final_sha256": final_sha256,
+            "_AuthenticatedCapturedReplayResultV2__manifest_raw": manifest_raw,
+            "_AuthenticatedCapturedReplayResultV2__submission_raw": submission_raw,
+            "_AuthenticatedCapturedReplayResultV2__pre_raw": pre_raw,
+            "_AuthenticatedCapturedReplayResultV2__exit_raw": exit_raw,
+            "_AuthenticatedCapturedReplayResultV2__final_raw": final_raw,
+            "_AuthenticatedCapturedReplayResultV2__source_transcript_raw": source_transcript_raw,
+            "_AuthenticatedCapturedReplayResultV2__result_capability": result_capability,
+        }
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("AuthenticatedCapturedReplayResultV2 is immutable")
+
+    def __reduce__(self) -> object:
+        raise TypeError("AuthenticatedCapturedReplayResultV2 cannot be pickled")
 
 
 def canonical_ascii_json(value: Any) -> bytes:
@@ -746,25 +850,19 @@ def domain_sha256(label: str, value: Any) -> str:
     return hashlib.sha256(preimage + canonical_ascii_json(value)).hexdigest()
 
 
-def derive_nemo_gym_request_seed(
-    *, seed_base: int, fixture_row_index: int, rollout_index: int
-) -> int:
+def derive_nemo_gym_request_seed(*, seed_base: int, fixture_row_index: int, rollout_index: int) -> int:
     """Recompute the exact signed-int63 request seed used by NeMo-Gym."""
     _require_nonnegative_int(seed_base, name="seed_base")
     _require_nonnegative_int(fixture_row_index, name="fixture_row_index")
     _require_nonnegative_int(rollout_index, name="rollout_index")
     identity = canonical_ascii_json([seed_base, fixture_row_index, rollout_index])
-    return int.from_bytes(hashlib.sha256(identity).digest()[:8], "big") & (
-        (1 << 63) - 1
-    )
+    return int.from_bytes(hashlib.sha256(identity).digest()[:8], "big") & ((1 << 63) - 1)
 
 
 def replay_run_id(*, environment: str, pair_id: str, attempt_id: str) -> str:
     _validate_identity(pair_id=pair_id, environment=environment)
     _require_attempt(attempt_id)
-    return hashlib.sha256(
-        f"nemo-rl-strict-replay-v2:{environment}:{pair_id}:{attempt_id}".encode("ascii")
-    ).hexdigest()
+    return hashlib.sha256(f"nemo-rl-strict-replay-v2:{environment}:{pair_id}:{attempt_id}".encode("ascii")).hexdigest()
 
 
 def replay_job_name(*, pair_id: str, attempt_id: str) -> str:
@@ -781,36 +879,61 @@ def main_transcript_bundle_path(results_dir: str) -> Path:
     return root / MAIN_EVIDENCE_DIRECTORY / MAIN_TRANSCRIPT_FILENAME
 
 
-def load_strict_fixture_row0(
-    *, path: str | Path, expected_sha256: str
-) -> dict[str, Any]:
+def load_strict_fixture_row0(*, path: str | Path, expected_sha256: str) -> dict[str, Any]:
     """Stable-read the Pair-authenticated five-row fixture and return row zero."""
     fixture_path = _canonical_absolute_path(str(path), name="fixture path")
     expected = _require_digest(expected_sha256, name="fixture expected_sha256")
     parent_fd = _open_absolute_directory_without_symlinks(fixture_path.parent)
     try:
+        parent_before = os.fstat(parent_fd)
+        pre_named = os.stat(
+            fixture_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(pre_named.st_mode) or not 0 < pre_named.st_size <= _MAX_STRICT_FIXTURE_BYTES:
+            raise RuntimeError("strict fixture must be a bounded regular file")
         descriptor = os.open(
             fixture_path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=parent_fd,
         )
         try:
             before = os.fstat(descriptor)
-            if not stat.S_ISREG(before.st_mode):
-                raise RuntimeError("strict fixture must be a regular file")
-            if not 0 < before.st_size <= _MAX_STRICT_FIXTURE_BYTES:
-                raise ValueError("strict fixture size is outside the admitted range")
+            if (
+                _file_fingerprint(pre_named) != _file_fingerprint(before)
+                or not stat.S_ISREG(before.st_mode)
+                or not 0 < before.st_size <= _MAX_STRICT_FIXTURE_BYTES
+            ):
+                raise RuntimeError("strict fixture changed before stable read")
             raw = _read_all_bounded(descriptor, maximum=_MAX_STRICT_FIXTURE_BYTES)
             after = os.fstat(descriptor)
             named = os.stat(fixture_path.name, dir_fd=parent_fd, follow_symlinks=False)
         finally:
             os.close(descriptor)
+        parent_after = os.fstat(parent_fd)
+        fresh_parent_fd = _open_absolute_directory_without_symlinks(fixture_path.parent)
+        try:
+            fresh_parent = os.fstat(fresh_parent_fd)
+            fresh_named = os.stat(
+                fixture_path.name,
+                dir_fd=fresh_parent_fd,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(fresh_parent_fd)
     finally:
         os.close(parent_fd)
     if not (
-        _file_fingerprint(before)
+        _directory_identity(parent_before) == _directory_identity(parent_after) == _directory_identity(fresh_parent)
+    ):
+        raise RuntimeError("strict fixture parent changed during stable read")
+    if not (
+        _file_fingerprint(pre_named)
+        == _file_fingerprint(before)
         == _file_fingerprint(after)
         == _file_fingerprint(named)
+        == _file_fingerprint(fresh_named)
     ):
         raise RuntimeError("strict fixture changed during stable read")
     if len(raw) != after.st_size:
@@ -839,9 +962,7 @@ def load_strict_fixture_row0(
                 parse_float=_parse_fixture_float,
             )
         except (json.JSONDecodeError, ValueError) as error:
-            raise ValueError(
-                f"strict fixture row {index} is not strict JSON"
-            ) from error
+            raise ValueError(f"strict fixture row {index} is not strict JSON") from error
         if type(row) is not dict:
             raise TypeError(f"strict fixture row {index} must be a JSON object")
         canonical_ascii_json(row)
@@ -861,20 +982,14 @@ def build_verifier_request_derivation(
         (gym_gitlink_commit, "gym_gitlink_commit"),
         (gym_tree, "gym_tree"),
     ):
-        if (
-            type(value) is not str
-            or _HEX40_RE.fullmatch(value) is None
-            or value == "0" * 40
-        ):
+        if type(value) is not str or _HEX40_RE.fullmatch(value) is None or value == "0" * 40:
             raise ValueError(f"{name} must be a nonzero lowercase Git object ID")
     runtime = {
         "openai_version": openai_version,
         "pydantic_version": pydantic_version,
     }
     if not _exact_json_equal(runtime, DERIVED_VERIFIER_REQUEST_RUNTIME):
-        raise ValueError(
-            "verifier request derivation runtime versions differ from the pinned contract"
-        )
+        raise ValueError("verifier request derivation runtime versions differ from the pinned contract")
     document: dict[str, Any] = {
         "schema": DERIVED_VERIFIER_REQUEST_SCHEMA,
         "assurance": "deterministic-reconstruction-not-wire-capture",
@@ -939,15 +1054,11 @@ def build_transcript_bundle(
     if attempt_id is None:
         expected_mode = "observe" if arm == "off" else "train"
         if mode != expected_mode:
-            raise ValueError(
-                f"main transcript arm={arm!r} requires mode={expected_mode!r}"
-            )
+            raise ValueError(f"main transcript arm={arm!r} requires mode={expected_mode!r}")
     else:
         _require_attempt(attempt_id)
         if arm != "on" or mode != "captured_replay":
-            raise ValueError(
-                "replay transcript requires arm='on' and mode='captured_replay'"
-            )
+            raise ValueError("replay transcript requires arm='on' and mode='captured_replay'")
     generation_document = _validate_generation(generation)
     binding_document = _validate_transcript_bindings(bindings)
     fixture_value = _validate_fixture_row(fixture_row, environment=environment)
@@ -958,12 +1069,8 @@ def build_transcript_bundle(
         name="model_transport_bundle",
         expected_schema=MODEL_TRANSPORT_BUNDLE_SCHEMA,
     )
-    derivation_document = validate_verifier_request_derivation(
-        verifier_request_derivation
-    )
-    if not isinstance(entry_inputs, Sequence) or isinstance(
-        entry_inputs, (str, bytes, bytearray)
-    ):
+    derivation_document = validate_verifier_request_derivation(verifier_request_derivation)
+    if not isinstance(entry_inputs, Sequence) or isinstance(entry_inputs, (str, bytes, bytearray)):
         raise TypeError("entry_inputs must be a sequence")
     if len(entry_inputs) != K4_SAMPLES:
         raise ValueError(f"transcript bundle requires exactly K={K4_SAMPLES} entries")
@@ -1033,10 +1140,7 @@ def validate_transcript_bundle(document: Mapping[str, Any]) -> None:
         fixture_row=document["fixture_row"]["value"],
         model_transport_bundle=document["model_transport_bundle"],
         verifier_request_derivation=document["verifier_request_derivation"],
-        entry_inputs=[
-            {key: entry[key] for key in TRANSCRIPT_ENTRY_INPUT_KEYS}
-            for entry in entries
-        ],
+        entry_inputs=[{key: entry[key] for key in TRANSCRIPT_ENTRY_INPUT_KEYS} for entry in entries],
     )
     if dict(document) != rebuilt:
         raise ValueError("transcript bundle contains a changed or non-derived value")
@@ -1065,10 +1169,7 @@ def validate_transcript_model_transport_join(
         model_transport_bundle,
         model_transport_policy=model_transport_policy,
         model_path=model_path,
-        expected_generation_inputs=[
-            entry["generation_request"]["input"]
-            for entry in transcript_bundle["entries"]
-        ],
+        expected_generation_inputs=[entry["generation_request"]["input"] for entry in transcript_bundle["entries"]],
     )
     reference = transcript_bundle["model_transport_bundle"]
     actual_sha256 = document_sha256(model_transport_bundle, trailing_lf=False)
@@ -1077,17 +1178,11 @@ def validate_transcript_model_transport_join(
     for key in ("pair_id", "environment"):
         if transcript_bundle[key] != model_transport_bundle[key]:
             raise ValueError(f"transcript/model transport {key} differs")
-    expected_transport_arm = (
-        "off"
-        if transcript_bundle["mode"] == "captured_replay"
-        else transcript_bundle["arm"]
-    )
+    expected_transport_arm = "off" if transcript_bundle["mode"] == "captured_replay" else transcript_bundle["arm"]
     if model_transport_bundle["arm"] != expected_transport_arm:
         raise ValueError("transcript/model transport authority arm differs")
     transport_entries = model_transport_bundle["entries"]
-    for index, (transcript, transport) in enumerate(
-        zip(transcript_bundle["entries"], transport_entries, strict=True)
-    ):
+    for index, (transcript, transport) in enumerate(zip(transcript_bundle["entries"], transport_entries, strict=True)):
         expected = {
             "model_transport_entry_sha256": transport["entry_sha256"],
             "model_transport_request_body_sha256": transport["request_body_sha256"],
@@ -1097,23 +1192,15 @@ def validate_transcript_model_transport_join(
         }
         for name, value in expected.items():
             if transcript[name] != value or type(transcript[name]) is not type(value):
-                raise ValueError(
-                    f"transcript/model transport entry {index} {name} differs"
-                )
+                raise ValueError(f"transcript/model transport entry {index} {name} differs")
     validate_model_transport_generation_request_join(
         model_transport_bundle,
-        generation_requests=[
-            entry["generation_request"] for entry in transcript_bundle["entries"]
-        ],
+        generation_requests=[entry["generation_request"] for entry in transcript_bundle["entries"]],
     )
     validate_model_transport_model_response_join(
         model_transport_bundle,
-        generation_requests=[
-            entry["generation_request"] for entry in transcript_bundle["entries"]
-        ],
-        model_responses=[
-            entry["model_response"] for entry in transcript_bundle["entries"]
-        ],
+        generation_requests=[entry["generation_request"] for entry in transcript_bundle["entries"]],
+        model_responses=[entry["model_response"] for entry in transcript_bundle["entries"]],
     )
 
 
@@ -1138,10 +1225,7 @@ def validate_captured_replay_source_join(
         or source_transcript_bundle["attempt_id"] is not None
     ):
         raise ValueError("captured replay source must be the OFF main transcript")
-    if (
-        replay_transcript_bundle["arm"] != "on"
-        or replay_transcript_bundle["mode"] != "captured_replay"
-    ):
+    if replay_transcript_bundle["arm"] != "on" or replay_transcript_bundle["mode"] != "captured_replay":
         raise ValueError("captured replay target must be an ON replay transcript")
     _require_attempt(replay_transcript_bundle["attempt_id"])
     for key in (
@@ -1154,19 +1238,14 @@ def validate_captured_replay_source_join(
         "model_transport_bundle",
         "verifier_request_derivation",
     ):
-        if not _exact_json_equal(
-            source_transcript_bundle[key], replay_transcript_bundle[key]
-        ):
+        if not _exact_json_equal(source_transcript_bundle[key], replay_transcript_bundle[key]):
             raise ValueError(f"source/replay transcript {key} differs")
     for key in (
         "pair_manifest_sha256",
         "fixture_sha256",
         "verifier_source_sha256",
     ):
-        if (
-            source_transcript_bundle["bindings"][key]
-            != replay_transcript_bundle["bindings"][key]
-        ):
+        if source_transcript_bundle["bindings"][key] != replay_transcript_bundle["bindings"][key]:
             raise ValueError(f"source/replay transcript binding {key} differs")
     for index, (source, replay) in enumerate(
         zip(
@@ -1207,9 +1286,7 @@ def build_captured_replay_step1_ledger(
     """Build a v5 ON replay ledger after authenticating both transcript docs."""
     _validate_identity(pair_id=pair_id, environment=environment)
     attempt = _require_attempt(attempt_id)
-    source_main_sha = _require_digest(
-        source_main_ledger_sha256, name="source_main_ledger_sha256"
-    )
+    source_main_sha = _require_digest(source_main_ledger_sha256, name="source_main_ledger_sha256")
     source_transcript_ref = _artifact_reference(
         source_transcript_bundle,
         name="source_transcript_bundle",
@@ -1222,13 +1299,9 @@ def build_captured_replay_step1_ledger(
     )
     validate_transcript_bundle(source_transcript_document)
     validate_transcript_bundle(transcript_document)
-    if source_transcript_ref["sha256"] != document_sha256(
-        source_transcript_document, trailing_lf=False
-    ):
+    if source_transcript_ref["sha256"] != document_sha256(source_transcript_document, trailing_lf=False):
         raise ValueError("source transcript reference does not bind document bytes")
-    if replay_transcript_ref["sha256"] != document_sha256(
-        transcript_document, trailing_lf=False
-    ):
+    if replay_transcript_ref["sha256"] != document_sha256(transcript_document, trailing_lf=False):
         raise ValueError("replay transcript reference does not bind document bytes")
     validate_captured_replay_source_join(
         source_transcript_bundle=source_transcript_document,
@@ -1249,9 +1322,7 @@ def build_captured_replay_step1_ledger(
 
     main_compatible_transcript_ref = dict(replay_transcript_ref)
     main_compatible_transcript_ref["path"] = str(
-        Path(replay_transcript_ref["path"]).parent
-        / MAIN_EVIDENCE_DIRECTORY
-        / MAIN_TRANSCRIPT_FILENAME
+        Path(replay_transcript_ref["path"]).parent / MAIN_EVIDENCE_DIRECTORY / MAIN_TRANSCRIPT_FILENAME
     )
     main_shape = build_main_step1_ledger(
         pair_id=pair_id,
@@ -1259,9 +1330,7 @@ def build_captured_replay_step1_ledger(
         arm="on",
         mode="train",
         generation=generation,
-        bindings={
-            key: value for key, value in binding_document.items() if key != "process"
-        },
+        bindings={key: value for key, value in binding_document.items() if key != "process"},
         transcript_bundle=main_compatible_transcript_ref,
         row_inputs=row_inputs,
         # Replay has no optimizer update.  This call reuses only the main
@@ -1283,9 +1352,7 @@ def build_captured_replay_step1_ledger(
         }
     )
     _require_exact_keys(document, REPLAY_LEDGER_ROOT_KEYS, name="replay ledger")
-    validate_ledger_transcript_join(
-        ledger=document, transcript_bundle=transcript_document
-    )
+    validate_ledger_transcript_join(ledger=document, transcript_bundle=transcript_document)
     canonical_ascii_json(document)
     return document
 
@@ -1330,18 +1397,14 @@ def validate_captured_replay_step1_ledger(
         bindings=document["bindings"],
         transcript_bundle=document["transcript_bundle"],
         transcript_document=transcript_document,
-        row_inputs=[
-            {key: row[key] for key in MAIN_STEP1_ROW_INPUT_KEYS} for row in rows
-        ],
+        row_inputs=[{key: row[key] for key in MAIN_STEP1_ROW_INPUT_KEYS} for row in rows],
     )
     if dict(document) != rebuilt:
         raise ValueError("replay ledger contains a changed or non-derived value")
     canonical_ascii_json(document)
 
 
-def validate_ledger_transcript_join(
-    *, ledger: Mapping[str, Any], transcript_bundle: Mapping[str, Any]
-) -> None:
+def validate_ledger_transcript_join(*, ledger: Mapping[str, Any], transcript_bundle: Mapping[str, Any]) -> None:
     """Close one ledger row-by-row to exact captured transport preimages."""
     validate_transcript_bundle(transcript_bundle)
     rows = ledger.get("rows")
@@ -1349,9 +1412,9 @@ def validate_ledger_transcript_join(
         raise ValueError("ledger must contain exactly K=4 rows")
     identity_fields = ("pair_id", "environment", "arm", "mode", "step", "sample_count")
     for key in identity_fields:
-        if ledger.get(key) != transcript_bundle.get(key) or type(
-            ledger.get(key)
-        ) is not type(transcript_bundle.get(key)):
+        if ledger.get(key) != transcript_bundle.get(key) or type(ledger.get(key)) is not type(
+            transcript_bundle.get(key)
+        ):
             raise ValueError(f"ledger/transcript {key} differs")
     if ledger.get("generation") != transcript_bundle["generation"]:
         raise ValueError("ledger/transcript generation policy differs")
@@ -1385,20 +1448,11 @@ def validate_ledger_transcript_join(
         raise ValueError("ledger prompt-group identity is not a UUID") from error
     if parsed_group_id.version != 4 or str(parsed_group_id) != group_id:
         raise ValueError("ledger prompt-group identity is not canonical UUID4")
-    expected_task_index = (parsed_group_id.int ^ (parsed_group_id.int >> 64)) & (
-        (1 << 63) - 1
-    )
-    task_indices = {
-        entry["agent_run_request"].get("_ng_task_index")
-        for entry in transcript_bundle["entries"]
-    }
+    expected_task_index = (parsed_group_id.int ^ (parsed_group_id.int >> 64)) & ((1 << 63) - 1)
+    task_indices = {entry["agent_run_request"].get("_ng_task_index") for entry in transcript_bundle["entries"]}
     if task_indices != {expected_task_index}:
-        raise ValueError(
-            "ledger prompt-group UUID does not close to transcript task index"
-        )
-    for index, (row, entry) in enumerate(
-        zip(rows, transcript_bundle["entries"], strict=True)
-    ):
+        raise ValueError("ledger prompt-group UUID does not close to transcript task index")
+    for index, (row, entry) in enumerate(zip(rows, transcript_bundle["entries"], strict=True)):
         exact = {
             "sample_index": entry["sample_index"],
             "fixture_row_index": entry["fixture_row_index"],
@@ -1414,22 +1468,15 @@ def validate_ledger_transcript_join(
             if row.get(key) != value or type(row.get(key)) is not type(value):
                 raise ValueError(f"ledger row {index} differs from transcript {key}")
         trainer_reward = _float32_round_trip(entry["raw_environment_reward"])
-        if (
-            type(row.get("raw_environment_reward")) is not float
-            or row["raw_environment_reward"] != trainer_reward
-        ):
-            raise ValueError(
-                f"ledger row {index} differs from float32 transcript raw_environment_reward"
-            )
+        if type(row.get("raw_environment_reward")) is not float or row["raw_environment_reward"] != trainer_reward:
+            raise ValueError(f"ledger row {index} differs from float32 transcript raw_environment_reward")
         prompt, completion, all_tokens = model_response_token_geometry(
             entry["model_response"], name=f"transcript entry {index} model_response"
         )
         if row.get("prompt_token_ids") != prompt:
             raise ValueError(f"ledger row {index} prompt tokens differ from transcript")
         if row.get("completion_token_ids") != completion:
-            raise ValueError(
-                f"ledger row {index} completion tokens differ from transcript"
-            )
+            raise ValueError(f"ledger row {index} completion tokens differ from transcript")
         if row.get("token_ids") != all_tokens:
             raise ValueError(f"ledger row {index} token IDs differ from transcript")
         if row.get("input_length") != len(all_tokens):
@@ -1455,15 +1502,9 @@ def build_captured_replay_scheduler_query_v2(
         expected_profile_id=expected_profile_id,
     )
     query_phase = _replay_scheduler_query_phase(phase)
-    raw_path = _canonical_absolute_path(
-        raw_output_path, name="scheduler query raw output path"
-    )
-    raw_sha256 = _require_digest(
-        raw_output_sha256, name="scheduler query raw output SHA-256"
-    )
-    raw = _load_lifecycle_raw_bytes(
-        raw_path, expected_sha256=raw_sha256, maximum=1 << 20
-    )
+    raw_path = _canonical_absolute_path(raw_output_path, name="scheduler query raw output path")
+    raw_sha256 = _require_digest(raw_output_sha256, name="scheduler query raw output SHA-256")
+    raw = _load_lifecycle_raw_bytes(raw_path, expected_sha256=raw_sha256, maximum=1 << 20)
     normalized = _normalized_replay_scheduler_record(raw, phase=query_phase)
     if not _exact_json_equal(normalized, record):
         raise ValueError("caller scheduler record differs from normalized raw output")
@@ -1526,9 +1567,7 @@ def validate_captured_replay_scheduler_query_v2(
     if (
         type(document["status"]) is not int
         or document["status"] != 0
-        or not _exact_json_equal(
-            document["normalization"], REPLAY_SCHEDULER_QUERY_NORMALIZATION
-        )
+        or not _exact_json_equal(document["normalization"], REPLAY_SCHEDULER_QUERY_NORMALIZATION)
         or type(document["line_count"]) is not int
         or document["line_count"] < 1
         or type(document["match_count"]) is not int
@@ -1539,9 +1578,7 @@ def validate_captured_replay_scheduler_query_v2(
         raise ValueError("scheduler query terminal normalization differs")
     raw_path = _canonical_absolute_path(document["path"], name="scheduler raw path")
     raw_sha256 = _require_digest(document["sha256"], name="scheduler raw SHA-256")
-    raw = _load_lifecycle_raw_bytes(
-        raw_path, expected_sha256=raw_sha256, maximum=1 << 20
-    )
+    raw = _load_lifecycle_raw_bytes(raw_path, expected_sha256=raw_sha256, maximum=1 << 20)
     if len(raw) != document["byte_count"] or raw.count(b"\n") != document["line_count"]:
         raise ValueError("scheduler query raw framing/count differs")
     normalized = _normalized_replay_scheduler_record(raw, phase=phase)
@@ -1566,9 +1603,7 @@ def publish_captured_replay_scheduler_query_v2(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
-    expected = _scheduler_query_document_path(
-        _canonical_absolute_path(document["path"], name="scheduler raw path")
-    )
+    expected = _scheduler_query_document_path(_canonical_absolute_path(document["path"], name="scheduler raw path"))
     actual = _canonical_absolute_path(str(output), name="scheduler query output")
     if actual != expected:
         raise ValueError("scheduler query document path differs from its raw output")
@@ -1584,9 +1619,7 @@ def load_captured_replay_scheduler_query_v2(
     expected_environment: str,
     expected_profile_id: str,
 ) -> tuple[dict[str, Any], str]:
-    document, digest = load_evidence_document(
-        path=path, expected_sha256=expected_sha256, trailing_lf=True
-    )
+    document, digest = load_evidence_document(path=path, expected_sha256=expected_sha256, trailing_lf=True)
     validate_captured_replay_scheduler_query_v2(
         document,
         replay_execution_manifest=replay_execution_manifest,
@@ -1594,9 +1627,7 @@ def load_captured_replay_scheduler_query_v2(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
-    expected = _scheduler_query_document_path(
-        _canonical_absolute_path(document["path"], name="scheduler raw path")
-    )
+    expected = _scheduler_query_document_path(_canonical_absolute_path(document["path"], name="scheduler raw path"))
     if _canonical_absolute_path(str(path), name="scheduler query path") != expected:
         raise ValueError("scheduler query document path differs from its raw output")
     return document, digest
@@ -1634,18 +1665,12 @@ def build_captured_replay_submission_receipt_v2(
         name="replay_execution_manifest",
         expected_schema=REPLAY_EXECUTION_MANIFEST_V2_SCHEMA,
     )
-    _require_loaded_document_matches(
-        manifest_ref, manifest, trailing_lf=False, name="replay execution manifest"
-    )
-    tools = _validate_replay_scheduler_tools(
-        scheduler_tools, replay_execution_manifest=manifest
-    )
+    _require_loaded_document_matches(manifest_ref, manifest, trailing_lf=False, name="replay execution manifest")
+    tools = _validate_replay_scheduler_tools(scheduler_tools, replay_execution_manifest=manifest)
     client_environment = _validate_replay_scheduler_client_environment(
         scheduler_client_environment, replay_execution_manifest=manifest
     )
-    accepted = _validate_replay_accepted_id_record(
-        accepted_id_record, replay_execution_manifest=manifest
-    )
+    accepted = _validate_replay_accepted_id_record(accepted_id_record, replay_execution_manifest=manifest)
     candidate = accepted["parsed_candidate_job_id"]
     _require_replay_job_disjoint_from_pair(manifest, candidate, name="candidate_job_id")
     _validate_submission_parent_precondition(manifest, candidate_job_id=candidate)
@@ -1658,15 +1683,10 @@ def build_captured_replay_submission_receipt_v2(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
-    nonce = _require_digest(
-        manifest["scheduler_submission"]["nonce"], name="submission nonce"
-    )
+    nonce = _require_digest(manifest["scheduler_submission"]["nonce"], name="submission nonce")
     job_name = manifest["scheduler_submission"]["identity"]["job_name"]
     submitter_euid = manifest["scheduler_submission"]["identity"]["submitter_euid"]
-    comment = (
-        f"nemo-rl-strict-captured-replay-v2:{manifest['attempt_id']}:"
-        f"{nonce}:{manifest_ref['sha256']}"
-    )
+    comment = f"nemo-rl-strict-captured-replay-v2:{manifest['attempt_id']}:" f"{nonce}:{manifest_ref['sha256']}"
     _close_scheduler_query_to_lifecycle(
         query,
         replay_execution_manifest=manifest,
@@ -1688,13 +1708,9 @@ def build_captured_replay_submission_receipt_v2(
         raise ValueError("sbatch stdout must be exactly candidate_job_id plus LF")
     _require_ascii(parsable_stdout, name="sbatch parsable stdout", maximum=64)
     timestamp = time.time_ns() if submitted_at_unix_ns is None else submitted_at_unix_ns
-    _require_bounded_positive_int(
-        timestamp, name="submitted_at_unix_ns", maximum=(1 << 63) - 1
-    )
+    _require_bounded_positive_int(timestamp, name="submitted_at_unix_ns", maximum=(1 << 63) - 1)
     snapshot = copy.deepcopy(manifest["replay_contract"]["source_snapshot"])
-    snapshot_root = _canonical_absolute_path(
-        snapshot["ref"]["path"], name="replay source snapshot path"
-    )
+    snapshot_root = _canonical_absolute_path(snapshot["ref"]["path"], name="replay source snapshot path")
     program = manifest["replay_contract"]["program"]
     document = {
         "schema": REPLAY_SUBMISSION_RECEIPT_V2_SCHEMA,
@@ -1708,16 +1724,10 @@ def build_captured_replay_submission_receipt_v2(
         "attempt_id": manifest["attempt_id"],
         "replay_execution_manifest": manifest_ref,
         "replay_source_snapshot": snapshot,
-        "submission_contract": copy.deepcopy(
-            manifest["scheduler_submission"]["contract"]
-        ),
+        "submission_contract": copy.deepcopy(manifest["scheduler_submission"]["contract"]),
         "slurm_export_boundary": copy.deepcopy(manifest["slurm_export_boundary"]),
-        "submission_launcher": _absolute_program_reference(
-            snapshot_root, program["submission_launcher"]
-        ),
-        "job_wrapper": _absolute_program_reference(
-            snapshot_root, program["job_wrapper"]
-        ),
+        "submission_launcher": _absolute_program_reference(snapshot_root, program["submission_launcher"]),
+        "job_wrapper": _absolute_program_reference(snapshot_root, program["job_wrapper"]),
         "scheduler_client_environment": client_environment,
         "scheduler_tools": tools,
         "submission_nonce": nonce,
@@ -1730,9 +1740,7 @@ def build_captured_replay_submission_receipt_v2(
             "argv": argv,
             "argv_sha256": domain_sha256("captured-replay-sbatch-argv", argv),
             "parsable_stdout": parsable_stdout,
-            "parsable_stdout_sha256": hashlib.sha256(
-                parsable_stdout.encode("ascii")
-            ).hexdigest(),
+            "parsable_stdout_sha256": hashlib.sha256(parsable_stdout.encode("ascii")).hexdigest(),
         },
         "candidate_job_id": candidate,
         "accepted_id_record": accepted,
@@ -1763,9 +1771,7 @@ def validate_captured_replay_submission_receipt_v2(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
-    _require_exact_keys(
-        document, REPLAY_SUBMISSION_V2_ROOT_KEYS, name="replay submission receipt"
-    )
+    _require_exact_keys(document, REPLAY_SUBMISSION_V2_ROOT_KEYS, name="replay submission receipt")
     expected_envelope = {
         "schema": REPLAY_SUBMISSION_RECEIPT_V2_SCHEMA,
         "scorer_profile": manifest["scorer_profile"],
@@ -1783,9 +1789,7 @@ def validate_captured_replay_submission_receipt_v2(
         name="replay_execution_manifest",
         expected_schema=REPLAY_EXECUTION_MANIFEST_V2_SCHEMA,
     )
-    _require_loaded_document_matches(
-        manifest_ref, manifest, trailing_lf=False, name="replay execution manifest"
-    )
+    _require_loaded_document_matches(manifest_ref, manifest, trailing_lf=False, name="replay execution manifest")
     expected_snapshot = manifest["replay_contract"]["source_snapshot"]
     if not _exact_json_equal(document["replay_source_snapshot"], expected_snapshot):
         raise ValueError("submission replay source snapshot differs from manifest")
@@ -1794,21 +1798,15 @@ def validate_captured_replay_submission_receipt_v2(
         manifest["scheduler_submission"]["contract"],
     ):
         raise ValueError("submission contract differs from manifest")
-    if not _exact_json_equal(
-        document["slurm_export_boundary"], manifest["slurm_export_boundary"]
-    ):
+    if not _exact_json_equal(document["slurm_export_boundary"], manifest["slurm_export_boundary"]):
         raise ValueError("submission Slurm export boundary differs from manifest")
-    snapshot_root = _canonical_absolute_path(
-        expected_snapshot["ref"]["path"], name="replay source snapshot path"
-    )
+    snapshot_root = _canonical_absolute_path(expected_snapshot["ref"]["path"], name="replay source snapshot path")
     program = manifest["replay_contract"]["program"]
     for name in ("submission_launcher", "job_wrapper"):
         expected = _absolute_program_reference(snapshot_root, program[name])
         if not _exact_json_equal(document[name], expected):
             raise ValueError(f"submission {name} differs from manifest program")
-    tools = _validate_replay_scheduler_tools(
-        document["scheduler_tools"], replay_execution_manifest=manifest
-    )
+    tools = _validate_replay_scheduler_tools(document["scheduler_tools"], replay_execution_manifest=manifest)
     _validate_replay_scheduler_client_environment(
         document["scheduler_client_environment"], replay_execution_manifest=manifest
     )
@@ -1818,8 +1816,7 @@ def validate_captured_replay_submission_receipt_v2(
     expected_name = manifest["scheduler_submission"]["identity"]["job_name"]
     expected_euid = manifest["scheduler_submission"]["identity"]["submitter_euid"]
     expected_comment = (
-        f"nemo-rl-strict-captured-replay-v2:{manifest['attempt_id']}:"
-        f"{nonce}:{manifest_ref['sha256']}"
+        f"nemo-rl-strict-captured-replay-v2:{manifest['attempt_id']}:" f"{nonce}:{manifest_ref['sha256']}"
     )
     if (
         document["job_name"] != expected_name
@@ -1828,9 +1825,7 @@ def validate_captured_replay_submission_receipt_v2(
         or document["submitter_euid"] != expected_euid
     ):
         raise ValueError("submission scheduler identity differs")
-    accepted = _validate_replay_accepted_id_record(
-        document["accepted_id_record"], replay_execution_manifest=manifest
-    )
+    accepted = _validate_replay_accepted_id_record(document["accepted_id_record"], replay_execution_manifest=manifest)
     candidate = _require_job_id(document["candidate_job_id"], name="candidate_job_id")
     _require_replay_job_disjoint_from_pair(manifest, candidate, name="candidate_job_id")
     if candidate != accepted["parsed_candidate_job_id"]:
@@ -1855,10 +1850,7 @@ def validate_captured_replay_submission_receipt_v2(
     )
     sbatch = document["sbatch"]
     _require_exact_keys(sbatch, SBATCH_KEYS, name="submission sbatch")
-    if (
-        sbatch["path"] != tools["sbatch"]["path"]
-        or sbatch["sha256"] != tools["sbatch"]["sha256"]
-    ):
+    if sbatch["path"] != tools["sbatch"]["path"] or sbatch["sha256"] != tools["sbatch"]["sha256"]:
         raise ValueError("submission sbatch tool differs")
     argv = _validate_replay_sbatch_argv(
         sbatch["argv"],
@@ -1874,8 +1866,7 @@ def validate_captured_replay_submission_receipt_v2(
     stdout = sbatch["parsable_stdout"]
     if (
         stdout != f"{candidate}\n"
-        or sbatch["parsable_stdout_sha256"]
-        != hashlib.sha256(stdout.encode("ascii")).hexdigest()
+        or sbatch["parsable_stdout_sha256"] != hashlib.sha256(stdout.encode("ascii")).hexdigest()
     ):
         raise ValueError("submission sbatch stdout/candidate binding differs")
     _require_bounded_positive_int(
@@ -1940,9 +1931,7 @@ def load_captured_replay_submission_receipt_v2(
     actual_path = _canonical_absolute_path(str(path), name="submission receipt path")
     if actual_path != expected_path:
         raise ValueError("replay submission receipt path differs from manifest")
-    document, digest = load_evidence_document(
-        path=actual_path, expected_sha256=expected_sha256, trailing_lf=True
-    )
+    document, digest = load_evidence_document(path=actual_path, expected_sha256=expected_sha256, trailing_lf=True)
     validate_captured_replay_submission_receipt_v2(
         document,
         replay_execution_manifest=manifest,
@@ -1978,14 +1967,10 @@ def build_captured_replay_pre_receipt_v2(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
-    candidate = _require_job_id(
-        submission_receipt["candidate_job_id"], name="candidate_job_id"
-    )
+    candidate = _require_job_id(submission_receipt["candidate_job_id"], name="candidate_job_id")
     authenticated = _require_job_id(authenticated_job_id, name="authenticated_job_id")
     _require_replay_job_disjoint_from_pair(manifest, candidate, name="candidate_job_id")
-    _require_replay_job_disjoint_from_pair(
-        manifest, authenticated, name="authenticated_job_id"
-    )
+    _require_replay_job_disjoint_from_pair(manifest, authenticated, name="authenticated_job_id")
     if candidate != authenticated:
         raise ValueError("candidate and authenticated replay job IDs differ")
     submission_ref = _receipt_reference_for_document(
@@ -2031,9 +2016,7 @@ def build_captured_replay_pre_receipt_v2(
         "arm": "on",
         "mode": "fresh_verifier_reward_replay",
         "attempt_id": manifest["attempt_id"],
-        "replay_execution_manifest": copy.deepcopy(
-            submission_receipt["replay_execution_manifest"]
-        ),
+        "replay_execution_manifest": copy.deepcopy(submission_receipt["replay_execution_manifest"]),
         "submission_receipt": submission_ref,
         "candidate_job_id": candidate,
         "authenticated_job_id": authenticated,
@@ -2045,9 +2028,7 @@ def build_captured_replay_pre_receipt_v2(
             "mode": "0700",
             "status": "absent",
         },
-        "runtime_attestation_contract": copy.deepcopy(
-            manifest["runtime_attestation_requirements"]
-        ),
+        "runtime_attestation_contract": copy.deepcopy(manifest["runtime_attestation_requirements"]),
         "execution_source_root": str(execution_source_root),
         "driver": {
             "entrypoint": manifest["replay_contract"]["program"]["entrypoint"]["path"],
@@ -2126,17 +2107,10 @@ def validate_captured_replay_pre_receipt_v2(
         name="replay submission receipt",
     )
     candidate = _require_job_id(document["candidate_job_id"], name="candidate_job_id")
-    authenticated = _require_job_id(
-        document["authenticated_job_id"], name="authenticated_job_id"
-    )
+    authenticated = _require_job_id(document["authenticated_job_id"], name="authenticated_job_id")
     _require_replay_job_disjoint_from_pair(manifest, candidate, name="candidate_job_id")
-    _require_replay_job_disjoint_from_pair(
-        manifest, authenticated, name="authenticated_job_id"
-    )
-    if (
-        candidate != authenticated
-        or candidate != submission_receipt["candidate_job_id"]
-    ):
+    _require_replay_job_disjoint_from_pair(manifest, authenticated, name="authenticated_job_id")
+    if candidate != authenticated or candidate != submission_receipt["candidate_job_id"]:
         raise ValueError("PRE candidate/authenticated job identity differs")
     _validate_job(document["job"], replay_execution_manifest=manifest)
     expected_static = _replay_static_boundary(manifest)
@@ -2246,16 +2220,12 @@ def load_captured_replay_pre_receipt_v2(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
-    candidate = _require_job_id(
-        submission_receipt["candidate_job_id"], name="candidate_job_id"
-    )
+    candidate = _require_job_id(submission_receipt["candidate_job_id"], name="candidate_job_id")
     expected_path = _replay_job_receipt_path(manifest, candidate, phase="PRE")
     actual_path = _canonical_absolute_path(str(path), name="replay PRE path")
     if actual_path != expected_path:
         raise ValueError("replay PRE receipt path differs")
-    document, digest = load_evidence_document(
-        path=actual_path, expected_sha256=expected_sha256, trailing_lf=True
-    )
+    document, digest = load_evidence_document(path=actual_path, expected_sha256=expected_sha256, trailing_lf=True)
     validate_captured_replay_pre_receipt_v2(
         document,
         replay_execution_manifest=manifest,
@@ -2300,18 +2270,14 @@ def build_captured_replay_exit_receipt_v2(
     )
     if type(driver_exit_code) is not int or driver_exit_code != 0:
         raise ValueError("successful replay EXIT requires exact integer exit code zero")
-    authenticated = _require_job_id(
-        pre_receipt["authenticated_job_id"], name="authenticated_job_id"
-    )
+    authenticated = _require_job_id(pre_receipt["authenticated_job_id"], name="authenticated_job_id")
     pre_path = _replay_job_receipt_path(manifest, authenticated, phase="PRE")
     pre_ref = _receipt_reference_for_document(
         path=str(pre_path),
         schema=REPLAY_JOB_PRE_RECEIPT_V2_SCHEMA,
         document=pre_receipt,
     )
-    _require_loaded_document_matches(
-        pre_ref, pre_receipt, trailing_lf=True, name="replay PRE receipt"
-    )
+    _require_loaded_document_matches(pre_ref, pre_receipt, trailing_lf=True, name="replay PRE receipt")
     query_ref, query = _load_replay_scheduler_query_reference(
         post_scheduler_query,
         phase="POST",
@@ -2328,16 +2294,10 @@ def build_captured_replay_exit_receipt_v2(
         comment=submission_receipt["comment"],
         submitter_euid=submission_receipt["submitter_euid"],
     )
-    wrapper_device_environment = _validate_scheduler_device_environment(
-        scheduler_device_environment
-    )
-    driver_device_environment = _validate_scheduler_device_environment(
-        driver_scheduler_device_environment
-    )
+    wrapper_device_environment = _validate_scheduler_device_environment(scheduler_device_environment)
+    driver_device_environment = _validate_scheduler_device_environment(driver_scheduler_device_environment)
     if not _exact_json_equal(driver_device_environment, wrapper_device_environment):
-        raise ValueError(
-            "driver scheduler device environment differs from wrapper observation"
-        )
+        raise ValueError("driver scheduler device environment differs from wrapper observation")
     process = _validate_process(driver_process)
     output_refs = _validate_captured_replay_outputs(
         outputs,
@@ -2360,9 +2320,7 @@ def build_captured_replay_exit_receipt_v2(
         "arm": "on",
         "mode": "fresh_verifier_reward_replay",
         "attempt_id": manifest["attempt_id"],
-        "replay_execution_manifest": copy.deepcopy(
-            submission_receipt["replay_execution_manifest"]
-        ),
+        "replay_execution_manifest": copy.deepcopy(submission_receipt["replay_execution_manifest"]),
         "submission_receipt": copy.deepcopy(pre_receipt["submission_receipt"]),
         "candidate_job_id": pre_receipt["candidate_job_id"],
         "authenticated_job_id": authenticated,
@@ -2438,9 +2396,7 @@ def validate_captured_replay_exit_receipt_v2(
     ):
         if not _exact_json_equal(document[name], pre_receipt[name]):
             raise ValueError(f"EXIT {name} differs from authenticated PRE")
-    authenticated = _require_job_id(
-        document["authenticated_job_id"], name="authenticated_job_id"
-    )
+    authenticated = _require_job_id(document["authenticated_job_id"], name="authenticated_job_id")
     if document["candidate_job_id"] != authenticated:
         raise ValueError("EXIT candidate/authenticated job IDs differ")
     _validate_job(document["job"], replay_execution_manifest=manifest)
@@ -2456,9 +2412,7 @@ def validate_captured_replay_exit_receipt_v2(
     )
     if pre_ref != expected_pre_ref:
         raise ValueError("EXIT PRE receipt reference differs")
-    _require_loaded_document_matches(
-        pre_ref, pre_receipt, trailing_lf=True, name="replay PRE receipt"
-    )
+    _require_loaded_document_matches(pre_ref, pre_receipt, trailing_lf=True, name="replay PRE receipt")
     query_ref, query = _load_replay_scheduler_query_reference(
         document["post_scheduler_query"],
         phase="POST",
@@ -2477,22 +2431,13 @@ def validate_captured_replay_exit_receipt_v2(
         comment=submission_receipt["comment"],
         submitter_euid=submission_receipt["submitter_euid"],
     )
-    if (
-        type(document["driver_exit_code"]) is not int
-        or document["driver_exit_code"] != 0
-    ):
+    if type(document["driver_exit_code"]) is not int or document["driver_exit_code"] != 0:
         raise ValueError("successful replay EXIT requires exact integer exit code zero")
     _validate_hardware(document["hardware"], replay_execution_manifest=manifest)
-    wrapper_device_environment = _validate_scheduler_device_environment(
-        document["scheduler_device_environment"]
-    )
-    driver_device_environment = _validate_scheduler_device_environment(
-        document["driver_scheduler_device_environment"]
-    )
+    wrapper_device_environment = _validate_scheduler_device_environment(document["scheduler_device_environment"])
+    driver_device_environment = _validate_scheduler_device_environment(document["driver_scheduler_device_environment"])
     if not _exact_json_equal(driver_device_environment, wrapper_device_environment):
-        raise ValueError(
-            "driver scheduler device environment differs from wrapper observation"
-        )
+        raise ValueError("driver scheduler device environment differs from wrapper observation")
     process = _validate_process(document["driver_process"])
     output_refs = _validate_captured_replay_outputs(
         document["outputs"],
@@ -2570,16 +2515,12 @@ def load_captured_replay_exit_receipt_v2(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
-    authenticated = _require_job_id(
-        pre_receipt["authenticated_job_id"], name="authenticated_job_id"
-    )
+    authenticated = _require_job_id(pre_receipt["authenticated_job_id"], name="authenticated_job_id")
     expected_path = _replay_job_receipt_path(manifest, authenticated, phase="EXIT")
     actual_path = _canonical_absolute_path(str(path), name="replay EXIT path")
     if actual_path != expected_path:
         raise ValueError("replay EXIT receipt path differs")
-    document, digest = load_evidence_document(
-        path=actual_path, expected_sha256=expected_sha256, trailing_lf=True
-    )
+    document, digest = load_evidence_document(path=actual_path, expected_sha256=expected_sha256, trailing_lf=True)
     validate_captured_replay_exit_receipt_v2(
         document,
         replay_execution_manifest=manifest,
@@ -2630,12 +2571,8 @@ def build_captured_replay_evidence_index_v2(
         "arm": "on",
         "mode": "fresh_verifier_reward_replay",
         "attempt_id": manifest["attempt_id"],
-        "replay_execution_manifest": copy.deepcopy(
-            submission_receipt["replay_execution_manifest"]
-        ),
-        "pair_submission_receipt": copy.deepcopy(
-            manifest["pair"]["submission_receipt"]
-        ),
+        "replay_execution_manifest": copy.deepcopy(submission_receipt["replay_execution_manifest"]),
+        "pair_submission_receipt": copy.deepcopy(manifest["pair"]["submission_receipt"]),
         "submission_receipt": copy.deepcopy(pre_receipt["submission_receipt"]),
         "pre_receipt": copy.deepcopy(exit_receipt["pre_receipt"]),
         "exit_receipt": _receipt_reference_for_document(
@@ -2695,9 +2632,7 @@ def validate_captured_replay_evidence_index_v2(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
-    _require_exact_keys(
-        document, REPLAY_POST_INDEX_V2_ROOT_KEYS, name="replay evidence index"
-    )
+    _require_exact_keys(document, REPLAY_POST_INDEX_V2_ROOT_KEYS, name="replay evidence index")
     expected_envelope = {
         "schema": REPLAY_POST_INDEX_V2_SCHEMA,
         "scorer_profile": manifest["scorer_profile"],
@@ -2711,10 +2646,7 @@ def validate_captured_replay_evidence_index_v2(
         "attempt_id": manifest["attempt_id"],
     }
     _require_exact_projection(document, expected_envelope, name="post index envelope")
-    if (
-        type(document["original_process_reaped"]) is not bool
-        or document["original_process_reaped"] is not True
-    ):
+    if type(document["original_process_reaped"]) is not bool or document["original_process_reaped"] is not True:
         raise ValueError("post index must prove original process reaping")
     expected_refs = {
         "replay_execution_manifest": submission_receipt["replay_execution_manifest"],
@@ -2722,11 +2654,7 @@ def validate_captured_replay_evidence_index_v2(
         "submission_receipt": pre_receipt["submission_receipt"],
         "pre_receipt": exit_receipt["pre_receipt"],
         "exit_receipt": _receipt_reference_for_document(
-            path=str(
-                _replay_job_receipt_path(
-                    manifest, exit_receipt["authenticated_job_id"], phase="EXIT"
-                )
-            ),
+            path=str(_replay_job_receipt_path(manifest, exit_receipt["authenticated_job_id"], phase="EXIT")),
             schema=REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA,
             document=exit_receipt,
         ),
@@ -2750,15 +2678,11 @@ def validate_captured_replay_evidence_index_v2(
         submission_receipt=submission_receipt,
         authenticated_job_id=exit_receipt["authenticated_job_id"],
         driver_process=exit_receipt["driver_process"],
-        driver_scheduler_device_environment=exit_receipt[
-            "driver_scheduler_device_environment"
-        ],
+        driver_scheduler_device_environment=exit_receipt["driver_scheduler_device_environment"],
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
-    _require_exact_keys(
-        document["identity"], REPLAY_POST_IDENTITY_KEYS, name="post index identity"
-    )
+    _require_exact_keys(document["identity"], REPLAY_POST_IDENTITY_KEYS, name="post index identity")
     expected_identity = {
         "candidate_job_id": exit_receipt["candidate_job_id"],
         "authenticated_job_id": exit_receipt["authenticated_job_id"],
@@ -2800,9 +2724,7 @@ def publish_captured_replay_evidence_index_v2(
     actual = _canonical_absolute_path(str(output), name="replay evidence index output")
     if actual != expected:
         raise ValueError("replay evidence index path differs")
-    return publish_evidence_document(
-        output=actual, document=document, trailing_lf=False
-    )
+    return publish_evidence_document(output=actual, document=document, trailing_lf=False)
 
 
 def load_captured_replay_evidence_index_v2(
@@ -2821,9 +2743,7 @@ def load_captured_replay_evidence_index_v2(
     actual_path = _canonical_absolute_path(str(path), name="replay evidence index path")
     if actual_path != expected_path:
         raise ValueError("replay evidence index path differs")
-    document, digest = load_evidence_document(
-        path=actual_path, expected_sha256=expected_sha256, trailing_lf=False
-    )
+    document, digest = load_evidence_document(path=actual_path, expected_sha256=expected_sha256, trailing_lf=False)
     validate_captured_replay_evidence_index_v2(
         document,
         replay_execution_manifest=replay_execution_manifest,
@@ -2835,6 +2755,1631 @@ def load_captured_replay_evidence_index_v2(
         expected_profile_id=expected_profile_id,
     )
     return document, digest
+
+
+def _final_receipt_paths_v2(
+    replay_execution_manifest: Mapping[str, Any],
+    *,
+    authenticated_job_id: str,
+) -> dict[str, str]:
+    """Derive PRE/EXIT/FINAL only from M4 and authenticated job identity."""
+    manifest = _strict_json_object(
+        replay_execution_manifest,
+        name="replay execution manifest",
+    )
+    pair_id = _require_safe_id(manifest.get("pair_id"), name="pair_id", maximum=64)
+    attempt_id = _require_attempt(manifest.get("attempt_id"))
+    job_id = _require_job_id(authenticated_job_id, name="authenticated_job_id")
+    pair = _strict_json_object(manifest.get("pair"), name="replay manifest pair")
+    pair_manifest = _artifact_reference(
+        pair.get("manifest"),
+        name="replay Pair manifest",
+        expected_schema=PAIR_MANIFEST_SCHEMA,
+    )
+    pair_manifest_path = Path(pair_manifest["path"])
+    if pair_manifest_path.name != "PAIR_MANIFEST.json":
+        raise ValueError("replay Pair manifest path is noncanonical")
+    results_root = pair_manifest_path.parent
+    receipt_root = (
+        results_root / "captured_replay" / "replay_job_state" / pair_id / attempt_id / f"{job_id}-0" / "receipts"
+    )
+    return {
+        "pre": str(receipt_root / "PRE.json"),
+        "exit": str(receipt_root / "EXIT.json"),
+        "final": str(receipt_root / "FINAL.json"),
+    }
+
+
+def _canonical_replay_manifest_path_v2(
+    replay_execution_manifest: Mapping[str, Any],
+) -> str:
+    """Derive the sole admitted M4 publication path from its Pair anchor."""
+    manifest = _strict_json_object(
+        replay_execution_manifest,
+        name="replay execution manifest",
+    )
+    pair_id = _require_safe_id(manifest.get("pair_id"), name="pair_id", maximum=64)
+    attempt_id = _require_attempt(manifest.get("attempt_id"))
+    pair = _strict_json_object(manifest.get("pair"), name="replay manifest pair")
+    pair_manifest = _artifact_reference(
+        pair.get("manifest"),
+        name="replay Pair manifest",
+        expected_schema=PAIR_MANIFEST_SCHEMA,
+    )
+    pair_manifest_path = _canonical_absolute_path(
+        pair_manifest["path"],
+        name="replay Pair manifest path",
+    )
+    if pair_manifest_path.name != "PAIR_MANIFEST.json":
+        raise ValueError("replay Pair manifest path is noncanonical")
+    return str(pair_manifest_path.parent / "captured_replay" / "manifests" / pair_id / f"{attempt_id}.json")
+
+
+def _sealed_result_payloads_v2(
+    verified_result: Any,
+    *,
+    replay_execution_manifest: Mapping[str, Any],
+    expected_environment: str,
+    expected_profile_id: str,
+) -> tuple[dict[str, Any], dict[str, bytes], dict[str, Any]]:
+    """Project verifier-retained inventory/member bytes without pathname I/O."""
+    from nemo_rl.utils.strict_captured_replay_profiles import (
+        get_strict_captured_replay_profile,
+    )
+    from nemo_rl.utils.strict_captured_replay_seal_v2 import (
+        RESULT_INVENTORY_V2_FILENAME,
+        RESULT_INVENTORY_V2_SCHEMA,
+        snapshot_verified_sealed_result_v2,
+    )
+
+    profile = get_strict_captured_replay_profile(
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    projection = snapshot_verified_sealed_result_v2(verified_result)
+    if type(projection) is not dict or set(projection) != {
+        "environment",
+        "profile_id",
+        "result_root",
+        "inventory",
+        "members",
+    }:
+        raise TypeError("sealed-result projection shape differs")
+    result_root = str(
+        _canonical_absolute_path(
+            projection["result_root"],
+            name="sealed result root",
+        )
+    )
+    expected_root = str(
+        _canonical_absolute_path(
+            replay_execution_manifest["artifacts"]["outputs"]["directory"]["path"],
+            name="manifest result root",
+        )
+    )
+    if (
+        projection["environment"] != expected_environment
+        or type(projection["environment"]) is not str
+        or projection["profile_id"] != expected_profile_id
+        or type(projection["profile_id"]) is not str
+        or result_root != expected_root
+    ):
+        raise ValueError("sealed-result projection identity differs from M4/profile")
+    inventory = projection["inventory"]
+    if type(inventory) is not dict or set(inventory) != {
+        "path",
+        "schema",
+        "sha256",
+        "raw",
+    }:
+        raise TypeError("sealed result inventory projection differs")
+    expected_inventory_path = f"{result_root}/{RESULT_INVENTORY_V2_FILENAME}"
+    inventory_sha256 = _require_digest(
+        inventory.get("sha256"),
+        name="sealed result inventory SHA-256",
+    )
+    inventory_raw = inventory.get("raw")
+    if (
+        inventory.get("path") != expected_inventory_path
+        or type(inventory.get("path")) is not str
+        or inventory.get("schema") != RESULT_INVENTORY_V2_SCHEMA
+        or type(inventory_raw) is not bytes
+    ):
+        raise ValueError("sealed result inventory projection identity differs")
+    inventory_document, _ = decode_evidence_document_bytes(
+        raw=inventory_raw,
+        expected_sha256=inventory_sha256,
+        trailing_lf=False,
+    )
+    if (
+        inventory_document.get("schema") != RESULT_INVENTORY_V2_SCHEMA
+        or inventory_document.get("root") != result_root
+        or inventory_document.get("environment") != expected_environment
+        or inventory_document.get("profile_id") != expected_profile_id
+    ):
+        raise ValueError("sealed result inventory bytes differ from M4/profile")
+    members = projection["members"]
+    if type(members) is not tuple or len(members) != len(profile.result_files):
+        raise TypeError("sealed result member projection differs")
+    payloads: dict[str, bytes] = {}
+    for item, relative, schema in zip(
+        members,
+        profile.result_files,
+        profile.result_file_schemas,
+        strict=True,
+    ):
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or item[0] != relative
+            or type(item[1]) is not bytes
+            or relative in payloads
+        ):
+            raise TypeError(f"sealed result member projection differs for {relative}")
+        document, _ = decode_evidence_document_bytes(
+            raw=item[1],
+            expected_sha256=hashlib.sha256(item[1]).hexdigest(),
+            trailing_lf=False,
+        )
+        if document.get("schema") != schema:
+            raise ValueError(f"sealed result member schema differs for {relative}")
+        payloads[relative] = bytes(item[1])
+    return projection, payloads, inventory_document
+
+
+def _final_receipt_reference(
+    *,
+    path: str,
+    schema: str,
+    document: Mapping[str, Any],
+    trailing_lf: bool,
+) -> dict[str, str]:
+    return {
+        "path": str(_canonical_absolute_path(path, name="artifact path")),
+        "schema": schema,
+        "sha256": document_sha256(document, trailing_lf=trailing_lf),
+    }
+
+
+def _derive_result_final_receipt_v2(
+    *,
+    replay_execution_manifest: Mapping[str, Any],
+    submission_receipt: Mapping[str, Any],
+    pre_receipt: Mapping[str, Any],
+    exit_receipt: Mapping[str, Any],
+    evidence_index: Mapping[str, Any],
+    verified_result: Any,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> tuple[dict[str, Any], str]:
+    manifest = _strict_json_object(
+        replay_execution_manifest,
+        name="replay execution manifest",
+    )
+    submission = _strict_json_object(
+        submission_receipt,
+        name="replay submission receipt",
+    )
+    pre = _strict_json_object(pre_receipt, name="replay PRE receipt")
+    exit_document = _strict_json_object(exit_receipt, name="replay EXIT receipt")
+    supplied_index = _strict_json_object(
+        evidence_index,
+        name="replay evidence index",
+    )
+    _require_exact_keys(
+        submission,
+        REPLAY_SUBMISSION_V2_ROOT_KEYS,
+        name="replay submission receipt",
+    )
+    _require_exact_keys(pre, REPLAY_PRE_V2_ROOT_KEYS, name="replay PRE receipt")
+    _require_exact_keys(
+        exit_document,
+        REPLAY_EXIT_V2_ROOT_KEYS,
+        name="replay EXIT receipt",
+    )
+    _require_exact_keys(
+        supplied_index,
+        REPLAY_POST_INDEX_V2_ROOT_KEYS,
+        name="replay evidence index",
+    )
+    projection, payloads, _ = _sealed_result_payloads_v2(
+        verified_result,
+        replay_execution_manifest=manifest,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    captured_index_raw = payloads["evidence-index.json"]
+    captured_index, captured_index_sha256 = decode_evidence_document_bytes(
+        raw=captured_index_raw,
+        expected_sha256=hashlib.sha256(captured_index_raw).hexdigest(),
+        trailing_lf=False,
+    )
+    if not _exact_json_equal(captured_index, supplied_index):
+        raise ValueError("in-memory evidence index differs from verifier-retained bytes")
+    if captured_index.get("schema") != REPLAY_POST_INDEX_V2_SCHEMA:
+        raise ValueError("verifier-retained evidence index schema differs")
+
+    manifest_ref = _artifact_reference(
+        submission.get("replay_execution_manifest"),
+        name="submission replay execution manifest",
+        expected_schema=REPLAY_EXECUTION_MANIFEST_V2_SCHEMA,
+    )
+    if manifest_ref["path"] != _canonical_replay_manifest_path_v2(manifest) or manifest_ref[
+        "sha256"
+    ] != document_sha256(manifest, trailing_lf=False):
+        raise ValueError("submission manifest reference differs from M4 bytes")
+    declared_submission = manifest["scheduler_submission"]["receipt"]
+    submission_ref = _artifact_reference(
+        pre.get("submission_receipt"),
+        name="PRE submission receipt",
+        expected_schema=REPLAY_SUBMISSION_RECEIPT_V2_SCHEMA,
+    )
+    if submission_ref["path"] != declared_submission["path"] or submission_ref["sha256"] != document_sha256(
+        submission, trailing_lf=True
+    ):
+        raise ValueError("PRE submission receipt reference differs from S5 bytes")
+    candidate_job_id = _require_job_id(
+        submission.get("candidate_job_id"),
+        name="submission candidate_job_id",
+    )
+    authenticated_job_id = _require_job_id(
+        pre.get("authenticated_job_id"),
+        name="PRE authenticated_job_id",
+    )
+    if (
+        pre.get("candidate_job_id") != candidate_job_id
+        or authenticated_job_id != candidate_job_id
+        or exit_document.get("candidate_job_id") != candidate_job_id
+        or exit_document.get("authenticated_job_id") != authenticated_job_id
+    ):
+        raise ValueError("candidate/authenticated replay job identity differs")
+    receipt_paths = _final_receipt_paths_v2(
+        manifest,
+        authenticated_job_id=authenticated_job_id,
+    )
+    pre_ref = _artifact_reference(
+        exit_document.get("pre_receipt"),
+        name="EXIT PRE receipt",
+        expected_schema=REPLAY_JOB_PRE_RECEIPT_V2_SCHEMA,
+    )
+    if pre_ref["path"] != receipt_paths["pre"] or pre_ref["sha256"] != document_sha256(pre, trailing_lf=True):
+        raise ValueError("EXIT PRE receipt reference differs from PRE3 bytes")
+    exit_ref = _artifact_reference(
+        captured_index.get("exit_receipt"),
+        name="index EXIT receipt",
+        expected_schema=REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA,
+    )
+    if exit_ref["path"] != receipt_paths["exit"] or exit_ref["sha256"] != document_sha256(
+        exit_document, trailing_lf=True
+    ):
+        raise ValueError("index EXIT receipt reference differs from EXIT6 bytes")
+    expected_envelope = {
+        "pair_id": manifest["pair_id"],
+        "environment": expected_environment,
+        "scorer_profile": manifest["scorer_profile"],
+        "arm": "on",
+        "mode": "fresh_verifier_reward_replay",
+        "attempt_id": manifest["attempt_id"],
+    }
+    for name, document in (
+        ("submission", submission),
+        ("PRE", pre),
+        ("EXIT", exit_document),
+        ("index", captured_index),
+    ):
+        _require_exact_projection(document, expected_envelope, name=name)
+    if (
+        submission.get("schema") != REPLAY_SUBMISSION_RECEIPT_V2_SCHEMA
+        or submission.get("phase") != "SUBMISSION"
+        or pre.get("schema") != REPLAY_JOB_PRE_RECEIPT_V2_SCHEMA
+        or pre.get("phase") != "PRE"
+        or exit_document.get("schema") != REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA
+        or exit_document.get("phase") != "EXIT"
+        or exit_document.get("post_verified") is not True
+        or exit_document.get("driver_exit_code") != 0
+        or type(exit_document.get("driver_exit_code")) is not int
+    ):
+        raise ValueError("replay lifecycle phase/status differs")
+    driver_process = _validate_process(exit_document.get("driver_process"))
+    index_identity = _strict_json_object(
+        captured_index.get("identity"),
+        name="replay index identity",
+    )
+    _require_exact_keys(
+        index_identity,
+        REPLAY_POST_IDENTITY_KEYS,
+        name="replay index identity",
+    )
+    if not _exact_json_equal(
+        index_identity,
+        {
+            "candidate_job_id": candidate_job_id,
+            "authenticated_job_id": authenticated_job_id,
+            "driver_process": driver_process,
+            "run_id": replay_run_id(
+                environment=expected_environment,
+                pair_id=manifest["pair_id"],
+                attempt_id=manifest["attempt_id"],
+            ),
+        },
+    ):
+        raise ValueError("replay index process/job/run identity differs")
+    runtime_attestation = _strict_json_object(
+        exit_document.get("runtime_attestation"),
+        name="EXIT runtime attestation",
+    )
+    if (
+        runtime_attestation.get("original_process_reaped") is not True
+        or captured_index.get("original_process_reaped") is not True
+    ):
+        raise ValueError("terminal replay result does not prove scorer reaping")
+    if not _exact_json_equal(captured_index.get("outputs"), exit_document.get("outputs")):
+        raise ValueError("index outputs differ from EXIT outputs")
+    result_root = projection["result_root"]
+    inventory = projection["inventory"]
+    declared_index = manifest["artifacts"]["outputs"]["evidence_index"]
+    evidence_index_ref = {
+        "path": declared_index["path"],
+        "schema": REPLAY_POST_INDEX_V2_SCHEMA,
+        "sha256": captured_index_sha256,
+    }
+    if evidence_index_ref["path"] != f"{result_root}/evidence-index.json":
+        raise ValueError("evidence index path differs from sealed result root")
+    inventory_ref = {
+        "path": inventory["path"],
+        "schema": inventory["schema"],
+        "sha256": inventory["sha256"],
+    }
+    final_document = {
+        "schema": REPLAY_RESULT_FINAL_RECEIPT_V2_SCHEMA,
+        "hash_domain": HASH_DOMAIN,
+        "phase": "FINAL",
+        "status": "complete",
+        **copy.deepcopy(expected_envelope),
+        "candidate_job_id": candidate_job_id,
+        "authenticated_job_id": authenticated_job_id,
+        "driver_process": driver_process,
+        "original_process_reaped": True,
+        "replay_execution_manifest": manifest_ref,
+        "submission_receipt": submission_ref,
+        "pre_receipt": pre_ref,
+        "exit_receipt": exit_ref,
+        "evidence_index": evidence_index_ref,
+        "result": {"root": result_root, "inventory": inventory_ref},
+    }
+    _require_exact_keys(
+        final_document,
+        REPLAY_RESULT_FINAL_V2_ROOT_KEYS,
+        name="result FINAL receipt",
+    )
+    receipt_bytes(final_document)
+    return final_document, receipt_paths["final"]
+
+
+def _validate_sealed_result_outputs_v2(
+    *,
+    replay_execution_manifest: Mapping[str, Any],
+    submission_receipt: Mapping[str, Any],
+    exit_receipt: Mapping[str, Any],
+    authenticated_source: AuthenticatedOffSourceCapture,
+    verified_result: Any,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Validate the exact 13 retained members and all K=4 semantic joins."""
+    from nemo_rl.environments.strict_gym_child_runtime_v2 import (
+        validate_finalized_format_verification_call_index_payloads,
+    )
+    from nemo_rl.utils.strict_captured_replay_manifest_v2 import (
+        AuthenticatedOffSourceCapture,
+    )
+    from nemo_rl.utils.strict_captured_replay_profiles import (
+        get_strict_captured_replay_profile,
+    )
+    from nemo_rl.utils.strict_model_transport_replay_v3 import (
+        validate_strict_model_transport_replay_consumption_v3,
+    )
+
+    if type(authenticated_source) is not AuthenticatedOffSourceCapture:
+        raise TypeError("authenticated_source must be an exact OFF-source capability")
+    manifest = _strict_json_object(
+        replay_execution_manifest,
+        name="replay execution manifest",
+    )
+    submission = _strict_json_object(
+        submission_receipt,
+        name="replay submission receipt",
+    )
+    exit_document = _strict_json_object(exit_receipt, name="replay EXIT receipt")
+    profile = get_strict_captured_replay_profile(
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    projection, payloads, _ = _sealed_result_payloads_v2(
+        verified_result,
+        replay_execution_manifest=manifest,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    result_root = projection["result_root"]
+    declared = manifest["artifacts"]["outputs"]
+    _require_exact_keys(
+        exit_document.get("outputs"),
+        REPLAY_OUTPUT_V2_KEYS,
+        name="EXIT outputs",
+    )
+    references: dict[str, dict[str, str]] = {}
+    relative_by_output = {
+        "scorer_call_index": profile.scorer_terminal_index_path,
+        "transport_consumption": "model-transport-replay-consumption.json",
+        "transcript_bundle": "transcript-bundle.json",
+        "replay_ledger": "replay-ledger.json",
+    }
+    for name in sorted(REPLAY_OUTPUT_V2_KEYS):
+        reference = _artifact_reference(
+            exit_document["outputs"][name],
+            name=f"EXIT output {name}",
+            expected_schema=declared[name]["schema"],
+        )
+        relative = relative_by_output[name]
+        raw = payloads[relative]
+        if (
+            reference["path"] != f"{result_root}/{relative}"
+            or reference["path"] != declared[name]["path"]
+            or reference["sha256"] != hashlib.sha256(raw).hexdigest()
+        ):
+            raise ValueError(f"EXIT output {name} differs from retained member bytes")
+        references[name] = reference
+
+    transcript_raw = payloads[relative_by_output["transcript_bundle"]]
+    transcript, _ = decode_evidence_document_bytes(
+        raw=transcript_raw,
+        expected_sha256=references["transcript_bundle"]["sha256"],
+        trailing_lf=False,
+    )
+    validate_transcript_bundle(transcript)
+    consumption_raw = payloads[relative_by_output["transport_consumption"]]
+    consumption, _ = decode_evidence_document_bytes(
+        raw=consumption_raw,
+        expected_sha256=references["transport_consumption"]["sha256"],
+        trailing_lf=False,
+    )
+    validate_strict_model_transport_replay_consumption_v3(
+        consumption,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    source_transcript = _strict_json_object(
+        authenticated_source.transcript_bundle,
+        name="authenticated OFF source transcript",
+    )
+    validate_transcript_bundle(source_transcript)
+    source_transcript_ref = _artifact_reference(
+        manifest["source_capture"]["step1_evidence"]["transcript_bundle"],
+        name="source transcript bundle",
+        expected_schema=TRANSCRIPT_BUNDLE_SCHEMA,
+    )
+    if source_transcript_ref["sha256"] != document_sha256(
+        source_transcript,
+        trailing_lf=False,
+    ):
+        raise ValueError("authenticated OFF source transcript digest differs")
+    validate_captured_replay_source_join(
+        source_transcript_bundle=source_transcript,
+        replay_transcript_bundle=transcript,
+    )
+    ledger_raw = payloads[relative_by_output["replay_ledger"]]
+    ledger, _ = decode_evidence_document_bytes(
+        raw=ledger_raw,
+        expected_sha256=references["replay_ledger"]["sha256"],
+        trailing_lf=False,
+    )
+    validate_captured_replay_step1_ledger(
+        ledger,
+        source_transcript_document=source_transcript,
+        transcript_document=transcript,
+    )
+    validate_ledger_transcript_join(ledger=ledger, transcript_bundle=transcript)
+
+    scorer_relative = profile.scorer_terminal_index_path
+    child_prefix = "strict_gym_child_runtime/"
+    child_payloads = tuple(
+        (relative, payloads[relative]) for relative in profile.result_files if relative.startswith(child_prefix)
+    )
+    bootstrap_program = manifest["replay_contract"]["program"]["gym_child_bootstrap"]
+    bootstrap_relative = Path(bootstrap_program["path"])
+    if (
+        bootstrap_relative.is_absolute()
+        or bootstrap_relative.name != "sitecustomize.py"
+        or any(part in {"", ".", ".."} for part in bootstrap_relative.parts)
+    ):
+        raise ValueError("authenticated Gym bootstrap path is noncanonical")
+    snapshot_root = _canonical_absolute_path(
+        manifest["replay_contract"]["source_snapshot"]["ref"]["path"],
+        name="authenticated replay source snapshot",
+    )
+    bootstrap_root = snapshot_root / bootstrap_relative.parent
+    scorer_document, scorer_sha256 = validate_finalized_format_verification_call_index_payloads(
+        child_payloads,
+        expected_sha256=references["scorer_call_index"]["sha256"],
+        expected_receipt_root=Path(result_root) / "strict_gym_child_runtime",
+        expected_bootstrap_root=bootstrap_root,
+        expected_bootstrap_sha256=bootstrap_program["sha256"],
+        expected_pair_id=manifest["pair_id"],
+        expected_job_id=exit_document["authenticated_job_id"],
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    if scorer_sha256 != hashlib.sha256(payloads[scorer_relative]).hexdigest():
+        raise ValueError("scorer validator returned a different terminal digest")
+    scorer_resource, _ = decode_evidence_document_bytes(
+        raw=payloads["strict_gym_child_runtime/resource.json"],
+        expected_sha256=hashlib.sha256(payloads["strict_gym_child_runtime/resource.json"]).hexdigest(),
+        trailing_lf=False,
+    )
+    driver_process, _ = _validate_scorer_resource_process_v2(
+        replay_execution_manifest=manifest,
+        driver_process=exit_document["driver_process"],
+        resource_process=scorer_resource["process"],
+    )
+
+    documents = {
+        "transcript_bundle": transcript,
+        "transport_consumption": consumption,
+        "replay_ledger": ledger,
+        "scorer_call_index": scorer_document,
+    }
+    device_environment = _validate_scheduler_device_environment(exit_document["driver_scheduler_device_environment"])
+    _close_replay_output_documents(
+        documents,
+        references=references,
+        replay_execution_manifest=manifest,
+        submission_receipt=submission,
+        authenticated_job_id=exit_document["authenticated_job_id"],
+        driver_process=driver_process,
+        driver_scheduler_device_environment=device_environment,
+        source_transcript_ref=source_transcript_ref,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    expected_runtime = _replay_runtime_attestation(manifest, references)
+    if not _exact_json_equal(exit_document["runtime_attestation"], expected_runtime):
+        raise ValueError("EXIT runtime attestation differs from retained outputs")
+    samples: list[dict[str, Any]] = []
+    for entry in transcript["entries"]:
+        verifier_response = _strict_json_object(
+            entry["verifier_response"],
+            name="replay verifier response",
+        )
+        match_details = _strict_json_object(
+            verifier_response["match_details"],
+            name="replay verifier match_details",
+        )
+        samples.append(
+            {
+                "sample_index": entry["sample_index"],
+                "fixture_row_index": entry["fixture_row_index"],
+                "rollout_index": entry["rollout_index"],
+                "generation_seed": entry["generation_seed"],
+                "model_transport_entry_sha256": entry["model_transport_entry_sha256"],
+                "model_transport_request_body_sha256": entry["model_transport_request_body_sha256"],
+                "model_transport_response_body_sha256": entry["model_transport_response_body_sha256"],
+                "model_response_sha256": entry["model_response_sha256"],
+                "match_details": match_details,
+                "raw_environment_reward": entry["raw_environment_reward"],
+            }
+        )
+    if len(samples) != K4_SAMPLES:
+        raise ValueError("authenticated result semantic projection is not exact K=4")
+    canonical_ascii_json(samples)
+    return documents, samples
+
+
+def _validate_lifecycle_before_result_v2(
+    *,
+    replay_execution_manifest: Mapping[str, Any],
+    submission_receipt: Mapping[str, Any],
+    pre_receipt: Mapping[str, Any],
+    exit_receipt: Mapping[str, Any],
+    authenticated_source: AuthenticatedOffSourceCapture,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, str],
+]:
+    """Validate all M4/S5/PRE3/EXIT6 authority before opening result_root."""
+    manifest = _strict_json_object(
+        replay_execution_manifest,
+        name="replay execution manifest",
+    )
+    submission = _strict_json_object(
+        submission_receipt,
+        name="replay submission receipt",
+    )
+    pre = _strict_json_object(pre_receipt, name="replay PRE receipt")
+    exit_document = _strict_json_object(exit_receipt, name="replay EXIT receipt")
+    validate_captured_replay_submission_receipt_v2(
+        submission,
+        replay_execution_manifest=manifest,
+        authenticated_source=authenticated_source,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    validate_captured_replay_pre_receipt_v2(
+        pre,
+        replay_execution_manifest=manifest,
+        submission_receipt=submission,
+        authenticated_source=authenticated_source,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    _require_exact_keys(
+        exit_document,
+        REPLAY_EXIT_V2_ROOT_KEYS,
+        name="replay EXIT receipt",
+    )
+    expected_exit_envelope = {
+        "schema": REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA,
+        "scorer_profile": manifest["scorer_profile"],
+        "phase": "EXIT",
+        "status": "complete",
+        "pair_id": manifest["pair_id"],
+        "environment": expected_environment,
+        "arm": "on",
+        "mode": "fresh_verifier_reward_replay",
+        "attempt_id": manifest["attempt_id"],
+    }
+    _require_exact_projection(
+        exit_document,
+        expected_exit_envelope,
+        name="EXIT envelope",
+    )
+    for name in (
+        "replay_execution_manifest",
+        "submission_receipt",
+        "candidate_job_id",
+        "authenticated_job_id",
+        "job",
+        "static_boundary",
+    ):
+        if not _exact_json_equal(exit_document[name], pre[name]):
+            raise ValueError(f"EXIT {name} differs from authenticated PRE")
+    authenticated_job_id = _require_job_id(
+        exit_document["authenticated_job_id"],
+        name="authenticated_job_id",
+    )
+    if exit_document["candidate_job_id"] != authenticated_job_id:
+        raise ValueError("EXIT candidate/authenticated job IDs differ")
+    pair = _strict_json_object(
+        authenticated_source.pair_manifest,
+        name="authenticated Pair manifest",
+    )
+    campaign = _strict_json_object(pair["campaign"], name="Pair campaign")
+    expected_job = {
+        "account": campaign["slurm"]["account"],
+        "name": manifest["scheduler_submission"]["identity"]["job_name"],
+        "num_nodes": campaign["nodes"],
+        "partition": campaign["slurm"]["partition"],
+        "qos": campaign["slurm"]["qos"],
+        "gpus_per_node": 4,
+        "restart_count": 0,
+    }
+    if not _exact_json_equal(exit_document["job"], expected_job):
+        raise ValueError("EXIT job allocation differs from authenticated Pair")
+    receipt_paths = _final_receipt_paths_v2(
+        manifest,
+        authenticated_job_id=authenticated_job_id,
+    )
+    expected_pre_ref = _final_receipt_reference(
+        path=receipt_paths["pre"],
+        schema=REPLAY_JOB_PRE_RECEIPT_V2_SCHEMA,
+        document=pre,
+        trailing_lf=True,
+    )
+    if not _exact_json_equal(exit_document["pre_receipt"], expected_pre_ref):
+        raise ValueError("EXIT PRE reference differs from owned PRE bytes")
+    query_ref, query = _load_replay_scheduler_query_reference(
+        exit_document["post_scheduler_query"],
+        phase="POST",
+        expected_path=_job_query_path(
+            manifest,
+            authenticated_job_id,
+            "POST",
+            raw=False,
+        ),
+        replay_execution_manifest=manifest,
+        authenticated_source=authenticated_source,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    if not _exact_json_equal(query_ref, exit_document["post_scheduler_query"]):
+        raise ValueError("EXIT POST scheduler query reference is noncanonical")
+    _close_scheduler_query_to_lifecycle(
+        query,
+        replay_execution_manifest=manifest,
+        candidate_job_id=authenticated_job_id,
+        comment=submission["comment"],
+        submitter_euid=submission["submitter_euid"],
+    )
+    if type(exit_document["driver_exit_code"]) is not int or exit_document["driver_exit_code"] != 0:
+        raise ValueError("successful replay EXIT requires exact exit code zero")
+    _validate_hardware(
+        exit_document["hardware"],
+        replay_execution_manifest=manifest,
+    )
+    wrapper_devices = _validate_scheduler_device_environment(exit_document["scheduler_device_environment"])
+    driver_devices = _validate_scheduler_device_environment(exit_document["driver_scheduler_device_environment"])
+    if not _exact_json_equal(wrapper_devices, driver_devices):
+        raise ValueError("EXIT wrapper/driver scheduler device environments differ")
+    _validate_process(exit_document["driver_process"])
+    if exit_document["post_verified"] is not True:
+        raise ValueError("successful replay EXIT must be post-verified")
+    _require_exact_keys(
+        exit_document["outputs"],
+        REPLAY_OUTPUT_V2_KEYS,
+        name="EXIT outputs",
+    )
+    declared_outputs = manifest["artifacts"]["outputs"]
+    output_refs: dict[str, dict[str, str]] = {}
+    for name in sorted(REPLAY_OUTPUT_V2_KEYS):
+        declaration = declared_outputs[name]
+        reference = _artifact_reference(
+            exit_document["outputs"][name],
+            name=f"EXIT output {name}",
+            expected_schema=declaration["schema"],
+        )
+        if reference["path"] != declaration["path"]:
+            raise ValueError(f"EXIT output {name} path differs from M4")
+        output_refs[name] = reference
+    expected_runtime = _replay_runtime_attestation(manifest, output_refs)
+    _require_exact_keys(
+        exit_document["runtime_attestation"],
+        REPLAY_RUNTIME_ATTESTATION_V2_KEYS,
+        name="EXIT runtime attestation",
+    )
+    if not _exact_json_equal(exit_document["runtime_attestation"], expected_runtime):
+        raise ValueError("EXIT runtime attestation differs from declared outputs")
+    if exit_document["runtime_attestation"]["original_process_reaped"] is not True:
+        raise ValueError("EXIT runtime attestation does not prove scorer reaping")
+
+    return manifest, submission, pre, exit_document, receipt_paths
+
+
+def _validate_terminal_result_v2(
+    *,
+    validated_lifecycle: tuple[
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, str],
+    ],
+    evidence_index: Mapping[str, Any],
+    authenticated_source: AuthenticatedOffSourceCapture,
+    verified_result: Any,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> list[dict[str, Any]]:
+    """Close retained outputs/index using an already authenticated lifecycle."""
+    if type(validated_lifecycle) is not tuple or len(validated_lifecycle) != 5:
+        raise TypeError("validated lifecycle must be the exact private five-value tuple")
+    manifest, submission, pre, exit_document = (
+        _strict_json_object(document, name=name)
+        for document, name in zip(
+            validated_lifecycle[:4],
+            (
+                "replay execution manifest",
+                "replay submission receipt",
+                "replay PRE receipt",
+                "replay EXIT receipt",
+            ),
+            strict=True,
+        )
+    )
+    authenticated_job_id = _require_job_id(
+        exit_document["authenticated_job_id"],
+        name="authenticated_job_id",
+    )
+    receipt_paths = _final_receipt_paths_v2(
+        manifest,
+        authenticated_job_id=authenticated_job_id,
+    )
+    if not _exact_json_equal(validated_lifecycle[4], receipt_paths):
+        raise ValueError("validated lifecycle receipt paths differ")
+    index = _strict_json_object(evidence_index, name="replay evidence index")
+
+    _, samples = _validate_sealed_result_outputs_v2(
+        replay_execution_manifest=manifest,
+        submission_receipt=submission,
+        exit_receipt=exit_document,
+        authenticated_source=authenticated_source,
+        verified_result=verified_result,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    _require_exact_keys(index, REPLAY_POST_INDEX_V2_ROOT_KEYS, name="replay index")
+    expected_index_envelope = {
+        "schema": REPLAY_POST_INDEX_V2_SCHEMA,
+        "scorer_profile": manifest["scorer_profile"],
+        "original_process_reaped": True,
+        "profile_id": expected_profile_id,
+        "hash_domain": HASH_DOMAIN,
+        "pair_id": manifest["pair_id"],
+        "environment": expected_environment,
+        "arm": "on",
+        "mode": "fresh_verifier_reward_replay",
+        "attempt_id": manifest["attempt_id"],
+    }
+    _require_exact_projection(index, expected_index_envelope, name="index envelope")
+    expected_index_refs = {
+        "replay_execution_manifest": submission["replay_execution_manifest"],
+        "pair_submission_receipt": manifest["pair"]["submission_receipt"],
+        "submission_receipt": pre["submission_receipt"],
+        "pre_receipt": exit_document["pre_receipt"],
+        "exit_receipt": _final_receipt_reference(
+            path=receipt_paths["exit"],
+            schema=REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA,
+            document=exit_document,
+            trailing_lf=True,
+        ),
+        "source_capture": manifest["source_capture"],
+        "outputs": exit_document["outputs"],
+    }
+    for name, expected in expected_index_refs.items():
+        if not _exact_json_equal(index[name], expected):
+            raise ValueError(f"replay index {name} differs from lifecycle authority")
+    expected_identity = {
+        "candidate_job_id": authenticated_job_id,
+        "authenticated_job_id": authenticated_job_id,
+        "driver_process": _validate_process(exit_document["driver_process"]),
+        "run_id": replay_run_id(
+            environment=expected_environment,
+            pair_id=manifest["pair_id"],
+            attempt_id=manifest["attempt_id"],
+        ),
+    }
+    if not _exact_json_equal(index["identity"], expected_identity):
+        raise ValueError("replay index identity differs from lifecycle authority")
+    canonical_ascii_json(index)
+    return samples
+
+
+def _validate_terminal_lifecycle_v2(
+    *,
+    replay_execution_manifest: Mapping[str, Any],
+    submission_receipt: Mapping[str, Any],
+    pre_receipt: Mapping[str, Any],
+    exit_receipt: Mapping[str, Any],
+    evidence_index: Mapping[str, Any],
+    authenticated_source: AuthenticatedOffSourceCapture,
+    verified_result: Any,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> list[dict[str, Any]]:
+    """Validate the complete lifecycle and retained terminal result graph."""
+    lifecycle = _validate_lifecycle_before_result_v2(
+        replay_execution_manifest=replay_execution_manifest,
+        submission_receipt=submission_receipt,
+        pre_receipt=pre_receipt,
+        exit_receipt=exit_receipt,
+        authenticated_source=authenticated_source,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    return _validate_terminal_result_v2(
+        validated_lifecycle=lifecycle,
+        evidence_index=evidence_index,
+        authenticated_source=authenticated_source,
+        verified_result=verified_result,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+
+
+def build_captured_replay_result_final_receipt_v2(
+    *,
+    replay_execution_manifest: Mapping[str, Any],
+    authenticated_source: AuthenticatedOffSourceCapture,
+    expected_environment: str,
+    expected_profile_id: str,
+    submission_receipt: Mapping[str, Any],
+    pre_receipt: Mapping[str, Any],
+    exit_receipt: Mapping[str, Any],
+    evidence_index: Mapping[str, Any],
+    verified_result: Any,
+) -> dict[str, Any]:
+    """Build FINAL only from a validated lifecycle and verifier-retained bytes."""
+    frozen_submission = _strict_json_object(
+        submission_receipt,
+        name="replay submission receipt",
+    )
+    frozen_pre = _strict_json_object(pre_receipt, name="replay PRE receipt")
+    frozen_exit = _strict_json_object(exit_receipt, name="replay EXIT receipt")
+    frozen_index = _strict_json_object(evidence_index, name="replay evidence index")
+    manifest = _validated_lifecycle_manifest(
+        replay_execution_manifest,
+        authenticated_source=authenticated_source,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    _validate_terminal_lifecycle_v2(
+        replay_execution_manifest=manifest,
+        submission_receipt=frozen_submission,
+        pre_receipt=frozen_pre,
+        exit_receipt=frozen_exit,
+        evidence_index=frozen_index,
+        authenticated_source=authenticated_source,
+        verified_result=verified_result,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    document, _ = _derive_result_final_receipt_v2(
+        replay_execution_manifest=manifest,
+        submission_receipt=frozen_submission,
+        pre_receipt=frozen_pre,
+        exit_receipt=frozen_exit,
+        evidence_index=frozen_index,
+        verified_result=verified_result,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    return document
+
+
+def publish_captured_replay_result_final_receipt_v2(
+    *,
+    output: str | Path,
+    document: Mapping[str, Any],
+    replay_execution_manifest: Mapping[str, Any],
+    authenticated_source: AuthenticatedOffSourceCapture,
+    expected_environment: str,
+    expected_profile_id: str,
+    submission_receipt: Mapping[str, Any],
+    pre_receipt: Mapping[str, Any],
+    exit_receipt: Mapping[str, Any],
+    evidence_index: Mapping[str, Any],
+    verified_result: Any,
+) -> tuple[Path, str]:
+    """Exclusively publish the externally carried post-seal FINAL receipt."""
+    frozen_manifest = _strict_json_object(
+        replay_execution_manifest,
+        name="replay execution manifest",
+    )
+    expected = build_captured_replay_result_final_receipt_v2(
+        replay_execution_manifest=frozen_manifest,
+        authenticated_source=authenticated_source,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+        submission_receipt=submission_receipt,
+        pre_receipt=pre_receipt,
+        exit_receipt=exit_receipt,
+        evidence_index=evidence_index,
+        verified_result=verified_result,
+    )
+    expected_path = _final_receipt_paths_v2(
+        frozen_manifest,
+        authenticated_job_id=expected["authenticated_job_id"],
+    )["final"]
+    supplied = _strict_json_object(document, name="result FINAL receipt")
+    _require_exact_keys(
+        supplied,
+        REPLAY_RESULT_FINAL_V2_ROOT_KEYS,
+        name="result FINAL receipt",
+    )
+    if not _exact_json_equal(supplied, expected):
+        raise ValueError("result FINAL receipt differs from retained authority")
+    actual_path = str(_canonical_absolute_path(str(output), name="FINAL output path"))
+    if actual_path != expected_path:
+        raise ValueError("FINAL output path differs from authenticated job receipt root")
+    return publish_evidence_document(
+        output=actual_path,
+        document=supplied,
+        trailing_lf=True,
+    )
+
+
+def _validate_result_final_receipt_v2(
+    document: Mapping[str, Any],
+    *,
+    replay_execution_manifest: Mapping[str, Any],
+    replay_execution_manifest_path: str,
+    replay_execution_manifest_sha256: str,
+    submission_receipt_sha256: str,
+    candidate_job_id: str,
+    result_final_receipt_path: str,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> dict[str, Any]:
+    """Validate the external FINAL envelope before following any of its refs."""
+    manifest = _strict_json_object(
+        replay_execution_manifest,
+        name="replay execution manifest",
+    )
+    final = _strict_json_object(document, name="result FINAL receipt")
+    _require_exact_keys(
+        final,
+        REPLAY_RESULT_FINAL_V2_ROOT_KEYS,
+        name="result FINAL receipt",
+    )
+    expected_envelope = {
+        "schema": REPLAY_RESULT_FINAL_RECEIPT_V2_SCHEMA,
+        "hash_domain": HASH_DOMAIN,
+        "phase": "FINAL",
+        "status": "complete",
+        "pair_id": manifest["pair_id"],
+        "environment": expected_environment,
+        "scorer_profile": manifest["scorer_profile"],
+        "arm": "on",
+        "mode": "fresh_verifier_reward_replay",
+        "attempt_id": manifest["attempt_id"],
+        "original_process_reaped": True,
+    }
+    _require_exact_projection(final, expected_envelope, name="FINAL envelope")
+    if final["original_process_reaped"] is not True:
+        raise ValueError("FINAL must prove original scorer-process reaping")
+    if manifest["scorer_profile"].get("profile_id") != expected_profile_id:
+        raise ValueError("FINAL manifest profile differs from expected profile")
+
+    candidate = _require_job_id(
+        final["candidate_job_id"],
+        name="FINAL candidate_job_id",
+    )
+    authenticated = _require_job_id(
+        final["authenticated_job_id"],
+        name="FINAL authenticated_job_id",
+    )
+    expected_candidate = _require_job_id(candidate_job_id, name="candidate_job_id")
+    if candidate != expected_candidate or authenticated != expected_candidate:
+        raise ValueError("FINAL candidate/authenticated job IDs differ from submit authority")
+    _validate_process(final["driver_process"])
+
+    manifest_ref = _artifact_reference(
+        final["replay_execution_manifest"],
+        name="FINAL replay execution manifest",
+        expected_schema=REPLAY_EXECUTION_MANIFEST_V2_SCHEMA,
+    )
+    canonical_manifest_path = _canonical_replay_manifest_path_v2(manifest)
+    if (
+        replay_execution_manifest_path != canonical_manifest_path
+        or manifest_ref["path"] != canonical_manifest_path
+        or manifest_ref["sha256"] != replay_execution_manifest_sha256
+    ):
+        raise ValueError("FINAL manifest reference differs from OOB canonical M4 authority")
+    submission_ref = _artifact_reference(
+        final["submission_receipt"],
+        name="FINAL submission receipt",
+        expected_schema=REPLAY_SUBMISSION_RECEIPT_V2_SCHEMA,
+    )
+    declared_submission = manifest["scheduler_submission"]["receipt"]
+    if submission_ref["path"] != declared_submission["path"] or submission_ref["sha256"] != submission_receipt_sha256:
+        raise ValueError("FINAL submission reference differs from OOB S5 authority")
+
+    paths = _final_receipt_paths_v2(
+        manifest,
+        authenticated_job_id=authenticated,
+    )
+    actual_final_path = str(
+        _canonical_absolute_path(
+            result_final_receipt_path,
+            name="result FINAL receipt path",
+        )
+    )
+    if actual_final_path != paths["final"]:
+        raise ValueError("FINAL is not at the authenticated job receipt root")
+    pre_ref = _artifact_reference(
+        final["pre_receipt"],
+        name="FINAL PRE receipt",
+        expected_schema=REPLAY_JOB_PRE_RECEIPT_V2_SCHEMA,
+    )
+    exit_ref = _artifact_reference(
+        final["exit_receipt"],
+        name="FINAL EXIT receipt",
+        expected_schema=REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA,
+    )
+    if pre_ref["path"] != paths["pre"] or exit_ref["path"] != paths["exit"]:
+        raise ValueError("FINAL PRE/EXIT paths differ from authenticated job identity")
+
+    index_ref = _artifact_reference(
+        final["evidence_index"],
+        name="FINAL evidence index",
+        expected_schema=REPLAY_POST_INDEX_V2_SCHEMA,
+    )
+    result = _strict_json_object(final["result"], name="FINAL result")
+    _require_exact_keys(result, frozenset({"root", "inventory"}), name="FINAL result")
+    result_root = str(_canonical_absolute_path(result["root"], name="FINAL result root"))
+    declared_root = str(
+        _canonical_absolute_path(
+            manifest["artifacts"]["outputs"]["directory"]["path"],
+            name="manifest result root",
+        )
+    )
+    if result_root != declared_root:
+        raise ValueError("FINAL result root differs from M4 output authority")
+    declared_index = manifest["artifacts"]["outputs"]["evidence_index"]
+    if index_ref["path"] != declared_index["path"]:
+        raise ValueError("FINAL evidence index path differs from M4")
+    inventory_ref = _artifact_reference(
+        result["inventory"],
+        name="FINAL result inventory",
+        expected_schema=_RESULT_INVENTORY_V2_SCHEMA,
+    )
+    if inventory_ref["path"] != f"{result_root}/{_RESULT_INVENTORY_V2_FILENAME}":
+        raise ValueError("FINAL inventory path differs from result root")
+    receipt_bytes(final)
+    return final
+
+
+def load_authenticated_captured_replay_result_v2(
+    *,
+    authenticated_source: AuthenticatedOffSourceCapture,
+    replay_execution_manifest_path: str,
+    replay_execution_manifest_sha256: str,
+    submission_receipt_sha256: str,
+    candidate_job_id: str,
+    result_final_receipt_path: str,
+    result_final_receipt_sha256: str,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> AuthenticatedCapturedReplayResultV2:
+    """Authenticate one terminal replay from OOB M4/S5/FINAL authority.
+
+    The sealed inventory and its exact thirteen members are captured once by the
+    sealer verifier.  Every subsequent semantic check consumes only those retained
+    bytes; no named result member is reopened after the verifier mints authority.
+    This V2 boundary is deliberately limited to citation/freeform profiles;
+    reasoning_gym remains on the separately versioned V1 replay path.
+    """
+    if type(expected_environment) is not str or type(expected_profile_id) is not str:
+        raise TypeError("expected environment/profile must be exact strings")
+    if _RESULT_PROFILE_IDS_V2.get(expected_environment) != expected_profile_id:
+        raise ValueError("authenticated result V2 admits only the exact citation/freeform profiles")
+    manifest_path = str(
+        _canonical_absolute_path(
+            replay_execution_manifest_path,
+            name="replay execution manifest path",
+        )
+    )
+    final_path = str(
+        _canonical_absolute_path(
+            result_final_receipt_path,
+            name="result FINAL receipt path",
+        )
+    )
+    manifest_sha256 = _require_digest(
+        replay_execution_manifest_sha256,
+        name="replay execution manifest SHA-256",
+    )
+    submission_sha256 = _require_digest(
+        submission_receipt_sha256,
+        name="submission receipt SHA-256",
+    )
+    final_sha256 = _require_digest(
+        result_final_receipt_sha256,
+        name="result FINAL receipt SHA-256",
+    )
+    candidate = _require_job_id(candidate_job_id, name="candidate_job_id")
+
+    # Freeze both independent OOB roots before importing or consulting any
+    # manifest-selected executable, source, lifecycle, or result pathname.
+    manifest_document, loaded_manifest_sha256, manifest_raw = _load_evidence_document_owned(
+        path=manifest_path,
+        expected_sha256=manifest_sha256,
+        trailing_lf=False,
+    )
+    final_document, loaded_final_sha256, final_raw = _load_evidence_document_owned(
+        path=final_path,
+        expected_sha256=final_sha256,
+        trailing_lf=True,
+    )
+    if loaded_manifest_sha256 != manifest_sha256 or loaded_final_sha256 != final_sha256:
+        raise AssertionError("unreachable OOB root digest mismatch")
+    final = _validate_result_final_receipt_v2(
+        final_document,
+        replay_execution_manifest=manifest_document,
+        replay_execution_manifest_path=manifest_path,
+        replay_execution_manifest_sha256=manifest_sha256,
+        submission_receipt_sha256=submission_sha256,
+        candidate_job_id=candidate,
+        result_final_receipt_path=final_path,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+
+    # Only an M4/FINAL pair that closes syntactically and cryptographically may
+    # select the executable closure used for full source/static authentication.
+    _authenticate_program_closure_v2(manifest_document)
+    from nemo_rl.utils.strict_captured_replay_manifest_v2 import (
+        AuthenticatedOffSourceCapture,
+        _reload_authenticated_off_source_capture,
+    )
+    from nemo_rl.utils.strict_captured_replay_seal_v2 import verify_sealed_result_v2
+
+    if type(authenticated_source) is not AuthenticatedOffSourceCapture:
+        raise TypeError("authenticated_source must be an exact OFF-source capability")
+    # Refresh the public-constructible source capability before consulting any of
+    # its detached fields.  The returned object is retained privately thereafter.
+    source = _reload_authenticated_off_source_capture(authenticated_source)
+    manifest = _validated_lifecycle_manifest(
+        manifest_document,
+        authenticated_source=source,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    if manifest_path != _canonical_replay_manifest_path_v2(manifest):
+        raise ValueError("OOB M4 authority is not at its canonical publication path")
+    # Repeat the envelope join after full M4 validation so no malformed field used
+    # during early fail-closed screening escapes the authenticated manifest shape.
+    final = _validate_result_final_receipt_v2(
+        final,
+        replay_execution_manifest=manifest,
+        replay_execution_manifest_path=manifest_path,
+        replay_execution_manifest_sha256=manifest_sha256,
+        submission_receipt_sha256=submission_sha256,
+        candidate_job_id=candidate,
+        result_final_receipt_path=final_path,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+
+    submission_path = manifest["scheduler_submission"]["receipt"]["path"]
+    submission, loaded_submission_sha256, submission_raw = _load_evidence_document_owned(
+        path=submission_path,
+        expected_sha256=submission_sha256,
+        trailing_lf=True,
+    )
+    if (
+        loaded_submission_sha256 != submission_sha256
+        or submission.get("schema") != REPLAY_SUBMISSION_RECEIPT_V2_SCHEMA
+        or _require_job_id(
+            submission.get("candidate_job_id"),
+            name="submission candidate_job_id",
+        )
+        != candidate
+    ):
+        raise ValueError("loaded S5 differs from OOB candidate/submission authority")
+    expected_manifest_ref = {
+        "path": manifest_path,
+        "schema": REPLAY_EXECUTION_MANIFEST_V2_SCHEMA,
+        "sha256": manifest_sha256,
+    }
+    if not _exact_json_equal(
+        submission.get("replay_execution_manifest"),
+        expected_manifest_ref,
+    ):
+        raise ValueError("S5 manifest reference differs from OOB M4 authority")
+
+    pre_ref = _artifact_reference(
+        final["pre_receipt"],
+        name="FINAL PRE receipt",
+        expected_schema=REPLAY_JOB_PRE_RECEIPT_V2_SCHEMA,
+    )
+    pre, pre_sha256, pre_raw = _load_evidence_document_owned(
+        path=pre_ref["path"],
+        expected_sha256=pre_ref["sha256"],
+        trailing_lf=True,
+    )
+    if pre_sha256 != pre_ref["sha256"] or pre.get("schema") != REPLAY_JOB_PRE_RECEIPT_V2_SCHEMA:
+        raise ValueError("loaded PRE3 differs from FINAL authority")
+    authenticated = _require_job_id(
+        pre.get("authenticated_job_id"),
+        name="PRE authenticated_job_id",
+    )
+    if (
+        pre.get("candidate_job_id") != candidate
+        or authenticated != candidate
+        or final["authenticated_job_id"] != authenticated
+    ):
+        raise ValueError("PRE does not authenticate the submitted candidate job ID")
+
+    exit_ref = _artifact_reference(
+        final["exit_receipt"],
+        name="FINAL EXIT receipt",
+        expected_schema=REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA,
+    )
+    exit_document, exit_sha256, exit_raw = _load_evidence_document_owned(
+        path=exit_ref["path"],
+        expected_sha256=exit_ref["sha256"],
+        trailing_lf=True,
+    )
+    if exit_sha256 != exit_ref["sha256"] or exit_document.get("schema") != REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA:
+        raise ValueError("loaded EXIT6 differs from FINAL authority")
+
+    # S5, PRE3, and every non-result EXIT6 field must authenticate before the
+    # result root is opened.  A lifecycle poison therefore cannot select even a
+    # schema-valid sealed tree for verification.
+    validated_lifecycle = _validate_lifecycle_before_result_v2(
+        replay_execution_manifest=manifest,
+        submission_receipt=submission,
+        pre_receipt=pre,
+        exit_receipt=exit_document,
+        authenticated_source=source,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    _, validated_submission, validated_pre, validated_exit, receipt_paths = validated_lifecycle
+    expected_exit_ref = _final_receipt_reference(
+        path=receipt_paths["exit"],
+        schema=REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA,
+        document=validated_exit,
+        trailing_lf=True,
+    )
+    pre_result_final_joins = {
+        "replay_execution_manifest": validated_submission["replay_execution_manifest"],
+        "submission_receipt": validated_pre["submission_receipt"],
+        "pre_receipt": validated_exit["pre_receipt"],
+        "exit_receipt": expected_exit_ref,
+        "candidate_job_id": validated_exit["candidate_job_id"],
+        "authenticated_job_id": validated_exit["authenticated_job_id"],
+        "driver_process": validated_exit["driver_process"],
+        "original_process_reaped": validated_exit["runtime_attestation"]["original_process_reaped"],
+    }
+    for name, expected in pre_result_final_joins.items():
+        if not _exact_json_equal(final[name], expected):
+            raise ValueError(f"FINAL {name} differs from authenticated EXIT lifecycle")
+
+    result = _strict_json_object(final["result"], name="FINAL result")
+    inventory_ref = _artifact_reference(
+        result["inventory"],
+        name="FINAL result inventory",
+        expected_schema="nemo-rl-strict-captured-replay-result-inventory-v2",
+    )
+    verified_result = verify_sealed_result_v2(
+        result_root=result["root"],
+        expected_inventory_sha256=inventory_ref["sha256"],
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    projection, payloads, _ = _sealed_result_payloads_v2(
+        verified_result,
+        replay_execution_manifest=manifest,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    index_raw = payloads["evidence-index.json"]
+    index, index_sha256 = decode_evidence_document_bytes(
+        raw=index_raw,
+        expected_sha256=final["evidence_index"]["sha256"],
+        trailing_lf=False,
+    )
+    if index_sha256 != final["evidence_index"]["sha256"]:
+        raise AssertionError("unreachable retained index digest mismatch")
+
+    _validate_terminal_result_v2(
+        validated_lifecycle=validated_lifecycle,
+        evidence_index=index,
+        authenticated_source=source,
+        verified_result=verified_result,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    expected_final, expected_final_path = _derive_result_final_receipt_v2(
+        replay_execution_manifest=manifest,
+        submission_receipt=submission,
+        pre_receipt=pre,
+        exit_receipt=exit_document,
+        evidence_index=index,
+        verified_result=verified_result,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    if expected_final_path != final_path or not _exact_json_equal(final, expected_final):
+        raise ValueError("FINAL differs from the fully authenticated lifecycle graph")
+    if projection["inventory"]["sha256"] != inventory_ref["sha256"]:
+        raise ValueError("retained inventory differs from FINAL authority")
+
+    source_transcript_raw = canonical_ascii_json(source.transcript_bundle)
+    source_transcript_ref = manifest["source_capture"]["step1_evidence"]["transcript_bundle"]
+    decode_evidence_document_bytes(
+        raw=source_transcript_raw,
+        expected_sha256=source_transcript_ref["sha256"],
+        trailing_lf=False,
+    )
+    return AuthenticatedCapturedReplayResultV2(
+        _mint_token=_AUTHENTICATED_REPLAY_RESULT_V2_MINT_TOKEN,
+        authenticated_source=source,
+        candidate_job_id=candidate,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+        final_path=final_path,
+        final_sha256=final_sha256,
+        manifest_raw=bytes(manifest_raw),
+        submission_raw=bytes(submission_raw),
+        pre_raw=bytes(pre_raw),
+        exit_raw=bytes(exit_raw),
+        final_raw=bytes(final_raw),
+        source_transcript_raw=bytes(source_transcript_raw),
+        result_capability=verified_result,
+    )
+
+
+def snapshot_authenticated_captured_replay_result_v2(
+    value: AuthenticatedCapturedReplayResultV2,
+) -> dict[str, Any]:
+    """Return a fresh detached semantic snapshot from owned authenticated bytes."""
+    if type(value) is not AuthenticatedCapturedReplayResultV2:
+        raise TypeError("authenticated result snapshot requires the exact V2 capability")
+    try:
+        token = object.__getattribute__(
+            value,
+            "_AuthenticatedCapturedReplayResultV2__mint_token",
+        )
+    except AttributeError as error:
+        raise ValueError("authenticated result capability token differs") from error
+    if token is not _AUTHENTICATED_REPLAY_RESULT_V2_MINT_TOKEN:
+        raise ValueError("authenticated result capability token differs")
+
+    def owned(name: str) -> Any:
+        return object.__getattribute__(
+            value,
+            f"_AuthenticatedCapturedReplayResultV2__{name}",
+        )
+
+    candidate = _require_job_id(owned("candidate_job_id"), name="candidate_job_id")
+    expected_environment = owned("expected_environment")
+    expected_profile_id = owned("expected_profile_id")
+    if type(expected_environment) is not str or type(expected_profile_id) is not str:
+        raise TypeError("authenticated result environment/profile differs")
+    final_path = str(_canonical_absolute_path(owned("final_path"), name="result FINAL receipt path"))
+    final_sha256 = _require_digest(
+        owned("final_sha256"),
+        name="result FINAL receipt SHA-256",
+    )
+
+    final, _ = decode_evidence_document_bytes(
+        raw=owned("final_raw"),
+        expected_sha256=final_sha256,
+        trailing_lf=True,
+    )
+    manifest_ref = _artifact_reference(
+        final["replay_execution_manifest"],
+        name="FINAL replay execution manifest",
+        expected_schema=REPLAY_EXECUTION_MANIFEST_V2_SCHEMA,
+    )
+    manifest, _ = decode_evidence_document_bytes(
+        raw=owned("manifest_raw"),
+        expected_sha256=manifest_ref["sha256"],
+        trailing_lf=False,
+    )
+    submission_ref = _artifact_reference(
+        final["submission_receipt"],
+        name="FINAL submission receipt",
+        expected_schema=REPLAY_SUBMISSION_RECEIPT_V2_SCHEMA,
+    )
+    submission, _ = decode_evidence_document_bytes(
+        raw=owned("submission_raw"),
+        expected_sha256=submission_ref["sha256"],
+        trailing_lf=True,
+    )
+    pre_ref = _artifact_reference(
+        final["pre_receipt"],
+        name="FINAL PRE receipt",
+        expected_schema=REPLAY_JOB_PRE_RECEIPT_V2_SCHEMA,
+    )
+    pre, _ = decode_evidence_document_bytes(
+        raw=owned("pre_raw"),
+        expected_sha256=pre_ref["sha256"],
+        trailing_lf=True,
+    )
+    exit_ref = _artifact_reference(
+        final["exit_receipt"],
+        name="FINAL EXIT receipt",
+        expected_schema=REPLAY_JOB_EXIT_RECEIPT_V2_SCHEMA,
+    )
+    exit_document, _ = decode_evidence_document_bytes(
+        raw=owned("exit_raw"),
+        expected_sha256=exit_ref["sha256"],
+        trailing_lf=True,
+    )
+    source_transcript_ref = manifest["source_capture"]["step1_evidence"]["transcript_bundle"]
+    source_transcript, _ = decode_evidence_document_bytes(
+        raw=owned("source_transcript_raw"),
+        expected_sha256=source_transcript_ref["sha256"],
+        trailing_lf=False,
+    )
+    source = owned("authenticated_source")
+    if not _exact_json_equal(source_transcript, source.transcript_bundle):
+        raise ValueError("owned source transcript differs from source capability")
+
+    verified_result = owned("result_capability")
+    projection, payloads, _ = _sealed_result_payloads_v2(
+        verified_result,
+        replay_execution_manifest=manifest,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    index, _ = decode_evidence_document_bytes(
+        raw=payloads["evidence-index.json"],
+        expected_sha256=final["evidence_index"]["sha256"],
+        trailing_lf=False,
+    )
+    expected_final, expected_final_path = _derive_result_final_receipt_v2(
+        replay_execution_manifest=manifest,
+        submission_receipt=submission,
+        pre_receipt=pre,
+        exit_receipt=exit_document,
+        evidence_index=index,
+        verified_result=verified_result,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    if (
+        expected_final_path != final_path
+        or final["candidate_job_id"] != candidate
+        or not _exact_json_equal(final, expected_final)
+    ):
+        raise ValueError("owned FINAL graph identity differs")
+    documents, samples = _validate_sealed_result_outputs_v2(
+        replay_execution_manifest=manifest,
+        submission_receipt=submission,
+        exit_receipt=exit_document,
+        authenticated_source=source,
+        verified_result=verified_result,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    scorer_resource, _ = decode_evidence_document_bytes(
+        raw=payloads["strict_gym_child_runtime/resource.json"],
+        expected_sha256=hashlib.sha256(payloads["strict_gym_child_runtime/resource.json"]).hexdigest(),
+        trailing_lf=False,
+    )
+    resource_process = _strict_json_object(
+        scorer_resource["process"],
+        name="scorer resource process",
+    )
+    _, scorer_process_identity = _validate_scorer_resource_process_v2(
+        replay_execution_manifest=manifest,
+        driver_process=final["driver_process"],
+        resource_process=resource_process,
+    )
+    # The scorer terminal was already joined to the resource process by the pure
+    # nine-member validator.  Keep this access explicit so a future return-shape
+    # change cannot silently drop that semantic validation.
+    scorer_quiescence = _strict_json_object(
+        documents["scorer_call_index"]["quiescence"],
+        name="scorer terminal quiescence",
+    )
+    if scorer_quiescence.get("original_process_reaped") is not True:
+        raise ValueError("scorer terminal does not prove process reaping")
+
+    identity = _strict_json_object(index["identity"], name="replay index identity")
+    snapshot = {
+        "schema": AUTHENTICATED_REPLAY_RESULT_SNAPSHOT_V2_SCHEMA,
+        "pair_id": manifest["pair_id"],
+        "environment": expected_environment,
+        "profile_id": expected_profile_id,
+        "attempt_id": manifest["attempt_id"],
+        "candidate_job_id": candidate,
+        "authenticated_job_id": final["authenticated_job_id"],
+        "run_id": identity["run_id"],
+        "driver_process": copy.deepcopy(final["driver_process"]),
+        "scorer_process_identity": scorer_process_identity,
+        "manifest": copy.deepcopy(manifest_ref),
+        "submission_receipt": copy.deepcopy(submission_ref),
+        "pre_receipt": copy.deepcopy(pre_ref),
+        "exit_receipt": copy.deepcopy(exit_ref),
+        "result_final_receipt": {
+            "path": final_path,
+            "schema": REPLAY_RESULT_FINAL_RECEIPT_V2_SCHEMA,
+            "sha256": final_sha256,
+        },
+        "result_root": projection["result_root"],
+        "result_inventory": copy.deepcopy(final["result"]["inventory"]),
+        "evidence_index": copy.deepcopy(final["evidence_index"]),
+        "outputs": copy.deepcopy(index["outputs"]),
+        "samples": copy.deepcopy(samples),
+    }
+    _require_exact_keys(
+        snapshot,
+        _AUTHENTICATED_RESULT_SNAPSHOT_V2_KEYS,
+        name="authenticated replay result snapshot",
+    )
+    canonical_ascii_json(snapshot)
+    return copy.deepcopy(snapshot)
 
 
 def publish_evidence_document(
@@ -2851,7 +4396,8 @@ def publish_evidence_document(
     candidate_created = False
     candidate_name = f".{path.name}.candidate"
     try:
-        _require_owned_directory(os.fstat(parent_fd), name="output parent")
+        parent_initial = os.fstat(parent_fd)
+        _require_owned_directory(parent_initial, name="output parent")
         candidate_fd = os.open(
             candidate_name,
             _DOCUMENT_CREATE_FLAGS,
@@ -2886,21 +4432,63 @@ def publish_evidence_document(
         os.unlink(candidate_name, dir_fd=parent_fd)
         candidate_created = False
         os.fsync(parent_fd)
+        final_pre_named = os.stat(
+            path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(final_pre_named.st_mode)
+            or stat.S_IMODE(final_pre_named.st_mode) != 0o400
+            or final_pre_named.st_uid != os.geteuid()
+            or final_pre_named.st_nlink != 1
+            or final_pre_named.st_size != len(payload)
+        ):
+            raise RuntimeError("published evidence pathname is not the candidate regular file")
         final_fd = os.open(
             path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=parent_fd,
         )
         try:
-            final_metadata = os.fstat(final_fd)
-            actual = _read_all(final_fd)
+            final_before = os.fstat(final_fd)
+            if _file_fingerprint(final_pre_named) != _file_fingerprint(final_before) or not stat.S_ISREG(
+                final_before.st_mode
+            ):
+                raise RuntimeError("published evidence changed before exact readback")
+            actual = _read_all_bounded(final_fd, maximum=len(payload))
+            final_after = os.fstat(final_fd)
+            final_named = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
         finally:
             os.close(final_fd)
+        parent_after = os.fstat(parent_fd)
+        fresh_parent_fd = _open_absolute_directory_without_symlinks(path.parent)
+        try:
+            fresh_parent = os.fstat(fresh_parent_fd)
+            _require_owned_directory(fresh_parent, name="fresh output parent")
+            fresh_named = os.stat(
+                path.name,
+                dir_fd=fresh_parent_fd,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(fresh_parent_fd)
         if (
-            not stat.S_ISREG(final_metadata.st_mode)
-            or stat.S_IMODE(final_metadata.st_mode) != 0o400
-            or final_metadata.st_uid != os.geteuid()
-            or final_metadata.st_nlink != 1
+            _directory_identity(parent_initial) != _directory_identity(parent_after)
+            or _directory_identity(parent_after) != _directory_identity(fresh_parent)
+            or _file_fingerprint(final_pre_named) != _file_fingerprint(final_before)
+            or _file_fingerprint(final_before) != _file_fingerprint(final_after)
+            or _file_fingerprint(final_after) != _file_fingerprint(final_named)
+            or _file_fingerprint(final_named) != _file_fingerprint(fresh_named)
+            or not stat.S_ISREG(final_after.st_mode)
+            or stat.S_IMODE(final_after.st_mode) != 0o400
+            or final_after.st_uid != os.geteuid()
+            or final_after.st_nlink != 1
+            or final_after.st_size != len(payload)
             or actual != payload
             or hashlib.sha256(actual).hexdigest() != digest
         ):
@@ -2917,9 +4505,7 @@ def publish_evidence_document(
     return path, digest
 
 
-def publish_main_transcript_bundle(
-    *, results_dir: str, document: Mapping[str, Any]
-) -> tuple[Path, str]:
+def publish_main_transcript_bundle(*, results_dir: str, document: Mapping[str, Any]) -> tuple[Path, str]:
     """Create the strict evidence directory and publish its main transcript."""
     validate_transcript_bundle(document)
     results_path = _canonical_absolute_path(results_dir, name="RESULTS_DIR")
@@ -2938,63 +4524,33 @@ def publish_main_transcript_bundle(
             _DIRECTORY_OPEN_FLAGS,
             dir_fd=results_fd,
         )
-        _require_owned_directory(
-            os.fstat(evidence_fd), name="main step1 evidence directory"
-        )
+        _require_owned_directory(os.fstat(evidence_fd), name="main step1 evidence directory")
     finally:
         if evidence_fd is not None:
             os.close(evidence_fd)
         os.close(results_fd)
-    return publish_evidence_document(
-        output=output, document=document, trailing_lf=False
-    )
+    return publish_evidence_document(output=output, document=document, trailing_lf=False)
 
 
-def load_evidence_document(
+def decode_evidence_document_bytes(
     *,
-    path: str | Path,
+    raw: bytes,
     expected_sha256: str,
     trailing_lf: bool,
 ) -> tuple[dict[str, Any], str]:
-    """Load one exact immutable evidence inode without following symlinks."""
-    evidence_path = _canonical_absolute_path(str(path), name="evidence path")
+    """Decode authenticated evidence bytes without consulting a pathname.
+
+    ``raw`` must be exact ``bytes`` so callers cannot smuggle mutable buffers or
+    subclasses across the authenticated snapshot boundary.  The parser keeps
+    every framing and canonical-JSON check used by the filesystem loader.
+    """
+    if type(raw) is not bytes:
+        raise TypeError("evidence payload must be exact immutable bytes")
+    if type(trailing_lf) is not bool:
+        raise TypeError("trailing_lf must be an exact bool")
+    if not 0 < len(raw) <= _MAX_EVIDENCE_DOCUMENT_BYTES:
+        raise ValueError("evidence size is outside the admitted range")
     expected = _require_digest(expected_sha256, name="expected_sha256")
-    parent_fd = _open_absolute_directory_without_symlinks(evidence_path.parent)
-    try:
-        _require_owned_directory(os.fstat(parent_fd), name="evidence parent")
-        descriptor = os.open(
-            evidence_path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=parent_fd,
-        )
-        try:
-            before = os.fstat(descriptor)
-            if not 0 < before.st_size <= _MAX_EVIDENCE_DOCUMENT_BYTES:
-                raise ValueError("evidence size is outside the admitted range")
-            raw = _read_all_bounded(descriptor, maximum=_MAX_EVIDENCE_DOCUMENT_BYTES)
-            after = os.fstat(descriptor)
-            named = os.stat(evidence_path.name, dir_fd=parent_fd, follow_symlinks=False)
-        finally:
-            os.close(descriptor)
-    finally:
-        os.close(parent_fd)
-    if not (
-        _file_fingerprint(before)
-        == _file_fingerprint(after)
-        == _file_fingerprint(named)
-    ):
-        raise RuntimeError("evidence changed during stable read")
-    if len(raw) != after.st_size:
-        raise RuntimeError("evidence size changed during stable read")
-    if (
-        not stat.S_ISREG(after.st_mode)
-        or stat.S_IMODE(after.st_mode) != 0o400
-        or after.st_uid != os.geteuid()
-        or after.st_nlink != 1
-    ):
-        raise RuntimeError(
-            "evidence must be an EUID-owned single-link mode-0400 regular file"
-        )
     actual = hashlib.sha256(raw).hexdigest()
     if actual != expected:
         raise ValueError("evidence bytes differ from expected SHA-256")
@@ -3022,6 +4578,108 @@ def load_evidence_document(
     return value, actual
 
 
+def _load_evidence_document_owned(
+    *,
+    path: str | Path,
+    expected_sha256: str,
+    trailing_lf: bool,
+) -> tuple[dict[str, Any], str, bytes]:
+    """Stable-load one exact evidence inode and retain its immutable bytes."""
+    evidence_path = _canonical_absolute_path(str(path), name="evidence path")
+    expected = _require_digest(expected_sha256, name="expected_sha256")
+    parent_fd = _open_absolute_directory_without_symlinks(evidence_path.parent)
+    try:
+        parent_before = os.fstat(parent_fd)
+        _require_owned_directory(parent_before, name="evidence parent")
+        pre_named = os.stat(
+            evidence_path.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(pre_named.st_mode)
+            or stat.S_IMODE(pre_named.st_mode) != 0o400
+            or pre_named.st_uid != os.geteuid()
+            or pre_named.st_nlink != 1
+            or not 0 < pre_named.st_size <= _MAX_EVIDENCE_DOCUMENT_BYTES
+        ):
+            raise RuntimeError("evidence must be an EUID-owned single-link mode-0400 regular file")
+        descriptor = os.open(
+            evidence_path.name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        try:
+            before = os.fstat(descriptor)
+            if (
+                _file_fingerprint(pre_named) != _file_fingerprint(before)
+                or not stat.S_ISREG(before.st_mode)
+                or not 0 < before.st_size <= _MAX_EVIDENCE_DOCUMENT_BYTES
+            ):
+                raise RuntimeError("evidence changed before stable read")
+            raw = _read_all_bounded(descriptor, maximum=_MAX_EVIDENCE_DOCUMENT_BYTES)
+            after = os.fstat(descriptor)
+            named = os.stat(evidence_path.name, dir_fd=parent_fd, follow_symlinks=False)
+        finally:
+            os.close(descriptor)
+        parent_after = os.fstat(parent_fd)
+        fresh_parent_fd = _open_absolute_directory_without_symlinks(evidence_path.parent)
+        try:
+            fresh_parent = os.fstat(fresh_parent_fd)
+            _require_owned_directory(fresh_parent, name="fresh evidence parent")
+            fresh_named = os.stat(
+                evidence_path.name,
+                dir_fd=fresh_parent_fd,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(fresh_parent_fd)
+    finally:
+        os.close(parent_fd)
+    if not (
+        _directory_identity(parent_before) == _directory_identity(parent_after) == _directory_identity(fresh_parent)
+    ):
+        raise RuntimeError("evidence parent changed during stable read")
+    if not (
+        _file_fingerprint(pre_named)
+        == _file_fingerprint(before)
+        == _file_fingerprint(after)
+        == _file_fingerprint(named)
+        == _file_fingerprint(fresh_named)
+    ):
+        raise RuntimeError("evidence changed during stable read")
+    if len(raw) != after.st_size:
+        raise RuntimeError("evidence size changed during stable read")
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or stat.S_IMODE(after.st_mode) != 0o400
+        or after.st_uid != os.geteuid()
+        or after.st_nlink != 1
+    ):
+        raise RuntimeError("evidence must be an EUID-owned single-link mode-0400 regular file")
+    document, actual = decode_evidence_document_bytes(
+        raw=raw,
+        expected_sha256=expected,
+        trailing_lf=trailing_lf,
+    )
+    return document, actual, raw
+
+
+def load_evidence_document(
+    *,
+    path: str | Path,
+    expected_sha256: str,
+    trailing_lf: bool,
+) -> tuple[dict[str, Any], str]:
+    """Load one exact immutable evidence inode without following symlinks."""
+    document, digest, _ = _load_evidence_document_owned(
+        path=path,
+        expected_sha256=expected_sha256,
+        trailing_lf=trailing_lf,
+    )
+    return document, digest
+
+
 def _build_transcript_entry(
     raw: Mapping[str, Any],
     *,
@@ -3038,34 +4696,22 @@ def _build_transcript_entry(
         raise ValueError("strict no-shuffle capture requires fixture_row_index=0")
     if raw["rollout_index"] != index or type(raw["rollout_index"]) is not int:
         raise ValueError(f"entry[{index}].rollout_index must equal its list index")
-    seed = _require_nonnegative_int(
-        raw["generation_seed"], name=f"entry[{index}].generation_seed"
-    )
+    seed = _require_nonnegative_int(raw["generation_seed"], name=f"entry[{index}].generation_seed")
     expected_seed = derive_nemo_gym_request_seed(
         seed_base=generation["seed_base"], fixture_row_index=0, rollout_index=index
     )
     if seed != expected_seed:
         raise ValueError(f"entry[{index}] generation seed does not close")
-    generation_request = _strict_json_object(
-        raw["generation_request"], name=f"entry[{index}].generation_request"
-    )
-    model_response = _strict_json_object(
-        raw["model_response"], name=f"entry[{index}].model_response"
-    )
+    generation_request = _strict_json_object(raw["generation_request"], name=f"entry[{index}].generation_request")
+    model_response = _strict_json_object(raw["model_response"], name=f"entry[{index}].model_response")
     if "reward" in model_response:
-        raise ValueError(
-            f"entry[{index}] model_response must not contain a root reward"
-        )
-    agent_run_request = _strict_json_object(
-        raw["agent_run_request"], name=f"entry[{index}].agent_run_request"
-    )
+        raise ValueError(f"entry[{index}] model_response must not contain a root reward")
+    agent_run_request = _strict_json_object(raw["agent_run_request"], name=f"entry[{index}].agent_run_request")
     derived_verifier_request = _strict_json_object(
         raw["derived_verifier_request"],
         name=f"entry[{index}].derived_verifier_request",
     )
-    verifier_response = _strict_json_object(
-        raw["verifier_response"], name=f"entry[{index}].verifier_response"
-    )
+    verifier_response = _strict_json_object(raw["verifier_response"], name=f"entry[{index}].verifier_response")
     _require_exact_keys(
         verifier_response,
         VERIFIER_RESPONSE_KEYS_BY_ENVIRONMENT[environment],
@@ -3090,13 +4736,9 @@ def _build_transcript_entry(
     )
     if not _exact_json_equal(agent_run_request, expected_agent_run_request):
         raise ValueError(f"entry[{index}] fixture-to-agent-run transform differs")
-    if not _exact_json_equal(
-        generation_request, expected_agent_run_request["responses_create_params"]
-    ):
+    if not _exact_json_equal(generation_request, expected_agent_run_request["responses_create_params"]):
         raise ValueError(f"entry[{index}] fixture-to-generation transform differs")
-    returned_seed = _seed_from_responses_create_params(
-        generation_request, name=f"entry[{index}].generation_request"
-    )
+    returned_seed = _seed_from_responses_create_params(generation_request, name=f"entry[{index}].generation_request")
     dispatched_params = agent_run_request.get("responses_create_params")
     dispatched_seed = _seed_from_responses_create_params(
         dispatched_params,
@@ -3110,25 +4752,15 @@ def _build_transcript_entry(
     if {returned_seed, dispatched_seed, verifier_returned_seed, seed} != {seed}:
         raise ValueError(f"entry[{index}] returned/dispatched request seeds differ")
     if not _exact_json_equal(dispatched_params, generation_request):
-        raise ValueError(
-            f"entry[{index}] verifier request generation params differ from returned params"
-        )
+        raise ValueError(f"entry[{index}] verifier request generation params differ from returned params")
     expected_returned_params = _expanded_responses_create_params(generation_request)
     if not _exact_json_equal(returned_params, expected_returned_params):
-        raise ValueError(
-            f"entry[{index}] returned response params differ from pinned Pydantic expansion"
-        )
+        raise ValueError(f"entry[{index}] returned response params differ from pinned Pydantic expansion")
     expected_derived_verifier_request = copy.deepcopy(agent_run_request)
-    expected_derived_verifier_request["responses_create_params"] = copy.deepcopy(
-        expected_returned_params
-    )
+    expected_derived_verifier_request["responses_create_params"] = copy.deepcopy(expected_returned_params)
     expected_derived_verifier_request["response"] = copy.deepcopy(model_response)
-    if not _exact_json_equal(
-        derived_verifier_request, expected_derived_verifier_request
-    ):
-        raise ValueError(
-            f"entry[{index}] derived verifier request differs from pinned model_dump"
-        )
+    if not _exact_json_equal(derived_verifier_request, expected_derived_verifier_request):
+        raise ValueError(f"entry[{index}] derived verifier request differs from pinned model_dump")
     _validate_raw_generation_policy(
         generation_request,
         generation=generation,
@@ -3141,9 +4773,7 @@ def _build_transcript_entry(
         name=f"entry[{index}].model_response",
     )
     if not _exact_json_equal(verifier_response.get("response"), model_response):
-        raise ValueError(
-            f"entry[{index}] model_response differs from verifier_response.response"
-        )
+        raise ValueError(f"entry[{index}] model_response differs from verifier_response.response")
     generation_input = generation_request.get("input")
     if not isinstance(generation_input, list) or not generation_input:
         raise ValueError(f"entry[{index}] generation_request.input must be nonempty")
@@ -3153,9 +4783,7 @@ def _build_transcript_entry(
     )
     if environment == "reasoning_gym":
         if not 0.0 <= reward <= 1.0:
-            raise ValueError(
-                f"entry[{index}] reasoning-gym raw reward must be in [0, 1]"
-            )
+            raise ValueError(f"entry[{index}] reasoning-gym raw reward must be in [0, 1]")
     elif reward not in (0.0, 1.0):
         raise ValueError(f"entry[{index}] format raw reward must be binary")
     returned_reward = _require_exact_float(
@@ -3178,23 +4806,15 @@ def _build_transcript_entry(
         "rollout_index": index,
         "generation_seed": seed,
         "generation_request": generation_request,
-        "generation_request_sha256": domain_sha256(
-            "step1-generation-request", generation_request
-        ),
+        "generation_request_sha256": domain_sha256("step1-generation-request", generation_request),
         "model_response": model_response,
         "model_response_sha256": domain_sha256("step1-model-response", model_response),
         "agent_run_request": agent_run_request,
-        "agent_run_request_sha256": domain_sha256(
-            "step1-agent-run-request", agent_run_request
-        ),
+        "agent_run_request_sha256": domain_sha256("step1-agent-run-request", agent_run_request),
         "derived_verifier_request": derived_verifier_request,
-        "derived_verifier_request_sha256": domain_sha256(
-            "step1-derived-verifier-request", derived_verifier_request
-        ),
+        "derived_verifier_request_sha256": domain_sha256("step1-derived-verifier-request", derived_verifier_request),
         "verifier_response": verifier_response,
-        "verifier_response_sha256": domain_sha256(
-            "step1-verifier-response", verifier_response
-        ),
+        "verifier_response_sha256": domain_sha256("step1-verifier-response", verifier_response),
         "raw_environment_reward": reward,
         "model_transport_entry_sha256": _require_digest(
             raw["model_transport_entry_sha256"],
@@ -3214,9 +4834,7 @@ def _build_transcript_entry(
     return entry
 
 
-def validate_model_response_token_ids(
-    model_response: Mapping[str, Any], *, name: str = "model_response"
-) -> None:
+def validate_model_response_token_ids(model_response: Mapping[str, Any], *, name: str = "model_response") -> None:
     """Validate bounded token arrays and logprobs in a raw Gym model response."""
     model_response_token_geometry(model_response, name=name)
 
@@ -3238,18 +4856,10 @@ def validate_fresh_verifier_response(
     """
     if environment not in STRICT_ENVIRONMENTS:
         raise ValueError("fresh verifier environment is not admitted")
-    agent_request = _strict_json_object(
-        agent_run_request, name="fresh verifier agent_run_request"
-    )
-    derived_request = _strict_json_object(
-        derived_verifier_request, name="fresh verifier derived_verifier_request"
-    )
-    captured_response = _strict_json_object(
-        model_response, name="fresh verifier model_response"
-    )
-    fresh_response = _strict_json_object(
-        verifier_response, name="fresh verifier response"
-    )
+    agent_request = _strict_json_object(agent_run_request, name="fresh verifier agent_run_request")
+    derived_request = _strict_json_object(derived_verifier_request, name="fresh verifier derived_verifier_request")
+    captured_response = _strict_json_object(model_response, name="fresh verifier model_response")
+    fresh_response = _strict_json_object(verifier_response, name="fresh verifier response")
     _require_exact_keys(
         fresh_response,
         VERIFIER_RESPONSE_KEYS_BY_ENVIRONMENT[environment],
@@ -3265,12 +4875,8 @@ def validate_fresh_verifier_response(
     expected_derived["responses_create_params"] = copy.deepcopy(expanded_params)
     expected_derived["response"] = copy.deepcopy(captured_response)
     if not _exact_json_equal(derived_request, expected_derived):
-        raise ValueError(
-            "fresh verifier derived request differs from pinned reconstruction"
-        )
-    if not _exact_json_equal(
-        fresh_response.get("responses_create_params"), expanded_params
-    ):
+        raise ValueError("fresh verifier derived request differs from pinned reconstruction")
+    if not _exact_json_equal(fresh_response.get("responses_create_params"), expanded_params):
         raise ValueError("fresh verifier returned response params differ")
     if not _exact_json_equal(fresh_response.get("response"), captured_response):
         raise ValueError("fresh verifier returned captured response differs")
@@ -3280,9 +4886,7 @@ def validate_fresh_verifier_response(
         generation_request=compact_params,
         name="fresh verifier model_response",
     )
-    reward = _require_exact_float(
-        fresh_response.get("reward"), name="fresh verifier response.reward"
-    )
+    reward = _require_exact_float(fresh_response.get("reward"), name="fresh verifier response.reward")
     if environment == "reasoning_gym":
         if not 0.0 <= reward <= 1.0:
             raise ValueError("fresh reasoning-gym reward must be in [0, 1]")
@@ -3358,10 +4962,7 @@ def validate_gym_model_response_r3(
         response["metadata"], request.get("metadata")
     ):
         raise ValueError(f"{name}.metadata differs from generation request")
-    if (
-        type(response["max_output_tokens"]) is not int
-        or response["max_output_tokens"] != 768
-    ):
+    if type(response["max_output_tokens"]) is not int or response["max_output_tokens"] != 768:
         raise ValueError(f"{name}.max_output_tokens must be exact integer 768")
     for key in ("temperature", "top_p"):
         if type(response[key]) is not float or response[key] != 1.0:
@@ -3374,31 +4975,22 @@ def validate_gym_model_response_r3(
         if response["incomplete_details"] is not None:
             raise ValueError(f"{name}.incomplete_details must be null when completed")
     elif status == "incomplete" and type(status) is str:
-        if not _exact_json_equal(
-            response["incomplete_details"], {"reason": "max_output_tokens"}
-        ):
+        if not _exact_json_equal(response["incomplete_details"], {"reason": "max_output_tokens"}):
             raise ValueError(f"{name}.incomplete_details differs for length finish")
     else:
         raise ValueError(f"{name}.status must be completed or incomplete")
 
     output = response["output"]
     if not isinstance(output, list) or len(output) not in {1, 2}:
-        raise ValueError(
-            f"{name}.output must contain one or two converter output items"
-        )
+        raise ValueError(f"{name}.output must contain one or two converter output items")
     first = output[0]
     if not isinstance(first, Mapping):
         raise TypeError(f"{name}.output[0] must be an object")
     if first.get("type") == "reasoning":
         reasoning = first
-        reasoning_keys = _GYM_REASONING_KEYS | (
-            _GYM_TOKEN_KEYS if len(output) == 1 else set()
-        )
+        reasoning_keys = _GYM_REASONING_KEYS | (_GYM_TOKEN_KEYS if len(output) == 1 else set())
         _require_exact_keys(reasoning, reasoning_keys, name=f"{name}.output[0]")
-        if (
-            reasoning["content"] is not None
-            or reasoning["encrypted_content"] is not None
-        ):
+        if reasoning["content"] is not None or reasoning["encrypted_content"] is not None:
             raise ValueError(f"{name}.output[0] reasoning payload must be null")
         _response_uuid(reasoning["id"], prefix="rs", name=f"{name}.output[0].id")
         if reasoning["type"] != "reasoning" or type(reasoning["type"]) is not str:
@@ -3408,18 +5000,14 @@ def validate_gym_model_response_r3(
             raise ValueError(f"{name}.output[0].summary must be nonempty")
         for summary_index, summary in enumerate(summaries):
             if not isinstance(summary, Mapping):
-                raise TypeError(
-                    f"{name}.output[0].summary[{summary_index}] must be an object"
-                )
+                raise TypeError(f"{name}.output[0].summary[{summary_index}] must be an object")
             _require_exact_keys(
                 summary,
                 frozenset({"text", "type"}),
                 name=f"{name}.output[0].summary[{summary_index}]",
             )
             if summary["type"] != "summary_text" or type(summary["type"]) is not str:
-                raise ValueError(
-                    f"{name}.output[0].summary[{summary_index}].type differs"
-                )
+                raise ValueError(f"{name}.output[0].summary[{summary_index}].type differs")
             _bounded_utf8_allow_empty(
                 summary["text"],
                 name=f"{name}.output[0].summary[{summary_index}].text",
@@ -3456,14 +5044,10 @@ def validate_gym_model_response_r3(
             raise ValueError(f"{name}.output[{message_index}] message identity differs")
         content = message["content"]
         if not isinstance(content, list) or len(content) != 1:
-            raise ValueError(
-                f"{name}.output[{message_index}].content must contain one output_text"
-            )
+            raise ValueError(f"{name}.output[{message_index}].content must contain one output_text")
         output_text = content[0]
         if not isinstance(output_text, Mapping):
-            raise TypeError(
-                f"{name}.output[{message_index}].content[0] must be an object"
-            )
+            raise TypeError(f"{name}.output[{message_index}].content[0] must be an object")
         _require_exact_keys(
             output_text,
             _GYM_OUTPUT_TEXT_KEYS,
@@ -3476,9 +5060,7 @@ def validate_gym_model_response_r3(
             or output_text["type"] != "output_text"
             or type(output_text["type"]) is not str
         ):
-            raise ValueError(
-                f"{name}.output[{message_index}].content[0] fixed fields differ"
-            )
+            raise ValueError(f"{name}.output[{message_index}].content[0] fixed fields differ")
         _bounded_utf8_allow_empty(
             output_text["text"],
             name=f"{name}.output[{message_index}].content[0].text",
@@ -3494,9 +5076,7 @@ def validate_gym_model_response_r3(
     _require_exact_keys(usage, _GYM_USAGE_KEYS, name=f"{name}.usage")
     if not _exact_json_equal(usage["input_tokens_details"], {"cached_tokens": None}):
         raise ValueError(f"{name}.usage.input_tokens_details differs")
-    if not _exact_json_equal(
-        usage["output_tokens_details"], {"reasoning_tokens": None}
-    ):
+    if not _exact_json_equal(usage["output_tokens_details"], {"reasoning_tokens": None}):
         raise ValueError(f"{name}.usage.output_tokens_details differs")
     for key in ("input_tokens", "output_tokens", "total_tokens"):
         value = usage[key]
@@ -3527,12 +5107,8 @@ def model_response_token_geometry(
         if not present:
             continue
         if present != token_keys:
-            raise ValueError(
-                f"{name}.output[{index}] has an incomplete token transport triple"
-            )
-        prompt = _token_id_list(
-            item["prompt_token_ids"], name=f"{name}.output[{index}].prompt_token_ids"
-        )
+            raise ValueError(f"{name}.output[{index}] has an incomplete token transport triple")
+        prompt = _token_id_list(item["prompt_token_ids"], name=f"{name}.output[{index}].prompt_token_ids")
         generation = _token_id_list(
             item["generation_token_ids"],
             name=f"{name}.output[{index}].generation_token_ids",
@@ -3541,20 +5117,14 @@ def model_response_token_geometry(
             raise ValueError(f"{name}.output[{index}] has an empty token array")
         logprobs = item["generation_log_probs"]
         if not isinstance(logprobs, list) or len(logprobs) != len(generation):
-            raise ValueError(
-                f"{name}.output[{index}] generation token/logprob lengths differ"
-            )
+            raise ValueError(f"{name}.output[{index}] generation token/logprob lengths differ")
         for offset, value in enumerate(logprobs):
             if type(value) is not float or not math.isfinite(value):
                 raise TypeError(
-                    f"{name}.output[{index}].generation_log_probs[{offset}] "
-                    "must be an exact finite float"
+                    f"{name}.output[{index}].generation_log_probs[{offset}] " "must be an exact finite float"
                 )
             if value == 0.0 and math.copysign(1.0, value) < 0:
-                raise ValueError(
-                    f"{name}.output[{index}].generation_log_probs[{offset}] "
-                    "must not be negative zero"
-                )
+                raise ValueError(f"{name}.output[{index}].generation_log_probs[{offset}] " "must not be negative zero")
         if prompt[: len(seen)] != seen:
             raise ValueError(f"{name}.output[{index}] prompt history is non-contiguous")
         if initial_prompt is None:
@@ -3581,10 +5151,7 @@ def _validate_raw_generation_policy(
         "top_p": 1.0,
     }:
         raise ValueError("strict captured replay generation policy is not frozen")
-    if (
-        value.get("max_output_tokens") != 768
-        or type(value.get("max_output_tokens")) is not int
-    ):
+    if value.get("max_output_tokens") != 768 or type(value.get("max_output_tokens")) is not int:
         raise ValueError(f"{name}.max_output_tokens must be exactly 768")
     if value.get("temperature") != 1.0 or type(value.get("temperature")) is not float:
         raise ValueError(f"{name}.temperature must be exact float 1.0")
@@ -3596,9 +5163,7 @@ def _validate_raw_generation_policy(
         raise ValueError(f"{name} does not carry the derived request seed")
 
 
-def _validate_fixture_row(
-    value: Mapping[str, Any], *, environment: str
-) -> dict[str, Any]:
+def _validate_fixture_row(value: Mapping[str, Any], *, environment: str) -> dict[str, Any]:
     row = _strict_json_object(value, name="fixture_row")
     _require_exact_keys(
         row,
@@ -3630,9 +5195,7 @@ def _validate_fixture_row(
     message = messages[0]
     if not isinstance(message, Mapping):
         raise TypeError("fixture_row input message must be an object")
-    _require_exact_keys(
-        message, frozenset({"content", "role"}), name="fixture_row input message"
-    )
+    _require_exact_keys(message, frozenset({"content", "role"}), name="fixture_row input message")
     if message["role"] != "user" or type(message["role"]) is not str:
         raise ValueError("fixture_row input message role must be user")
     if (
@@ -3659,11 +5222,7 @@ def _expected_transformed_fixture_request(
     params["temperature"] = 1.0
     params["top_p"] = 1.0
     params["max_output_tokens"] = 768
-    params["metadata"] = {
-        "extra_body": json.dumps(
-            {"seed": generation_seed}, sort_keys=True, separators=(",", ":")
-        )
-    }
+    params["metadata"] = {"extra_body": json.dumps({"seed": generation_seed}, sort_keys=True, separators=(",", ":"))}
     return transformed
 
 
@@ -3735,17 +5294,12 @@ def _reward_facing_text(model_response: Mapping[str, Any], *, name: str) -> str:
             raise TypeError(f"{name}.output[{output_index}].content must be a list")
         for content_index, part in enumerate(content):
             if not isinstance(part, Mapping):
-                raise TypeError(
-                    f"{name}.output[{output_index}].content[{content_index}] "
-                    "must be an object"
-                )
+                raise TypeError(f"{name}.output[{output_index}].content[{content_index}] " "must be an object")
             if part.get("type") == "output_text":
                 pieces.append(
                     _bounded_utf8_allow_empty(
                         part.get("text"),
-                        name=(
-                            f"{name}.output[{output_index}].content[{content_index}].text"
-                        ),
+                        name=(f"{name}.output[{output_index}].content[{content_index}].text"),
                         maximum=16 * 1024 * 1024,
                     )
                 )
@@ -3793,13 +5347,8 @@ def _validate_environment_verifier_response(
             raise TypeError(f"{name} reasoning verifier metadata must be an object")
         task_name = metadata.get("source_dataset")
         if type(task_name) is not str or not task_name:
-            raise ValueError(
-                f"{name} metadata.source_dataset must be a nonempty string"
-            )
-        if (
-            type(verifier_response["task_name"]) is not str
-            or verifier_response["task_name"] != task_name
-        ):
+            raise ValueError(f"{name} metadata.source_dataset must be a nonempty string")
+        if type(verifier_response["task_name"]) is not str or verifier_response["task_name"] != task_name:
             raise ValueError(f"{name}.task_name differs from metadata.source_dataset")
         score = _require_exact_float(verifier_response["score"], name=f"{name}.score")
         if score != reward:
@@ -3834,17 +5383,13 @@ def _validate_environment_verifier_response(
             verifier["expected_markers"],
             name=f"{name}.verifier.expected_markers",
         )
-        patterns = _exact_string_list(
-            verifier["patterns"], name=f"{name}.verifier.patterns"
-        )
+        patterns = _exact_string_list(verifier["patterns"], name=f"{name}.verifier.patterns")
         missing = [marker for marker in expected if marker not in text]
         expected_set = set(expected)
         spurious: list[str] = []
         for pattern in patterns:
             spurious.extend(
-                match.group(0)
-                for match in re.finditer(pattern, text)
-                if match.group(0) not in expected_set
+                match.group(0) for match in re.finditer(pattern, text) if match.group(0) not in expected_set
             )
         expected_details = {
             "expected": list(expected),
@@ -3864,9 +5409,7 @@ def _validate_environment_verifier_response(
             raise ValueError(f"{name}.verifier.type must be regex")
         if type(verifier["pattern_id"]) is not str:
             raise TypeError(f"{name}.verifier.pattern_id must be a string")
-        patterns = _exact_string_list(
-            verifier["verify_regex"], name=f"{name}.verifier.verify_regex"
-        )
+        patterns = _exact_string_list(verifier["verify_regex"], name=f"{name}.verifier.verify_regex")
         minimum = _require_nonnegative_int(
             verifier["verify_min_matches"],
             name=f"{name}.verifier.verify_min_matches",
@@ -3874,9 +5417,7 @@ def _validate_environment_verifier_response(
         if minimum > (1 << 31) - 1:
             raise ValueError(f"{name}.verifier.verify_min_matches exceeds int31")
         compiled = [re.compile(pattern) for pattern in patterns]
-        matching_lines = sum(
-            1 for line in text.split("\n") if any(rx.search(line) for rx in compiled)
-        )
+        matching_lines = sum(1 for line in text.split("\n") if any(rx.search(line) for rx in compiled))
         if matching_lines > (1 << 31) - 1:
             raise ValueError(f"{name}.match_details.matching_lines exceeds int31")
         expected_details = {
@@ -3911,11 +5452,7 @@ def _token_id_list(value: Any, *, name: str) -> list[int]:
 
 
 def _response_uuid(value: Any, *, prefix: str, name: str) -> str:
-    if (
-        type(value) is not str
-        or not value.startswith(f"{prefix}_")
-        or _RESPONSE_UUID_RE.fullmatch(value) is None
-    ):
+    if type(value) is not str or not value.startswith(f"{prefix}_") or _RESPONSE_UUID_RE.fullmatch(value) is None:
         raise ValueError(f"{name} must be a canonical UUID4 {prefix}_ identifier")
     return value
 
@@ -3935,15 +5472,9 @@ def _bounded_utf8_nonempty(value: Any, *, name: str, maximum: int) -> str:
 
 def _validate_generation(value: Mapping[str, Any]) -> dict[str, Any]:
     _require_exact_keys(value, GENERATION_KEYS, name="generation")
-    seed_base = _require_nonnegative_int(
-        value["seed_base"], name="generation.seed_base"
-    )
-    max_new_tokens = _require_positive_int(
-        value["max_new_tokens"], name="generation.max_new_tokens"
-    )
-    temperature = _require_exact_float(
-        value["temperature"], name="generation.temperature"
-    )
+    seed_base = _require_nonnegative_int(value["seed_base"], name="generation.seed_base")
+    max_new_tokens = _require_positive_int(value["max_new_tokens"], name="generation.max_new_tokens")
+    temperature = _require_exact_float(value["temperature"], name="generation.temperature")
     top_p = _require_exact_float(value["top_p"], name="generation.top_p")
     top_k = value["top_k"]
     if top_k is not None:
@@ -3995,9 +5526,7 @@ def _validate_replay_ledger_bindings(
     if type(result["restart_count"]) is not int or result["restart_count"] != 0:
         raise ValueError("captured replay requires restart_count=0")
     result["process"] = _validate_process(result["process"])
-    expected_run = replay_run_id(
-        environment=environment, pair_id=pair_id, attempt_id=attempt_id
-    )
+    expected_run = replay_run_id(environment=environment, pair_id=pair_id, attempt_id=attempt_id)
     if result["run_id"] != expected_run:
         raise ValueError("replay ledger run_id is not deterministic")
     return result
@@ -4006,9 +5535,7 @@ def _validate_replay_ledger_bindings(
 def _validate_identity(*, pair_id: Any, environment: Any) -> None:
     _require_safe_id(pair_id, name="pair_id", maximum=64)
     if environment not in STRICT_ENVIRONMENTS:
-        raise ValueError(
-            f"environment must be one of {sorted(STRICT_ENVIRONMENTS)}, got {environment!r}"
-        )
+        raise ValueError(f"environment must be one of {sorted(STRICT_ENVIRONMENTS)}, got {environment!r}")
 
 
 def _require_attempt(value: Any) -> str:
@@ -4017,9 +5544,7 @@ def _require_attempt(value: Any) -> str:
     return value
 
 
-def _artifact_reference(
-    value: Mapping[str, Any], *, name: str, expected_schema: str
-) -> dict[str, str]:
+def _artifact_reference(value: Mapping[str, Any], *, name: str, expected_schema: str) -> dict[str, str]:
     _require_exact_keys(value, ARTIFACT_REFERENCE_KEYS, name=name)
     path = str(_canonical_absolute_path(value["path"], name=f"{name}.path"))
     if value["schema"] != expected_schema:
@@ -4031,9 +5556,7 @@ def _artifact_reference(
     }
 
 
-def _validate_job(
-    value: Mapping[str, Any], *, replay_execution_manifest: Mapping[str, Any]
-) -> dict[str, Any]:
+def _validate_job(value: Mapping[str, Any], *, replay_execution_manifest: Mapping[str, Any]) -> dict[str, Any]:
     _require_exact_keys(value, JOB_KEYS, name="job")
     result = copy.deepcopy(dict(value))
     for key in ("account", "partition", "qos"):
@@ -4043,9 +5566,7 @@ def _validate_job(
     campaign = pair["campaign"]
     expected = {
         "account": campaign["slurm"]["account"],
-        "name": replay_execution_manifest["scheduler_submission"]["identity"][
-            "job_name"
-        ],
+        "name": replay_execution_manifest["scheduler_submission"]["identity"]["job_name"],
         "num_nodes": campaign["nodes"],
         "partition": campaign["slurm"]["partition"],
         "qos": campaign["slurm"]["qos"],
@@ -4072,23 +5593,17 @@ def _validate_hardware(
         raise ValueError("hardware ordered rows must be exact K=4")
     normalized_rows: list[dict[str, Any]] = []
     for index, raw_row in enumerate(rows):
-        _require_exact_keys(
-            raw_row, HARDWARE_ROW_KEYS, name=f"hardware ordered row {index}"
-        )
+        _require_exact_keys(raw_row, HARDWARE_ROW_KEYS, name=f"hardware ordered row {index}")
         row = dict(raw_row)
         if type(row["index"]) is not int or row["index"] != index:
             raise ValueError("hardware ordered row indices must be exact 0..3")
-        model = _require_ascii(
-            row["gpu_model"], name=f"hardware ordered row {index} model", maximum=128
-        )
+        model = _require_ascii(row["gpu_model"], name=f"hardware ordered row {index} model", maximum=128)
         driver = _require_ascii(
             row["driver_version"],
             name=f"hardware ordered row {index} driver",
             maximum=64,
         )
-        raw = _require_ascii(
-            row["raw"], name=f"hardware ordered row {index} raw", maximum=255
-        )
+        raw = _require_ascii(row["raw"], name=f"hardware ordered row {index} raw", maximum=255)
         if raw != f"{model}, {driver}":
             raise ValueError("hardware ordered row raw text differs from parsed fields")
         if model != "NVIDIA GB200":
@@ -4102,14 +5617,10 @@ def _validate_hardware(
         raise ValueError("hardware GPU model summary differs from ordered rows")
     if drivers != {"580.126.20"} or value["driver_version"] != next(iter(drivers)):
         raise ValueError("hardware driver summary differs from ordered rows")
-    raw_output = ("\n".join(row["raw"] for row in normalized_rows) + "\n").encode(
-        "ascii"
-    )
+    raw_output = ("\n".join(row["raw"] for row in normalized_rows) + "\n").encode("ascii")
     if value["raw_output_sha256"] != hashlib.sha256(raw_output).hexdigest():
         raise ValueError("hardware raw nvidia-smi output digest differs")
-    expected_rows_sha256 = domain_sha256(
-        HARDWARE_ORDERED_ROWS_HASH_LABEL, normalized_rows
-    )
+    expected_rows_sha256 = domain_sha256(HARDWARE_ORDERED_ROWS_HASH_LABEL, normalized_rows)
     if value["ordered_rows_sha256"] != expected_rows_sha256:
         raise ValueError("hardware ordered-row digest differs")
     tool = _file_reference(value["nvidia_smi"], name="hardware.nvidia_smi")
@@ -4137,9 +5648,7 @@ def _validate_scheduler_device_environment(
     result = dict(value)
     if result["schema"] != SCHEDULER_DEVICE_ENVIRONMENT_SCHEMA:
         raise ValueError("unexpected scheduler device environment schema")
-    cuda = _four_distinct_decimal_ids(
-        result["cuda_visible_devices"], name="cuda_visible_devices"
-    )
+    cuda = _four_distinct_decimal_ids(result["cuda_visible_devices"], name="cuda_visible_devices")
     ordinal = result["gpu_device_ordinal"]
     if ordinal is not None and ordinal != cuda:
         raise ValueError("gpu_device_ordinal must equal cuda_visible_devices or null")
@@ -4161,9 +5670,7 @@ def _validate_scheduler_device_environment(
     if ze is not None:
         _require_ascii(ze, name="ze_affinity_mask", maximum=255)
         tokens = ze.split(",")
-        if not 1 <= len(tokens) <= 64 or any(
-            _ZE_DEVICE_RE.fullmatch(token) is None for token in tokens
-        ):
+        if not 1 <= len(tokens) <= 64 or any(_ZE_DEVICE_RE.fullmatch(token) is None for token in tokens):
             raise ValueError("ze_affinity_mask has invalid device tokens")
         identities = {
             (
@@ -4188,9 +5695,7 @@ def _validate_process(value: Mapping[str, Any]) -> dict[str, Any]:
     _require_exact_keys(value, PROCESS_KEYS, name="process")
     result = dict(value)
     _require_digest(result["boot_id_sha256"], name="process.boot_id_sha256")
-    _require_bounded_positive_int(
-        result["pid"], name="process.pid", maximum=(1 << 31) - 1
-    )
+    _require_bounded_positive_int(result["pid"], name="process.pid", maximum=(1 << 31) - 1)
     _require_bounded_positive_int(
         result["start_time_ticks"],
         name="process.start_time_ticks",
@@ -4199,23 +5704,90 @@ def _validate_process(value: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _validate_driver_scorer_process_join_v2(
+    *,
+    driver_process: Mapping[str, Any],
+    scorer_process: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Close the independent driver/scorer identities onto one boot."""
+    driver = _validate_process(driver_process)
+    scorer = _strict_json_object(scorer_process, name="scorer process identity")
+    _require_exact_keys(
+        scorer,
+        frozenset({"boot_id", "hostname", "pid", "start_ticks"}),
+        name="scorer process identity",
+    )
+    boot_id = scorer["boot_id"]
+    if (
+        type(boot_id) is not str
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            boot_id,
+        )
+        is None
+        or type(scorer["hostname"]) is not str
+        or not scorer["hostname"]
+    ):
+        raise ValueError("scorer process identity differs")
+    _require_bounded_positive_int(
+        scorer["pid"],
+        name="scorer process identity.pid",
+        maximum=(1 << 31) - 1,
+    )
+    _require_bounded_positive_int(
+        scorer["start_ticks"],
+        name="scorer process identity.start_ticks",
+        maximum=(1 << 63) - 1,
+    )
+    boot_sha256 = hashlib.sha256(f"{boot_id}\n".encode("ascii")).hexdigest()
+    if driver["boot_id_sha256"] != boot_sha256:
+        raise ValueError("driver/scorer boot identities differ")
+    if driver["pid"] == scorer["pid"]:
+        raise ValueError("driver and scorer must be distinct processes")
+    return driver, scorer
+
+
+def _validate_scorer_resource_process_v2(
+    *,
+    replay_execution_manifest: Mapping[str, Any],
+    driver_process: Mapping[str, Any],
+    resource_process: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bind retained scorer process evidence to M4 and the replay driver."""
+    manifest = _strict_json_object(
+        replay_execution_manifest,
+        name="replay execution manifest",
+    )
+    resource = _strict_json_object(
+        resource_process,
+        name="scorer resource process",
+    )
+    container_python = _file_reference(
+        manifest["runtime_tools"]["document"]["container"]["python"],
+        name="runtime_tools container python",
+    )
+    expected_proc_exe = container_python["path"]
+    expected_base_prefix = str(Path(expected_proc_exe).parent.parent)
+    if resource.get("proc_exe") != expected_proc_exe or resource.get("sys_base_prefix") != expected_base_prefix:
+        raise ValueError("scorer base interpreter differs from authenticated M4")
+    driver = _validate_process(driver_process)
+    if type(resource.get("ppid")) is not int or resource["ppid"] != driver["pid"]:
+        raise ValueError("scorer parent process differs from replay driver")
+    return _validate_driver_scorer_process_join_v2(
+        driver_process=driver,
+        scorer_process={name: resource[name] for name in ("boot_id", "hostname", "pid", "start_ticks")},
+    )
+
+
 def _validate_runtime_tools(value: Mapping[str, Any]) -> dict[str, Any]:
     _require_exact_keys(value, RUNTIME_TOOL_KEYS, name="runtime_tools")
     return {
-        "manifest_path": str(
-            _canonical_absolute_path(
-                value["manifest_path"], name="runtime_tools.manifest_path"
-            )
-        ),
-        "manifest_sha256": _require_digest(
-            value["manifest_sha256"], name="runtime_tools.manifest_sha256"
-        ),
+        "manifest_path": str(_canonical_absolute_path(value["manifest_path"], name="runtime_tools.manifest_path")),
+        "manifest_sha256": _require_digest(value["manifest_sha256"], name="runtime_tools.manifest_sha256"),
     }
 
 
-def _validate_replay_runtime(
-    value: Mapping[str, Any], *, expected_bundle_sha256: str
-) -> dict[str, Any]:
+def _validate_replay_runtime(value: Mapping[str, Any], *, expected_bundle_sha256: str) -> dict[str, Any]:
     _require_exact_keys(value, REPLAY_RUNTIME_KEYS, name="replay_runtime")
     result = dict(value)
     expected = {
@@ -4229,16 +5801,10 @@ def _validate_replay_runtime(
         "streaming_rejections": 0,
     }
     for key, expected_value in expected.items():
-        if result[key] != expected_value or type(result[key]) is not type(
-            expected_value
-        ):
+        if result[key] != expected_value or type(result[key]) is not type(expected_value):
             raise ValueError(f"replay_runtime.{key} must be exactly {expected_value!r}")
-    _require_digest(
-        result["ready_marker_sha256"], name="replay_runtime.ready_marker_sha256"
-    )
-    _require_digest(
-        result["hit_markers_sha256"], name="replay_runtime.hit_markers_sha256"
-    )
+    _require_digest(result["ready_marker_sha256"], name="replay_runtime.ready_marker_sha256")
+    _require_digest(result["hit_markers_sha256"], name="replay_runtime.hit_markers_sha256")
     return result
 
 
@@ -4364,9 +5930,7 @@ def _load_finalized_scorer_call_index(
             load_finalized_format_verification_call_index,
         )
     except ImportError as error:
-        raise RuntimeError(
-            "public finalized scorer call loader is unavailable"
-        ) from error
+        raise RuntimeError("public finalized scorer call loader is unavailable") from error
     receipt_root = Path(reference["path"]).parent
     loaded, digest = load_finalized_format_verification_call_index(
         Path(reference["path"]),
@@ -4404,15 +5968,11 @@ def _close_replay_output_documents(
         "mode": "captured_replay",
         "attempt_id": manifest["attempt_id"],
     }
-    _require_exact_projection(
-        transcript, expected_transcript_envelope, name="replay transcript"
-    )
+    _require_exact_projection(transcript, expected_transcript_envelope, name="replay transcript")
     source_snapshot = manifest["replay_contract"]["source_snapshot"]["ref"]
     expected_transcript_bindings = {
         "pair_manifest_sha256": manifest["pair"]["manifest"]["sha256"],
-        "submission_receipt_sha256": document_sha256(
-            submission_receipt, trailing_lf=True
-        ),
+        "submission_receipt_sha256": document_sha256(submission_receipt, trailing_lf=True),
         "job_id": authenticated_job_id,
         "run_id": replay_run_id(
             environment=manifest["environment"],
@@ -4420,9 +5980,7 @@ def _close_replay_output_documents(
             attempt_id=manifest["attempt_id"],
         ),
         "fixture_sha256": manifest["artifacts"]["fixture"]["sha256"],
-        "verifier_source_sha256": manifest["replay_contract"]["gym_scorer"][
-            "resources"
-        ]["verifier_source"]["sha256"],
+        "verifier_source_sha256": manifest["replay_contract"]["gym_scorer"]["resources"]["verifier_source"]["sha256"],
         "config_sha256": manifest["replay_contract"]["selected_config"]["sha256"],
         "snapshot_manifest_sha256": source_snapshot["manifest_sha256"],
     }
@@ -4435,9 +5993,7 @@ def _close_replay_output_documents(
         **expected_transcript_bindings,
         "restart_count": 0,
         "pair_campaign_sha256": manifest["pair"]["pair_campaign_sha256"],
-        "pair_campaign_reward_and_advantage_sha256": manifest["pair"][
-            "pair_campaign_reward_and_advantage_sha256"
-        ],
+        "pair_campaign_reward_and_advantage_sha256": manifest["pair"]["pair_campaign_reward_and_advantage_sha256"],
         "process": copy.deepcopy(dict(driver_process)),
     }
     expected_ledger = {
@@ -4457,9 +6013,7 @@ def _close_replay_output_documents(
     transport = source_step1["model_transport"]
     expected_source = {
         "arm": "off",
-        "authenticated_job_id": manifest["source_capture"]["authenticated_job"][
-            "job_id"
-        ],
+        "authenticated_job_id": manifest["source_capture"]["authenticated_job"]["job_id"],
         "pair_manifest_sha256": manifest["pair"]["manifest"]["sha256"],
         "submission_receipt_sha256": manifest["pair"]["submission_receipt"]["sha256"],
         "main_ledger": source_step1["main_ledger"],
@@ -4474,15 +6028,11 @@ def _close_replay_output_documents(
         "environment": manifest["environment"],
         "source": expected_source,
     }
-    _require_exact_projection(
-        consumption, expected_consumption, name="transport consumption"
-    )
+    _require_exact_projection(consumption, expected_consumption, name="transport consumption")
     replay = consumption["replay"]
     expected_replay = {
         "attempt_id": manifest["attempt_id"],
-        "replay_execution_manifest_sha256": submission_receipt[
-            "replay_execution_manifest"
-        ]["sha256"],
+        "replay_execution_manifest_sha256": submission_receipt["replay_execution_manifest"]["sha256"],
         "authenticated_job_id": authenticated_job_id,
         "process": driver_process,
         "scheduler_device_environment": driver_scheduler_device_environment,
@@ -4516,35 +6066,21 @@ def _close_replay_output_documents(
     transcript_entries = transcript["entries"]
     if len(entries) != K4_SAMPLES or len(transcript_entries) != K4_SAMPLES:
         raise ValueError("replay terminal outputs are not exact K=4")
-    for index, (entry, transcript_entry) in enumerate(
-        zip(entries, transcript_entries, strict=True)
-    ):
+    for index, (entry, transcript_entry) in enumerate(zip(entries, transcript_entries, strict=True)):
         expected_entry = {
             "rollout_index": index,
             "generation_seed": transcript_entry["generation_seed"],
-            "source_model_transport_entry_sha256": transcript_entry[
-                "model_transport_entry_sha256"
-            ],
-            "source_request_body_sha256": transcript_entry[
-                "model_transport_request_body_sha256"
-            ],
-            "source_response_body_sha256": transcript_entry[
-                "model_transport_response_body_sha256"
-            ],
+            "source_model_transport_entry_sha256": transcript_entry["model_transport_entry_sha256"],
+            "source_request_body_sha256": transcript_entry["model_transport_request_body_sha256"],
+            "source_response_body_sha256": transcript_entry["model_transport_response_body_sha256"],
             "generation_request_sha256": transcript_entry["generation_request_sha256"],
             "model_response_sha256": transcript_entry["model_response_sha256"],
             "agent_run_request_sha256": transcript_entry["agent_run_request_sha256"],
-            "derived_verifier_request_sha256": transcript_entry[
-                "derived_verifier_request_sha256"
-            ],
-            "fresh_verifier_response_sha256": transcript_entry[
-                "verifier_response_sha256"
-            ],
+            "derived_verifier_request_sha256": transcript_entry["derived_verifier_request_sha256"],
+            "fresh_verifier_response_sha256": transcript_entry["verifier_response_sha256"],
             "fresh_native_reward": transcript_entry["raw_environment_reward"],
         }
-        _require_exact_projection(
-            entry, expected_entry, name=f"transport consumption entry {index}"
-        )
+        _require_exact_projection(entry, expected_entry, name=f"transport consumption entry {index}")
 
 
 def _close_score_transcript_join(
@@ -4565,23 +6101,17 @@ def _close_score_transcript_join(
     ):
         raise ValueError("scorer call index profile identity differs")
     quiescence = score_index.get("quiescence")
-    if (
-        not isinstance(quiescence, Mapping)
-        or quiescence.get("original_process_reaped") is not True
-    ):
+    if not isinstance(quiescence, Mapping) or quiescence.get("original_process_reaped") is not True:
         raise ValueError("scorer call index does not prove process reaping")
     calls = score_index.get("calls")
     if not isinstance(calls, list) or len(calls) != K4_SAMPLES:
         raise ValueError("scorer call index is not exact K=4")
-    for index, (call, entry) in enumerate(
-        zip(calls, transcript["entries"], strict=True)
-    ):
+    for index, (call, entry) in enumerate(zip(calls, transcript["entries"], strict=True)):
         request = entry["derived_verifier_request"]
         if type(request) is not dict:
             raise TypeError("derived format-verifier request must be an exact object")
         format_request = {
-            name: copy.deepcopy(request[name])
-            for name in ("responses_create_params", "response", "verifier")
+            name: copy.deepcopy(request[name]) for name in ("responses_create_params", "response", "verifier")
         }
         expectation = format_verification_call_expectation(
             environment=expected_environment,
@@ -4626,9 +6156,7 @@ def _replay_runtime_attestation(
         "original_process_reaped": True,
         "environment": replay_execution_manifest["environment"],
         "profile_id": replay_execution_manifest["scorer_profile"]["profile_id"],
-        "requirements": copy.deepcopy(
-            replay_execution_manifest["runtime_attestation_requirements"]
-        ),
+        "requirements": copy.deepcopy(replay_execution_manifest["runtime_attestation_requirements"]),
         **{name: copy.deepcopy(outputs[name]) for name in REPLAY_OUTPUT_V2_KEYS},
     }
 
@@ -4666,9 +6194,7 @@ def _validated_lifecycle_manifest(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
-    if not _exact_json_equal(
-        document["source_capture"], authenticated_source.source_capture
-    ):
+    if not _exact_json_equal(document["source_capture"], authenticated_source.source_capture):
         raise ValueError("replay manifest source capture differs from capability")
     return document
 
@@ -4685,13 +6211,8 @@ def _authenticate_program_closure_v2(document: Mapping[str, Any]) -> None:
         name="profiled replay program closure",
     )
     source_snapshot = replay_contract.get("source_snapshot")
-    if (
-        type(source_snapshot) is not dict
-        or type(source_snapshot.get("ref")) is not dict
-    ):
-        raise TypeError(
-            "profiled replay source snapshot reference must be an exact object"
-        )
+    if type(source_snapshot) is not dict or type(source_snapshot.get("ref")) is not dict:
+        raise TypeError("profiled replay source snapshot reference must be an exact object")
     snapshot_root = _canonical_absolute_path(
         source_snapshot["ref"].get("path"),
         name="profiled replay source snapshot path",
@@ -4783,21 +6304,13 @@ def _require_replay_job_disjoint_from_pair(
     authenticated = receipt.get("authenticated_jobs")
     if not isinstance(authenticated, Mapping):
         raise TypeError("Pair authenticated_jobs must be an object")
-    _require_exact_keys(
-        authenticated, frozenset({"off", "on"}), name="Pair authenticated_jobs"
-    )
+    _require_exact_keys(authenticated, frozenset({"off", "on"}), name="Pair authenticated_jobs")
     pair_job_ids: dict[str, str] = {}
     for arm in ("off", "on"):
         identities = authenticated[arm]
-        if (
-            not isinstance(identities, list)
-            or len(identities) != 1
-            or not isinstance(identities[0], Mapping)
-        ):
+        if not isinstance(identities, list) or len(identities) != 1 or not isinstance(identities[0], Mapping):
             raise ValueError(f"Pair authenticated_jobs.{arm} must contain one identity")
-        pair_job_ids[arm] = _require_job_id(
-            identities[0].get("job_id"), name=f"Pair authenticated {arm} job_id"
-        )
+        pair_job_ids[arm] = _require_job_id(identities[0].get("job_id"), name=f"Pair authenticated {arm} job_id")
     if pair_job_ids["off"] == pair_job_ids["on"]:
         raise ValueError("Pair authenticated OFF and ON job IDs must differ")
     if job_id in pair_job_ids.values():
@@ -4805,9 +6318,7 @@ def _require_replay_job_disjoint_from_pair(
     return job_id
 
 
-def _require_exact_projection(
-    actual: Mapping[str, Any], expected: Mapping[str, Any], *, name: str
-) -> None:
+def _require_exact_projection(actual: Mapping[str, Any], expected: Mapping[str, Any], *, name: str) -> None:
     for key, expected_value in expected.items():
         if key not in actual or not _exact_json_equal(actual[key], expected_value):
             raise ValueError(f"{name}.{key} differs")
@@ -4852,12 +6363,10 @@ def _validate_replay_scheduler_tools(
     pair_receipt = _load_lifecycle_pair_submission_receipt(replay_execution_manifest)
     authenticated_tools = pair_receipt["scheduler_tools"]
     for name in REPLAY_SCHEDULER_TOOL_KEYS:
-        if not _exact_json_equal(
-            result[name], host_tools[name]
-        ) or not _exact_json_equal(result[name], authenticated_tools[name]):
-            raise ValueError(
-                f"scheduler_tools.{name} differs from authenticated runtime tools"
-            )
+        if not _exact_json_equal(result[name], host_tools[name]) or not _exact_json_equal(
+            result[name], authenticated_tools[name]
+        ):
+            raise ValueError(f"scheduler_tools.{name} differs from authenticated runtime tools")
     return result
 
 
@@ -4891,9 +6400,7 @@ def _validate_replay_scheduler_client_environment(
     pair_receipt = _load_lifecycle_pair_submission_receipt(replay_execution_manifest)
     expected = pair_receipt["scheduler_tools"]["client_environment"]
     if not _exact_json_equal(result, expected):
-        raise ValueError(
-            "scheduler client environment differs from authenticated Pair receipt"
-        )
+        raise ValueError("scheduler client environment differs from authenticated Pair receipt")
     host_env = replay_execution_manifest["runtime_tools"]["document"]["host"]["env"]
     if not _exact_json_equal(result["env"], host_env):
         raise ValueError("scheduler client env tool differs from replay runtime tools")
@@ -4903,14 +6410,10 @@ def _validate_replay_scheduler_client_environment(
 def _validate_replay_accepted_id_record(
     value: Mapping[str, Any], *, replay_execution_manifest: Mapping[str, Any]
 ) -> dict[str, Any]:
-    _require_exact_keys(
-        value, REPLAY_ACCEPTED_ID_RECORD_KEYS, name="accepted_id_record"
-    )
+    _require_exact_keys(value, REPLAY_ACCEPTED_ID_RECORD_KEYS, name="accepted_id_record")
     contract = replay_execution_manifest["scheduler_submission"]["accepted_id_record"]
     path = _canonical_absolute_path(value["path"], name="accepted_id_record.path")
-    expected_path = _canonical_absolute_path(
-        contract["path"], name="declared accepted ID path"
-    )
+    expected_path = _canonical_absolute_path(contract["path"], name="declared accepted ID path")
     if path != expected_path:
         raise ValueError("accepted ID record path differs from replay manifest")
     if (
@@ -4921,9 +6424,7 @@ def _validate_replay_accepted_id_record(
     ):
         raise ValueError("accepted ID record framing/mode differs")
     sha256 = _require_digest(value["sha256"], name="accepted_id_record.sha256")
-    candidate = _require_job_id(
-        value["parsed_candidate_job_id"], name="parsed_candidate_job_id"
-    )
+    candidate = _require_job_id(value["parsed_candidate_job_id"], name="parsed_candidate_job_id")
     raw = _load_lifecycle_raw_bytes(path, expected_sha256=sha256, maximum=64)
     if raw != f"{candidate}\n".encode("ascii"):
         raise ValueError("accepted ID bytes differ from parsed candidate job ID")
@@ -4968,24 +6469,18 @@ def _load_replay_scheduler_query_reference(
 
 def _lifecycle_results_root(replay_execution_manifest: Mapping[str, Any]) -> Path:
     pair = _load_lifecycle_pair_manifest(replay_execution_manifest)
-    root = _canonical_absolute_path(
-        pair["paths"]["results_root"], name="Pair results_root"
-    )
+    root = _canonical_absolute_path(pair["paths"]["results_root"], name="Pair results_root")
     attempt_root = _canonical_absolute_path(
         replay_execution_manifest["artifacts"]["outputs"]["directory"]["path"],
         name="replay attempt output root",
     )
-    expected_attempt_root = (
-        root / "captured_replay" / replay_execution_manifest["attempt_id"]
-    )
+    expected_attempt_root = root / "captured_replay" / replay_execution_manifest["attempt_id"]
     if attempt_root != expected_attempt_root:
         raise ValueError("replay output root differs from Pair results root")
     return root
 
 
-def _submission_query_path(
-    replay_execution_manifest: Mapping[str, Any], *, raw: bool
-) -> Path:
+def _submission_query_path(replay_execution_manifest: Mapping[str, Any], *, raw: bool) -> Path:
     accepted_path = _canonical_absolute_path(
         replay_execution_manifest["scheduler_submission"]["accepted_id_record"]["path"],
         name="accepted ID path",
@@ -5010,12 +6505,8 @@ def _validate_submission_parent_precondition(
     )
     if accepted_path.parent != receipt_path.parent:
         raise ValueError("accepted-ID and submission receipt parents differ")
-    operational = replay_execution_manifest["execution_environment"]["attempt"][
-        "operational"
-    ]
-    slurm_root = _canonical_absolute_path(
-        operational["slurm"], name="operational Slurm root"
-    )
+    operational = replay_execution_manifest["execution_environment"]["attempt"]["operational"]
+    slurm_root = _canonical_absolute_path(operational["slurm"], name="operational Slurm root")
     parent_fd = _open_absolute_directory_without_symlinks(slurm_root)
     try:
         _require_owned_directory(os.fstat(parent_fd), name="submission state parent")
@@ -5033,9 +6524,7 @@ def _validate_submission_parent_precondition(
         os.close(parent_fd)
 
 
-def _replay_job_parent(
-    replay_execution_manifest: Mapping[str, Any], authenticated_job_id: str
-) -> Path:
+def _replay_job_parent(replay_execution_manifest: Mapping[str, Any], authenticated_job_id: str) -> Path:
     job_id = _require_job_id(authenticated_job_id, name="authenticated_job_id")
     return (
         _lifecycle_results_root(replay_execution_manifest)
@@ -5057,11 +6546,7 @@ def _job_query_path(
     if phase not in {"PRE", "POST"}:
         raise ValueError("in-job scheduler query phase must be PRE or POST")
     suffix = "scontrol.raw" if raw else "scontrol-query.json"
-    return (
-        _replay_job_parent(replay_execution_manifest, authenticated_job_id)
-        / "queries"
-        / f"{phase}.{suffix}"
-    )
+    return _replay_job_parent(replay_execution_manifest, authenticated_job_id) / "queries" / f"{phase}.{suffix}"
 
 
 def _replay_job_receipt_path(
@@ -5072,11 +6557,7 @@ def _replay_job_receipt_path(
 ) -> Path:
     if phase not in {"PRE", "EXIT"}:
         raise ValueError("replay job receipt phase must be PRE or EXIT")
-    return (
-        _replay_job_parent(replay_execution_manifest, authenticated_job_id)
-        / "receipts"
-        / f"{phase}.json"
-    )
+    return _replay_job_parent(replay_execution_manifest, authenticated_job_id) / "receipts" / f"{phase}.json"
 
 
 def _replay_post_index_path(replay_execution_manifest: Mapping[str, Any]) -> Path:
@@ -5112,19 +6593,15 @@ def _close_scheduler_query_to_lifecycle(
     record = query["records"][0]
     expected = {
         "job_id": _require_job_id(candidate_job_id, name="candidate_job_id"),
-        "job_name": replay_execution_manifest["scheduler_submission"]["identity"][
-            "job_name"
-        ],
+        "job_name": replay_execution_manifest["scheduler_submission"]["identity"]["job_name"],
         "comment": comment,
         "user_id": str(submitter_euid),
-        "work_dir": replay_execution_manifest["execution_environment"]["attempt"][
-            "scheduler"
-        ]["batch_working_directory"],
+        "work_dir": replay_execution_manifest["execution_environment"]["attempt"]["scheduler"][
+            "batch_working_directory"
+        ],
         "restart_count": 0,
     }
-    _require_exact_projection(
-        record, expected, name=f"{query['phase']} scheduler record"
-    )
+    _require_exact_projection(record, expected, name=f"{query['phase']} scheduler record")
 
 
 def _validate_replay_sbatch_argv(
@@ -5146,7 +6623,7 @@ def _validate_replay_sbatch_argv(
         replay_execution_manifest["replay_contract"]["source_snapshot"]["ref"]["path"],
         name="replay source snapshot",
     )
-    wrapper = _absolute_program_reference(
+    _absolute_program_reference(
         snapshot_root,
         replay_execution_manifest["replay_contract"]["program"]["job_wrapper"],
     )
@@ -5160,9 +6637,7 @@ def _validate_replay_sbatch_argv(
     finally:
         os.close(parent_fd)
     slurm_root = _canonical_absolute_path(
-        replay_execution_manifest["execution_environment"]["attempt"]["operational"][
-            "slurm"
-        ],
+        replay_execution_manifest["execution_environment"]["attempt"]["operational"]["slurm"],
         name="operational Slurm root",
     )
     slurm_fd = _open_absolute_directory_without_symlinks(slurm_root)
@@ -5170,6 +6645,16 @@ def _validate_replay_sbatch_argv(
         _require_owned_directory(os.fstat(slurm_fd), name="operational Slurm root")
     finally:
         os.close(slurm_fd)
+    if len(argv) != 39:
+        raise ValueError("sbatch argv differs from authoritative replay ordering")
+    export_match = re.fullmatch(r"--export-file=([1-9][0-9]*)", argv[17])
+    wrapper_match = re.fullmatch(r"/proc/self/fd/([1-9][0-9]*)", argv[18])
+    if export_match is None or wrapper_match is None:
+        raise ValueError("sbatch retained descriptor arguments differ")
+    export_fd = int(export_match.group(1), 10)
+    wrapper_fd = int(wrapper_match.group(1), 10)
+    if export_fd < 3 or wrapper_fd < 3 or export_fd == wrapper_fd:
+        raise ValueError("sbatch retained descriptor identities differ")
     expected = [
         "--parsable",
         "--hold",
@@ -5188,8 +6673,8 @@ def _validate_replay_sbatch_argv(
         f"--error={slurm_root}/slurm-%j.err",
         f"--qos={slurm['qos']}",
         f"--comment={comment}",
-        f"--export-file={replay_execution_manifest['slurm_export_boundary']['path']}",
-        wrapper["path"],
+        f"--export-file={export_fd}",
+        f"/proc/self/fd/{wrapper_fd}",
         "--pair-manifest",
         replay_execution_manifest["pair"]["manifest"]["path"],
         "--pair-manifest-sha256",
@@ -5216,13 +6701,9 @@ def _validate_replay_sbatch_argv(
     return argv
 
 
-def _absolute_program_reference(
-    snapshot_root: Path, value: Mapping[str, Any]
-) -> dict[str, str]:
+def _absolute_program_reference(snapshot_root: Path, value: Mapping[str, Any]) -> dict[str, str]:
     _require_exact_keys(value, TOOL_REFERENCE_KEYS, name="replay program reference")
-    relative = _require_ascii(
-        value["path"], name="replay program relative path", maximum=4096
-    )
+    relative = _require_ascii(value["path"], name="replay program relative path", maximum=4096)
     relative_path = Path(relative)
     if (
         relative_path.is_absolute()
@@ -5233,15 +6714,11 @@ def _absolute_program_reference(
         raise ValueError("replay program path must be canonical and relative")
     return {
         "path": str(snapshot_root / relative_path),
-        "sha256": _require_digest(
-            value["sha256"], name="replay program reference SHA-256"
-        ),
+        "sha256": _require_digest(value["sha256"], name="replay program reference SHA-256"),
     }
 
 
-def _receipt_reference_for_document(
-    *, path: str, schema: str, document: Mapping[str, Any]
-) -> dict[str, str]:
+def _receipt_reference_for_document(*, path: str, schema: str, document: Mapping[str, Any]) -> dict[str, str]:
     return {
         "path": str(_canonical_absolute_path(path, name=f"{schema} path")),
         "schema": schema,
@@ -5252,10 +6729,7 @@ def _receipt_reference_for_document(
 def _replay_static_boundary(
     replay_execution_manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
-    return {
-        name: copy.deepcopy(replay_execution_manifest[name])
-        for name in REPLAY_STATIC_BOUNDARY_V2_KEYS
-    }
+    return {name: copy.deepcopy(replay_execution_manifest[name]) for name in REPLAY_STATIC_BOUNDARY_V2_KEYS}
 
 
 def _replay_scheduler_query_phase(value: Any) -> str:
@@ -5264,9 +6738,7 @@ def _replay_scheduler_query_phase(value: Any) -> str:
     return value
 
 
-def _validate_replay_scheduler_record(
-    value: Mapping[str, Any], *, phase: str
-) -> dict[str, Any]:
+def _validate_replay_scheduler_record(value: Mapping[str, Any], *, phase: str) -> dict[str, Any]:
     _require_exact_keys(value, REPLAY_SCHEDULER_RECORD_KEYS, name="scheduler record")
     result = copy.deepcopy(dict(value))
     _require_job_id(result["job_id"], name="scheduler record job_id")
@@ -5276,17 +6748,9 @@ def _validate_replay_scheduler_record(
         ("job_state", 64),
     ):
         _require_ascii(result[key], name=f"scheduler record {key}", maximum=maximum)
-    _require_scheduler_string(
-        result["reason"], name="scheduler record reason", maximum=4096
-    )
-    user_id = _require_ascii(
-        result["user_id"], name="scheduler record user_id", maximum=32
-    )
-    if (
-        not user_id.isdecimal()
-        or str(int(user_id)) != user_id
-        or not 0 <= int(user_id) <= (1 << 31) - 1
-    ):
+    _require_scheduler_string(result["reason"], name="scheduler record reason", maximum=4096)
+    user_id = _require_ascii(result["user_id"], name="scheduler record user_id", maximum=32)
+    if not user_id.isdecimal() or str(int(user_id)) != user_id or not 0 <= int(user_id) <= (1 << 31) - 1:
         raise ValueError("scheduler record user_id must be a canonical uint31 string")
     _canonical_absolute_path(result["work_dir"], name="scheduler record work_dir")
     if type(result["held"]) is not bool:
@@ -5322,9 +6786,7 @@ def _normalized_replay_scheduler_record(raw: bytes, *, phase: str) -> dict[str, 
         raise ValueError(f"scheduler raw output is not strict JSON: {error}") from error
     _require_exact_keys(
         parsed,
-        frozenset(
-            {"errors", "jobs", "last_backfill", "last_update", "meta", "warnings"}
-        ),
+        frozenset({"errors", "jobs", "last_backfill", "last_update", "meta", "warnings"}),
         name="scheduler raw JSON root",
     )
     if parsed["errors"] != [] or type(parsed["errors"]) is not list:
@@ -5351,10 +6813,7 @@ def _normalized_replay_scheduler_record(raw: bytes, *, phase: str) -> dict[str, 
     }
     missing = required - set(source)
     if missing:
-        raise ValueError(
-            "scheduler raw job is missing required fields: "
-            + ", ".join(sorted(missing))
-        )
+        raise ValueError("scheduler raw job is missing required fields: " + ", ".join(sorted(missing)))
     job_id = source["job_id"]
     if type(job_id) is not int or not 1 <= job_id <= (1 << 63) - 1:
         raise ValueError("scheduler raw job_id must be a positive int63")
@@ -5370,9 +6829,7 @@ def _normalized_replay_scheduler_record(raw: bytes, *, phase: str) -> dict[str, 
     if type(states) is not list or len(states) != 1 or type(states[0]) is not str:
         raise ValueError("scheduler raw job_state must be an exact one-string list")
     job_name = _require_ascii(source["name"], name="scheduler raw name", maximum=255)
-    comment = _require_ascii(
-        source["comment"], name="scheduler raw comment", maximum=4096
-    )
+    comment = _require_ascii(source["comment"], name="scheduler raw comment", maximum=4096)
     work_dir = str(
         _canonical_absolute_path(
             _require_ascii(
@@ -5384,9 +6841,7 @@ def _normalized_replay_scheduler_record(raw: bytes, *, phase: str) -> dict[str, 
         )
     )
     job_state = _require_ascii(states[0], name="scheduler raw job_state", maximum=64)
-    reason = _require_scheduler_string(
-        source["state_reason"], name="scheduler raw state_reason", maximum=4096
-    )
+    reason = _require_scheduler_string(source["state_reason"], name="scheduler raw state_reason", maximum=4096)
     record = {
         "job_id": str(job_id),
         "job_name": job_name,
@@ -5415,9 +6870,7 @@ def _authenticated_replay_scontrol(
     )
     if host_ref != receipt_ref:
         raise ValueError("replay scontrol differs from authenticated Pair receipt")
-    _load_bound_runtime_tool_bytes(
-        Path(host_ref["path"]), expected_sha256=host_ref["sha256"]
-    )
+    _load_bound_runtime_tool_bytes(Path(host_ref["path"]), expected_sha256=host_ref["sha256"])
     return host_ref
 
 
@@ -5425,33 +6878,54 @@ def _load_bound_runtime_tool_bytes(path: Path, *, expected_sha256: str) -> bytes
     expected = _require_digest(expected_sha256, name="runtime tool SHA-256")
     parent_fd = _open_absolute_directory_without_symlinks(path.parent)
     try:
+        parent_before = os.fstat(parent_fd)
+        pre_named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(pre_named.st_mode) or not 0 < pre_named.st_size <= 64 * 1024 * 1024:
+            raise ValueError("runtime tool must be a bounded regular file")
         descriptor = os.open(
             path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=parent_fd,
         )
         try:
             before = os.fstat(descriptor)
-            if not 0 < before.st_size <= 64 * 1024 * 1024:
-                raise ValueError("runtime tool size is outside the admitted range")
+            if (
+                _file_fingerprint(pre_named) != _file_fingerprint(before)
+                or not stat.S_ISREG(before.st_mode)
+                or not 0 < before.st_size <= 64 * 1024 * 1024
+            ):
+                raise RuntimeError("runtime tool changed before stable read")
             raw = _read_all_bounded(descriptor, maximum=64 * 1024 * 1024)
             after = os.fstat(descriptor)
             named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         finally:
             os.close(descriptor)
+        parent_after = os.fstat(parent_fd)
+        fresh_parent_fd = _open_absolute_directory_without_symlinks(path.parent)
+        try:
+            fresh_parent = os.fstat(fresh_parent_fd)
+            fresh_named = os.stat(
+                path.name,
+                dir_fd=fresh_parent_fd,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(fresh_parent_fd)
     finally:
         os.close(parent_fd)
     if not (
-        _file_fingerprint(before)
+        _directory_identity(parent_before) == _directory_identity(parent_after) == _directory_identity(fresh_parent)
+    ):
+        raise RuntimeError("runtime tool parent changed during stable read")
+    if not (
+        _file_fingerprint(pre_named)
+        == _file_fingerprint(before)
         == _file_fingerprint(after)
         == _file_fingerprint(named)
+        == _file_fingerprint(fresh_named)
     ):
         raise RuntimeError("runtime tool changed during stable read")
-    if (
-        len(raw) != after.st_size
-        or not stat.S_ISREG(after.st_mode)
-        or hashlib.sha256(raw).hexdigest() != expected
-    ):
+    if len(raw) != after.st_size or not stat.S_ISREG(after.st_mode) or hashlib.sha256(raw).hexdigest() != expected:
         raise ValueError("runtime tool bytes differ from authenticated reference")
     return raw
 
@@ -5463,33 +6937,63 @@ def _scheduler_query_document_path(raw_path: Path) -> Path:
     return raw_path.with_name(f"{raw_path.name[: -len(suffix)]}.scontrol-query.json")
 
 
-def _load_lifecycle_raw_bytes(
-    path: Path, *, expected_sha256: str, maximum: int
-) -> bytes:
+def _load_lifecycle_raw_bytes(path: Path, *, expected_sha256: str, maximum: int) -> bytes:
     expected = _require_digest(expected_sha256, name="raw expected SHA-256")
     parent_fd = _open_absolute_directory_without_symlinks(path.parent)
     try:
-        _require_owned_directory(os.fstat(parent_fd), name="raw evidence parent")
+        parent_before = os.fstat(parent_fd)
+        _require_owned_directory(parent_before, name="raw evidence parent")
+        pre_named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(pre_named.st_mode)
+            or stat.S_IMODE(pre_named.st_mode) != 0o400
+            or pre_named.st_uid != os.geteuid()
+            or pre_named.st_nlink != 1
+            or not 0 < pre_named.st_size <= maximum
+        ):
+            raise RuntimeError("raw evidence must be stable EUID-owned single-link mode-0400 bytes")
         descriptor = os.open(
             path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=parent_fd,
         )
         try:
             before = os.fstat(descriptor)
-            if not 0 < before.st_size <= maximum:
-                raise ValueError("raw evidence size is outside the admitted range")
+            if (
+                _file_fingerprint(pre_named) != _file_fingerprint(before)
+                or not stat.S_ISREG(before.st_mode)
+                or not 0 < before.st_size <= maximum
+            ):
+                raise RuntimeError("raw evidence changed before stable read")
             raw = _read_all_bounded(descriptor, maximum=maximum)
             after = os.fstat(descriptor)
             named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         finally:
             os.close(descriptor)
+        parent_after = os.fstat(parent_fd)
+        fresh_parent_fd = _open_absolute_directory_without_symlinks(path.parent)
+        try:
+            fresh_parent = os.fstat(fresh_parent_fd)
+            _require_owned_directory(fresh_parent, name="fresh raw evidence parent")
+            fresh_named = os.stat(
+                path.name,
+                dir_fd=fresh_parent_fd,
+                follow_symlinks=False,
+            )
+        finally:
+            os.close(fresh_parent_fd)
     finally:
         os.close(parent_fd)
     if not (
-        _file_fingerprint(before)
+        _directory_identity(parent_before) == _directory_identity(parent_after) == _directory_identity(fresh_parent)
+    ):
+        raise RuntimeError("raw evidence parent changed during stable read")
+    if not (
+        _file_fingerprint(pre_named)
+        == _file_fingerprint(before)
         == _file_fingerprint(after)
         == _file_fingerprint(named)
+        == _file_fingerprint(fresh_named)
     ):
         raise RuntimeError("raw evidence changed during stable read")
     if (
@@ -5499,9 +7003,7 @@ def _load_lifecycle_raw_bytes(
         or after.st_uid != os.geteuid()
         or after.st_nlink != 1
     ):
-        raise RuntimeError(
-            "raw evidence must be stable EUID-owned single-link mode-0400 bytes"
-        )
+        raise RuntimeError("raw evidence must be stable EUID-owned single-link mode-0400 bytes")
     if hashlib.sha256(raw).hexdigest() != expected:
         raise ValueError("raw evidence differs from expected SHA-256")
     return raw
@@ -5594,9 +7096,7 @@ def _four_distinct_decimal_ids(value: Any, *, name: str) -> str:
         or any(re.fullmatch(r"0|[1-9][0-9]*", token) is None for token in tokens)
         or len({int(token) for token in tokens}) != 4
     ):
-        raise ValueError(
-            f"{name} must contain four canonical numerically distinct decimal IDs"
-        )
+        raise ValueError(f"{name} must contain four canonical numerically distinct decimal IDs")
     return text
 
 
@@ -5605,9 +7105,7 @@ def _require_exact_keys(value: Any, expected: frozenset[str], *, name: str) -> N
         raise TypeError(f"{name} must be an exact object")
     actual = set(value)
     if actual != set(expected):
-        raise ValueError(
-            f"{name} keyset mismatch: expected {sorted(expected)}, got {sorted(actual)}"
-        )
+        raise ValueError(f"{name} keyset mismatch: expected {sorted(expected)}, got {sorted(actual)}")
 
 
 def _require_ascii(value: Any, *, name: str, maximum: int) -> str:
@@ -5637,22 +7135,14 @@ def _require_safe_id(value: Any, *, name: str, maximum: int) -> str:
 
 
 def _require_digest(value: Any, *, name: str) -> str:
-    if (
-        type(value) is not str
-        or _HEX64_RE.fullmatch(value) is None
-        or value == "0" * 64
-    ):
+    if type(value) is not str or _HEX64_RE.fullmatch(value) is None or value == "0" * 64:
         raise ValueError(f"{name} must be a nonzero lowercase SHA-256 digest")
     return value
 
 
 def _require_job_id(value: Any, *, name: str) -> str:
     text = _require_ascii(value, name=name, maximum=32)
-    if (
-        not text.isdecimal()
-        or str(int(text)) != text
-        or not 1 <= int(text) <= (1 << 63) - 1
-    ):
+    if not text.isdecimal() or str(int(text)) != text or not 1 <= int(text) <= (1 << 63) - 1:
         raise ValueError(f"{name} must be a canonical positive decimal string")
     return text
 
@@ -5726,21 +7216,10 @@ def _validate_strict_json_types(value: Any, *, path: str) -> None:
 
 
 def _canonical_absolute_path(value: Any, *, name: str) -> Path:
-    if (
-        type(value) is not str
-        or not value
-        or "\x00" in value
-        or not value.startswith("/")
-        or value.startswith("//")
-    ):
+    if type(value) is not str or not value or "\x00" in value or not value.startswith("/") or value.startswith("//"):
         raise ValueError(f"{name} must be a nonempty canonical absolute path")
     path = Path(value)
-    if (
-        not path.is_absolute()
-        or "." in path.parts
-        or ".." in path.parts
-        or str(path) != value
-    ):
+    if not path.is_absolute() or "." in path.parts or ".." in path.parts or str(path) != value:
         raise ValueError(f"{name} must be a canonical absolute path, got {value!r}")
     return path
 
@@ -5763,11 +7242,7 @@ def _open_absolute_directory_without_symlinks(path: Path) -> int:
 
 
 def _require_owned_directory(metadata: os.stat_result, *, name: str) -> None:
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-        or metadata.st_uid != os.geteuid()
-    ):
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700 or metadata.st_uid != os.geteuid():
         raise RuntimeError(f"{name} must be an EUID-owned mode-0700 directory")
 
 
@@ -5813,4 +7288,14 @@ def _file_fingerprint(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
+    )
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    """Identity needed to prove a held directory is still at its canonical path."""
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
     )

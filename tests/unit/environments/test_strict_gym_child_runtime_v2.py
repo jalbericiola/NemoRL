@@ -34,18 +34,12 @@ import pytest
 
 from nemo_rl.environments import strict_gym_child_runtime_v2 as runtime
 
-BOOTSTRAP = (
-    Path(runtime.__file__).parent
-    / "_strict_gym_child_bootstrap_v2"
-    / "sitecustomize.py"
-)
+BOOTSTRAP = Path(runtime.__file__).parent / "_strict_gym_child_bootstrap_v2" / "sitecustomize.py"
 
 
 def _bootstrap_module(monkeypatch) -> SimpleNamespace:
     monkeypatch.delenv("NRL_STRICT_GYM_CHILD_SPEC_PATH", raising=False)
-    return SimpleNamespace(
-        **runpy.run_path(str(BOOTSTRAP), run_name="_strict_gym_bootstrap_test")
-    )
+    return SimpleNamespace(**runpy.run_path(str(BOOTSTRAP), run_name="_strict_gym_bootstrap_test"))
 
 
 def test_bootstrap_is_loaded_by_real_python_startup(tmp_path: Path) -> None:
@@ -106,8 +100,7 @@ def test_direct_runner_app_compile_does_not_inherit_future_annotations() -> None
 
     future_namespace: dict[str, Any] = {}
     future_code = compile(
-        b"from __future__ import annotations\n"
-        b"class Config: pass\nclass App:\n    config: Config\n",
+        b"from __future__ import annotations\n" b"class Config: pass\nclass App:\n    config: Config\n",
         "<strict-direct-runner-future-app>",
         "exec",
         dont_inherit=True,
@@ -148,9 +141,7 @@ def test_authenticated_termination_uses_pidfd_across_escalation(monkeypatch) -> 
 
         def register(self, pidfd: int, events: int) -> None:
             assert pidfd == 73
-            assert events == (
-                runtime.select.POLLIN | runtime.select.POLLHUP | runtime.select.POLLERR
-            )
+            assert events == (runtime.select.POLLIN | runtime.select.POLLHUP | runtime.select.POLLERR)
 
         def poll(self, timeout_ms: int) -> list[tuple[int, int]]:
             assert timeout_ms == 5_000
@@ -231,37 +222,23 @@ def _receipt(
             {
                 "package_root": str(purelib / "reasoning_gym"),
                 "package_resolved_root": str(purelib / "reasoning_gym"),
-                "module_origin": str(
-                    purelib / scorer["module_origin_relative_to_purelib"]
-                ),
-                "module_resolved_origin": str(
-                    purelib / scorer["module_origin_relative_to_purelib"]
-                ),
-                "resolver_origin": str(
-                    purelib / scorer["resolver_origin_relative_to_purelib"]
-                ),
-                "resolver_resolved_origin": str(
-                    purelib / scorer["resolver_origin_relative_to_purelib"]
-                ),
+                "module_origin": str(purelib / scorer["module_origin_relative_to_purelib"]),
+                "module_resolved_origin": str(purelib / scorer["module_origin_relative_to_purelib"]),
+                "resolver_origin": str(purelib / scorer["resolver_origin_relative_to_purelib"]),
+                "resolver_resolved_origin": str(purelib / scorer["resolver_origin_relative_to_purelib"]),
                 "origin": str(purelib / scorer["origin_relative_to_purelib"]),
                 "resolved_origin": str(purelib / scorer["origin_relative_to_purelib"]),
             }
         )
     direct = spec["scope"] == "scorer-only"
-    bootstrap_source = str(
-        Path(spec["bootstrap"]["root"]) / spec["bootstrap"]["filename"]
-    )
+    bootstrap_source = str(Path(spec["bootstrap"]["root"]) / spec["bootstrap"]["filename"])
     receipt = {
         "schema": runtime.STRICT_GYM_CHILD_RECEIPT_SCHEMA,
         "hash_domain": runtime.STRICT_GYM_CHILD_HASH_DOMAIN,
         "environment": spec["environment"],
         "pair_id": spec["pair_id"],
         "job_id": spec["job_id"],
-        "stage": (
-            "isolated-runner-pre-entrypoint"
-            if direct
-            else "sitecustomize-pre-entrypoint"
-        ),
+        "stage": ("isolated-runner-pre-entrypoint" if direct else "sitecustomize-pre-entrypoint"),
         "spec_sha256": runtime._sha256_bytes(runtime.canonical_ascii_json(spec)),
         "target": target_record,
         "server": {
@@ -283,11 +260,7 @@ def _receipt(
             "sys_prefix": target["venv"],
             "sys_base_prefix": "/usr/local",
             "proc_exe": "/usr/local/bin/python3.13",
-            "sys_argv": (
-                [bootstrap_source, target["source_path"]]
-                if direct
-                else [target["entrypoint"]]
-            ),
+            "sys_argv": ([bootstrap_source, target["source_path"]] if direct else [target["entrypoint"]]),
             "proc_argv": (
                 [
                     target["interpreter"],
@@ -312,32 +285,20 @@ def _receipt(
 
 
 def _patch_live_process(monkeypatch, target: dict[str, Any]) -> None:
-    monkeypatch.setattr(
-        runtime, "_boot_id", lambda: "12345678-1234-1234-1234-123456789abc"
-    )
+    monkeypatch.setattr(runtime, "_boot_id", lambda: "12345678-1234-1234-1234-123456789abc")
     monkeypatch.setattr(runtime, "_process_stat", lambda pid: (50, 777))
     monkeypatch.setattr(runtime, "_process_is_descendant", lambda pid, ancestor: True)
     monkeypatch.setattr(runtime, "_process_descendant_identities", lambda pid: [])
-    monkeypatch.setattr(
-        runtime, "_process_argv", lambda pid: ["python", target["entrypoint"]]
-    )
-    monkeypatch.setattr(
-        runtime, "_listening_socket_inodes", lambda pid, host, port: [88]
-    )
+    monkeypatch.setattr(runtime, "_process_argv", lambda pid: ["python", target["entrypoint"]])
+    monkeypatch.setattr(runtime, "_listening_socket_inodes", lambda pid, host, port: [88])
     monkeypatch.setattr(
         runtime.os,
         "readlink",
-        lambda path: (
-            "/usr/local/bin/python3.13"
-            if str(path).endswith("/exe")
-            else target["component_dir"]
-        ),
+        lambda path: ("/usr/local/bin/python3.13" if str(path).endswith("/exe") else target["component_dir"]),
     )
 
 
-def test_descendant_scan_includes_children_of_nonleader_threads(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_descendant_scan_includes_children_of_nonleader_threads(monkeypatch, tmp_path: Path) -> None:
     proc_root = tmp_path / "proc"
 
     def add_process(pid: int, tasks: dict[int, bytes]) -> None:
@@ -360,9 +321,7 @@ def test_descendant_scan_includes_children_of_nonleader_threads(
 
     monkeypatch.setattr(runtime, "_process_stat", process_stat)
 
-    assert runtime._process_descendant_identities(100, proc_root=proc_root) == [
-        (200, 777)
-    ]
+    assert runtime._process_descendant_identities(100, proc_root=proc_root) == [(200, 777)]
 
 
 def _write_immutable(path: Path, document: dict[str, Any]) -> bytes:
@@ -372,9 +331,7 @@ def _write_immutable(path: Path, document: dict[str, Any]) -> bytes:
     return payload
 
 
-def _score_finalizer_fixture(
-    monkeypatch, tmp_path: Path
-) -> tuple[
+def _score_finalizer_fixture(monkeypatch, tmp_path: Path) -> tuple[
     runtime.StrictGymChildRuntimeSession,
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -385,12 +342,8 @@ def _score_finalizer_fixture(
     component_dir = gym_root / "resources_servers/reasoning_gym"
     component_dir.mkdir(parents=True)
     monkeypatch.setattr(runtime, "STRICT_GYM_ROOT", gym_root)
-    monkeypatch.setattr(
-        runtime, "STRICT_GYM_VENV_ROOT", tmp_path.parent / f"{tmp_path.name}-venvs"
-    )
-    targets = runtime._target_matrix(
-        "reasoning_gym", runtime.STRICT_GYM_ROOT, scope="scorer-only"
-    )
+    monkeypatch.setattr(runtime, "STRICT_GYM_VENV_ROOT", tmp_path.parent / f"{tmp_path.name}-venvs")
+    targets = runtime._target_matrix("reasoning_gym", runtime.STRICT_GYM_ROOT, scope="scorer-only")
     target = targets[0]
     scorer = target["scorer"]
     assert scorer is not None
@@ -524,18 +477,12 @@ def _score_finalizer_fixture(
             raise ProcessLookupError(pid)
         return 50, 777
 
-    monkeypatch.setattr(
-        runtime, "_boot_id", lambda: "12345678-1234-1234-1234-123456789abc"
-    )
+    monkeypatch.setattr(runtime, "_boot_id", lambda: "12345678-1234-1234-1234-123456789abc")
     monkeypatch.setattr(runtime, "_process_stat", process_stat)
     monkeypatch.setattr(runtime, "_process_is_descendant", lambda pid, ancestor: True)
     monkeypatch.setattr(runtime, "_process_descendant_identities", lambda pid: [])
-    monkeypatch.setattr(
-        runtime, "_process_argv", lambda pid: ["python", target["entrypoint"]]
-    )
-    monkeypatch.setattr(
-        runtime, "_listening_socket_inodes", lambda pid, host, port: [88]
-    )
+    monkeypatch.setattr(runtime, "_process_argv", lambda pid: ["python", target["entrypoint"]])
+    monkeypatch.setattr(runtime, "_listening_socket_inodes", lambda pid, host, port: [88])
     monkeypatch.setattr(
         runtime,
         "_validate_receipt",
@@ -579,15 +526,11 @@ def _score_finalizer_fixture(
         spec=spec,
     )
     object.__setattr__(session, "_started_index", child_index)
-    object.__setattr__(
-        session, "_started_index_sha256", runtime._sha256_bytes(child_index_payload)
-    )
+    object.__setattr__(session, "_started_index_sha256", runtime._sha256_bytes(child_index_payload))
     return session, expected_calls, documents, run_helper
 
 
-def _format_finalizer_fixture(
-    monkeypatch, tmp_path: Path
-) -> tuple[
+def _format_finalizer_fixture(monkeypatch, tmp_path: Path) -> tuple[
     runtime.StrictGymChildRuntimeSession,
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -602,9 +545,7 @@ def _format_finalizer_fixture(
         "STRICT_GYM_VENV_ROOT",
         tmp_path.parent / f"{tmp_path.name}-format-venvs",
     )
-    targets = runtime._target_matrix(
-        "citation", runtime.STRICT_GYM_ROOT, scope="scorer-only"
-    )
+    targets = runtime._target_matrix("citation", runtime.STRICT_GYM_ROOT, scope="scorer-only")
     target = targets[0]
     assert target["scorer"] is None
     spec = runtime._build_spec(
@@ -757,15 +698,11 @@ def _format_finalizer_fixture(
             raise ProcessLookupError(pid)
         return 50, 777
 
-    monkeypatch.setattr(
-        runtime, "_boot_id", lambda: "12345678-1234-1234-1234-123456789abc"
-    )
+    monkeypatch.setattr(runtime, "_boot_id", lambda: "12345678-1234-1234-1234-123456789abc")
     monkeypatch.setattr(runtime, "_process_stat", process_stat)
     monkeypatch.setattr(runtime, "_process_is_descendant", lambda pid, ancestor: True)
     monkeypatch.setattr(runtime, "_process_descendant_identities", lambda pid: [])
-    monkeypatch.setattr(
-        runtime, "_listening_socket_inodes", lambda pid, host, port: [88]
-    )
+    monkeypatch.setattr(runtime, "_listening_socket_inodes", lambda pid, host, port: [88])
     monkeypatch.setattr(
         runtime,
         "_validate_receipt",
@@ -817,29 +754,33 @@ def _format_finalizer_fixture(
     return session, expected_calls, documents, run_helper
 
 
+def _format_payload_roster(root: Path) -> tuple[tuple[str, bytes], ...]:
+    filenames = (
+        "index.json",
+        *(f"format-verification-call-{sequence:08d}.json" for sequence in range(1, 5)),
+        "format-verification-call-index.json",
+        "format-verification-closed.json",
+        "resource.json",
+        "spec.json",
+    )
+    return tuple((f"strict_gym_child_runtime/{filename}", (root / filename).read_bytes()) for filename in filenames)
+
+
 @pytest.mark.parametrize("environment", ["reasoning_gym", "citation", "freeform"])
 def test_target_selection_main_and_scorer_only(environment: str) -> None:
     main = runtime._target_matrix(environment, runtime.STRICT_GYM_ROOT, scope="main")
-    scorer_only = runtime._target_matrix(
-        environment, runtime.STRICT_GYM_ROOT, scope="scorer-only"
-    )
+    scorer_only = runtime._target_matrix(environment, runtime.STRICT_GYM_ROOT, scope="scorer-only")
 
     assert [target["role"] for target in main] == ["resource", "simple_agent"]
     assert [target["role"] for target in scorer_only] == ["resource"]
     if environment == "reasoning_gym":
         assert main[0]["config_path_source"].endswith("/configs/reasoning_gym.yaml")
-        assert scorer_only[0]["config_path_source"].endswith(
-            "/configs/resources_only.yaml"
-        )
-        assert scorer_only[0]["config_sha256"] == (
-            "e11a3084f050e4c24101550f63efe71ac6c10f3bc125489ba7293cd81778de68"
-        )
+        assert scorer_only[0]["config_path_source"].endswith("/configs/resources_only.yaml")
+        assert scorer_only[0]["config_sha256"] == ("e11a3084f050e4c24101550f63efe71ac6c10f3bc125489ba7293cd81778de68")
     else:
         assert scorer_only == [main[0]]
     assert main[0]["component_dir"].startswith(f"{runtime.STRICT_GYM_ROOT}/")
-    assert main[1]["interpreter"] == (
-        "/opt/gym_venvs/responses_api_agents/simple_agent/.venv/bin/python"
-    )
+    assert main[1]["interpreter"] == ("/opt/gym_venvs/responses_api_agents/simple_agent/.venv/bin/python")
     assert main[1]["distribution_versions"] == {
         "nemo-gym": "0.5.0rc0",
         "openai": "2.6.1",
@@ -849,9 +790,7 @@ def test_target_selection_main_and_scorer_only(environment: str) -> None:
 
 
 def test_reasoning_metadata_and_module_literals_are_separate() -> None:
-    target = runtime._target_matrix(
-        "reasoning_gym", runtime.STRICT_GYM_ROOT, scope="scorer-only"
-    )[0]
+    target = runtime._target_matrix("reasoning_gym", runtime.STRICT_GYM_ROOT, scope="scorer-only")[0]
 
     assert target["distribution_versions"]["nemo-gym"] == "0.5.0rc0"
     assert target["module_versions"]["nemo_gym"] == "0.5.1"
@@ -891,9 +830,7 @@ def test_canonical_artifact_rejects_symlink(tmp_path: Path) -> None:
         runtime._load_canonical_document(link)
 
 
-def test_launch_environment_is_exclusive_and_restores_parent(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_launch_environment_is_exclusive_and_restores_parent(monkeypatch, tmp_path: Path) -> None:
     spec_path = tmp_path / "spec.json"
     session = runtime.StrictGymChildRuntimeSession(
         environment="citation",
@@ -920,9 +857,7 @@ def test_launch_environment_is_exclusive_and_restores_parent(
     assert "NRL_STRICT_GYM_CHILD_SPEC_PATH" not in os.environ
 
 
-def test_scorer_only_launch_rejects_ray_initialization_inside_hook(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_scorer_only_launch_rejects_ray_initialization_inside_hook(monkeypatch, tmp_path: Path) -> None:
     session = runtime.StrictGymChildRuntimeSession(
         environment="reasoning_gym",
         scope="scorer-only",
@@ -933,18 +868,14 @@ def test_scorer_only_launch_rejects_ray_initialization_inside_hook(
         bootstrap_sha256="b" * 64,
         spec={},
     )
-    monkeypatch.setitem(
-        sys.modules, "ray", SimpleNamespace(is_initialized=lambda: False)
-    )
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(is_initialized=lambda: False))
 
     with pytest.raises(RuntimeError, match="Ray initialized before hook injection"):
         with session.launch_environment():
             pytest.fail("launch context must not be entered")
 
 
-def test_scorer_only_launch_uses_exact_isolated_process_and_restores_globals(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_scorer_only_launch_uses_exact_isolated_process_and_restores_globals(monkeypatch, tmp_path: Path) -> None:
     component = tmp_path / "component"
     component.mkdir()
     target = {
@@ -992,9 +923,7 @@ def test_scorer_only_launch_uses_exact_isolated_process_and_restores_globals(
     setup_module.run_command = original_run
     setup_module.get_venv_path = lambda directory, config: Path(target["venv"])
     omega_module = ModuleType("omegaconf")
-    omega_module.OmegaConf = SimpleNamespace(
-        to_yaml=lambda config: "dry_run: false\nskip_venv_if_present: true\n"
-    )
+    omega_module.OmegaConf = SimpleNamespace(to_yaml=lambda config: "dry_run: false\nskip_venv_if_present: true\n")
     gym_package.cli = cli_package
     cli_package.env = env_module
     cli_package.setup_command = setup_module
@@ -1031,12 +960,8 @@ def test_scorer_only_launch_uses_exact_isolated_process_and_restores_globals(
     )
 
     with session.launch_environment():
-        assert (
-            env_module.setup_env_command(component, config, "reasoning_gym") == sentinel
-        )
-        process = env_module.run_command(
-            command, component, server_name="reasoning_gym"
-        )
+        assert env_module.setup_env_command(component, config, "reasoning_gym") == sentinel
+        process = env_module.run_command(command, component, server_name="reasoning_gym")
         assert process.pid == 321
 
     assert env_module.setup_env_command is original_setup
@@ -1132,9 +1057,7 @@ def test_exact_root_rejects_foreign_same_suffix(tmp_path: Path) -> None:
         runtime._validate_pinned_gym_root(hostile, [], scope="scorer-only")
 
 
-def test_scorer_no_site_accepts_only_exact_inert_q_image_pth_inventory(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_scorer_no_site_accepts_only_exact_inert_q_image_pth_inventory(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     purelib = tmp_path / "site-packages"
     purelib.mkdir()
@@ -1240,39 +1163,26 @@ def test_bootstrap_rejects_tampered_static_target(monkeypatch) -> None:
         bootstrap._validate_target(spec, target)
 
 
-def test_direct_bootstrap_removes_and_locks_hostile_component_import_path(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_direct_bootstrap_removes_and_locks_hostile_component_import_path(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     purelib = tmp_path / "purelib"
     component = tmp_path / "component"
     gym_root = tmp_path / "Gym"
     for directory in (purelib, component, gym_root):
         directory.mkdir()
-    (component / "hostile_component_module.py").write_text(
-        "raise RuntimeError('must not import')\n", encoding="ascii"
-    )
+    (component / "hostile_component_module.py").write_text("raise RuntimeError('must not import')\n", encoding="ascii")
     nemo_gym = ModuleType("nemo_gym")
     nemo_gym._augment_sys_path = lambda: None
-    monkeypatch.setitem(
-        bootstrap._seal_direct_runner_sys_path.__globals__, "_GYM_ROOT", gym_root
-    )
+    monkeypatch.setitem(bootstrap._seal_direct_runner_sys_path.__globals__, "_GYM_ROOT", gym_root)
     original_path = list(sys.path)
     isolated = ["/isolated/stdlib", "/isolated/lib-dynload"]
     try:
         sys.path[:] = [*isolated, str(purelib), str(component), str(gym_root)]
-        safe_path = bootstrap._seal_direct_runner_sys_path(
-            isolated, purelib, component, nemo_gym
-        )
+        safe_path = bootstrap._seal_direct_runner_sys_path(isolated, purelib, component, nemo_gym)
 
         assert sys.path == [*isolated, str(purelib), str(gym_root)]
         assert safe_path == tuple(sys.path)
-        assert (
-            importlib.machinery.PathFinder.find_spec(
-                "hostile_component_module", sys.path
-            )
-            is None
-        )
+        assert importlib.machinery.PathFinder.find_spec("hostile_component_module", sys.path) is None
         sys.path.append(str(component))
         with pytest.raises(ValueError, match="changed after authentication"):
             nemo_gym._augment_sys_path()
@@ -1289,9 +1199,7 @@ def test_direct_bootstrap_removes_and_locks_hostile_component_import_path(
         lambda paths: ["/hostile", *paths],
     ],
 )
-def test_direct_bootstrap_rejects_changed_ray_thirdparty_path(
-    monkeypatch, tmp_path: Path, mutate
-) -> None:
+def test_direct_bootstrap_rejects_changed_ray_thirdparty_path(monkeypatch, tmp_path: Path, mutate) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     purelib = tmp_path / "purelib"
     gym_root = tmp_path / "Gym"
@@ -1322,17 +1230,13 @@ def test_direct_bootstrap_rejects_changed_ray_thirdparty_path(
     original_path = list(sys.path)
     try:
         sys.path[:] = mutate(expected)
-        with pytest.raises(
-            ValueError, match="Ray changed the isolated scorer import path"
-        ):
+        with pytest.raises(ValueError, match="Ray changed the isolated scorer import path"):
             bootstrap._seal_direct_runner_ray_sys_path(safe_path, purelib, ray_inputs)
     finally:
         sys.path[:] = original_path
 
 
-def test_direct_bootstrap_strips_exact_ray_thirdparty_path(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_direct_bootstrap_strips_exact_ray_thirdparty_path(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     purelib = tmp_path / "purelib"
     gym_root = tmp_path / "Gym"
@@ -1402,9 +1306,7 @@ def _direct_ray_auth_fixture(bootstrap, monkeypatch, tmp_path: Path):
     return purelib, thirdparty
 
 
-def test_direct_bootstrap_authenticates_exact_ray_inputs(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_direct_bootstrap_authenticates_exact_ray_inputs(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     purelib, thirdparty = _direct_ray_auth_fixture(bootstrap, monkeypatch, tmp_path)
 
@@ -1414,9 +1316,7 @@ def test_direct_bootstrap_authenticates_exact_ray_inputs(
     assert set(authenticated["sources"]) == {"__init__.py", "_version.py"}
 
 
-def test_direct_bootstrap_rejects_symlinked_ray_thirdparty_path(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_direct_bootstrap_rejects_symlinked_ray_thirdparty_path(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     purelib, thirdparty = _direct_ray_auth_fixture(bootstrap, monkeypatch, tmp_path)
     thirdparty.rmdir()
@@ -1428,9 +1328,7 @@ def test_direct_bootstrap_rejects_symlinked_ray_thirdparty_path(
         bootstrap._authenticate_direct_runner_ray_inputs(purelib)
 
 
-def test_direct_bootstrap_rejects_changed_ray_source(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_direct_bootstrap_rejects_changed_ray_source(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     purelib, _thirdparty = _direct_ray_auth_fixture(bootstrap, monkeypatch, tmp_path)
     ray_init = (purelib / "ray/__init__.py").resolve(strict=True)
@@ -1442,9 +1340,7 @@ def test_direct_bootstrap_rejects_changed_ray_source(
 
 
 @pytest.mark.parametrize("link_count", [1, 3])
-def test_direct_bootstrap_rejects_changed_ray_source_link_count(
-    monkeypatch, tmp_path: Path, link_count: int
-) -> None:
+def test_direct_bootstrap_rejects_changed_ray_source_link_count(monkeypatch, tmp_path: Path, link_count: int) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     purelib, _thirdparty = _direct_ray_auth_fixture(bootstrap, monkeypatch, tmp_path)
     ray_init = (purelib / "ray/__init__.py").resolve(strict=True)
@@ -1460,9 +1356,7 @@ def test_direct_bootstrap_rejects_changed_ray_source_link_count(
 
 
 @pytest.mark.parametrize("mode", [0o644, 0o664, 0o646])
-def test_direct_bootstrap_rejects_changed_ray_source_mode(
-    monkeypatch, tmp_path: Path, mode: int
-) -> None:
+def test_direct_bootstrap_rejects_changed_ray_source_mode(monkeypatch, tmp_path: Path, mode: int) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     purelib, _thirdparty = _direct_ray_auth_fixture(bootstrap, monkeypatch, tmp_path)
     ray_init = (purelib / "ray/__init__.py").resolve(strict=True)
@@ -1646,12 +1540,8 @@ def judge_failsafe(verify_fn):
     return endpoint, request_type, payload, published
 
 
-def test_format_hook_records_exact_typed_fastapi_call(
-    monkeypatch, tmp_path: Path
-) -> None:
-    endpoint, request_type, payload, published = _format_hook_fixture(
-        monkeypatch, tmp_path
-    )
+def test_format_hook_records_exact_typed_fastapi_call(monkeypatch, tmp_path: Path) -> None:
+    endpoint, request_type, payload, published = _format_hook_fixture(monkeypatch, tmp_path)
 
     returned = asyncio.run(endpoint(body=request_type(payload)))
 
@@ -1738,9 +1628,7 @@ def test_format_expectation_rejects_negative_zero_reward() -> None:
         )
 
 
-def test_freeform_expectation_binds_exact_regex_result_and_rejects_inline_prose() -> (
-    None
-):
+def test_freeform_expectation_binds_exact_regex_result_and_rejects_inline_prose() -> None:
     request = {
         "responses_create_params": {},
         "response": {
@@ -1787,47 +1675,235 @@ def test_freeform_expectation_binds_exact_regex_result_and_rejects_inline_prose(
         )
 
 
-def test_format_finalizer_publishes_reaped_call_index(
-    monkeypatch, tmp_path: Path
-) -> None:
-    session, expected, _documents, run_helper = _format_finalizer_fixture(
-        monkeypatch, tmp_path
-    )
+def test_format_finalizer_publishes_reaped_call_index(monkeypatch, tmp_path: Path) -> None:
+    session, expected, _documents, run_helper = _format_finalizer_fixture(monkeypatch, tmp_path)
 
-    terminal, digest = session.finalize_format_verification_calls(
-        expected, run_helper=run_helper
-    )
+    terminal, digest = session.finalize_format_verification_calls(expected, run_helper=run_helper)
 
     assert terminal["schema"] == runtime.STRICT_GYM_FORMAT_CALL_INDEX_SCHEMA
     assert terminal["profile_id"] == "citation-string-match-v1"
     assert terminal["call_count"] == 4
     assert terminal["quiescence"]["original_process_reaped"] is True
-    assert digest == runtime._sha256_bytes(
-        (tmp_path / "format-verification-call-index.json").read_bytes()
+    assert digest == runtime._sha256_bytes((tmp_path / "format-verification-call-index.json").read_bytes())
+
+
+def test_format_payload_validator_matches_path_loader_without_io(monkeypatch, tmp_path: Path) -> None:
+    session, expected, _documents, run_helper = _format_finalizer_fixture(monkeypatch, tmp_path)
+    terminal, digest = session.finalize_format_verification_calls(expected, run_helper=run_helper)
+    payload_roster = _format_payload_roster(tmp_path)
+
+    def unexpected_io(*_args, **_kwargs):
+        raise AssertionError("pure format payload validation performed I/O")
+
+    monkeypatch.setattr(runtime, "_load_canonical_document", unexpected_io)
+    monkeypatch.setattr(runtime, "_require_sealed_bootstrap_root", unexpected_io)
+    monkeypatch.setattr(runtime.os, "open", unexpected_io)
+    monkeypatch.setattr(Path, "iterdir", unexpected_io)
+    monkeypatch.setattr(Path, "lstat", unexpected_io)
+
+    admitted, admitted_digest = runtime.validate_finalized_format_verification_call_index_payloads(
+        payload_roster,
+        expected_sha256=digest,
+        expected_receipt_root=tmp_path,
+        expected_bootstrap_root=session.bootstrap_root,
+        expected_bootstrap_sha256=session.bootstrap_sha256,
+        expected_pair_id="strict-pair-1",
+        expected_job_id="12345",
+        expected_environment="citation",
+        expected_profile_id="citation-string-match-v1",
     )
 
+    assert admitted == terminal
+    assert admitted_digest == digest
 
-def test_format_finalizer_rejects_negative_zero_expected_call(
-    monkeypatch, tmp_path: Path
+
+def test_format_payload_validator_requires_exact_roster_and_bootstrap_identity(monkeypatch, tmp_path: Path) -> None:
+    session, expected, _documents, run_helper = _format_finalizer_fixture(monkeypatch, tmp_path)
+    _terminal, digest = session.finalize_format_verification_calls(expected, run_helper=run_helper)
+    payload_roster = _format_payload_roster(tmp_path)
+    arguments = {
+        "expected_sha256": digest,
+        "expected_receipt_root": tmp_path,
+        "expected_bootstrap_root": session.bootstrap_root,
+        "expected_bootstrap_sha256": session.bootstrap_sha256,
+        "expected_pair_id": "strict-pair-1",
+        "expected_job_id": "12345",
+        "expected_environment": "citation",
+        "expected_profile_id": "citation-string-match-v1",
+    }
+    renamed = list(payload_roster)
+    renamed[0] = ("strict_gym_child_runtime/not-index.json", renamed[0][1])
+    mutable_payload = list(payload_roster)
+    mutable_payload[0] = (mutable_payload[0][0], bytearray(mutable_payload[0][1]))
+    poisons = (
+        list(payload_roster),
+        payload_roster[:-1],
+        tuple(reversed(payload_roster)),
+        tuple(renamed),
+        tuple(mutable_payload),
+    )
+    for poison in poisons:
+        with pytest.raises(ValueError, match="payload roster differs"):
+            runtime.validate_finalized_format_verification_call_index_payloads(poison, **arguments)
+
+    for boundary_poison in (
+        {"expected_bootstrap_root": Path("/different/bootstrap")},
+        {"expected_bootstrap_sha256": "b" * 64},
+    ):
+        with pytest.raises(ValueError, match="finalized format spec differs"):
+            runtime.validate_finalized_format_verification_call_index_payloads(
+                payload_roster, **(arguments | boundary_poison)
+            )
+
+
+def test_format_payload_validator_rejects_coherently_rehashed_negative_zero(monkeypatch, tmp_path: Path) -> None:
+    session, expected, _documents, run_helper = _format_finalizer_fixture(monkeypatch, tmp_path)
+    terminal, _digest = session.finalize_format_verification_calls(expected, run_helper=run_helper)
+    payloads = dict(_format_payload_roster(tmp_path))
+
+    call_name = "strict_gym_child_runtime/format-verification-call-00000001.json"
+    call = json.loads(payloads[call_name])
+    call["outcome"]["float_result"] = -0.0
+    payloads[call_name] = runtime.canonical_ascii_json(call)
+    call_digest = runtime._sha256_bytes(payloads[call_name])
+
+    closed_name = "strict_gym_child_runtime/format-verification-closed.json"
+    closed = json.loads(payloads[closed_name])
+    closed["calls"][0]["sha256"] = call_digest
+    payloads[closed_name] = runtime.canonical_ascii_json(closed)
+    closed_digest = runtime._sha256_bytes(payloads[closed_name])
+
+    terminal["calls"][0]["outcome"]["float_result"] = -0.0
+    terminal["calls"][0]["receipt"]["sha256"] = call_digest
+    terminal["verification_closed"]["sha256"] = closed_digest
+    terminal_name = "strict_gym_child_runtime/format-verification-call-index.json"
+    payloads[terminal_name] = runtime.canonical_ascii_json(terminal)
+    terminal_digest = runtime._sha256_bytes(payloads[terminal_name])
+    poisoned_roster = tuple((name, payloads[name]) for name, _payload in _format_payload_roster(tmp_path))
+
+    with pytest.raises(ValueError, match="finalized format call record 1"):
+        runtime.validate_finalized_format_verification_call_index_payloads(
+            poisoned_roster,
+            expected_sha256=terminal_digest,
+            expected_receipt_root=tmp_path,
+            expected_bootstrap_root=session.bootstrap_root,
+            expected_bootstrap_sha256=session.bootstrap_sha256,
+            expected_pair_id="strict-pair-1",
+            expected_job_id="12345",
+            expected_environment="citation",
+            expected_profile_id="citation-string-match-v1",
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "sys_base_prefix_int",
+        "sys_base_prefix_relative",
+        "sys_base_prefix_noncanonical",
+        "sys_base_prefix_venv",
+        "proc_exe_int",
+        "proc_exe_relative",
+        "proc_exe_noncanonical",
+    ),
+)
+def test_format_payload_validator_rejects_coherently_rehashed_process_paths(
+    monkeypatch, tmp_path: Path, mutation: str
 ) -> None:
-    session, expected, _documents, run_helper = _format_finalizer_fixture(
-        monkeypatch, tmp_path
+    session, expected, _documents, run_helper = _format_finalizer_fixture(monkeypatch, tmp_path)
+    terminal, _digest = session.finalize_format_verification_calls(expected, run_helper=run_helper)
+    payloads = dict(_format_payload_roster(tmp_path))
+    resource_name = "strict_gym_child_runtime/resource.json"
+    resource = json.loads(payloads[resource_name])
+    if mutation == "sys_base_prefix_int":
+        resource["process"]["sys_base_prefix"] = 1
+    elif mutation == "sys_base_prefix_relative":
+        resource["process"]["sys_base_prefix"] = "usr/local"
+    elif mutation == "sys_base_prefix_noncanonical":
+        resource["process"]["sys_base_prefix"] = "/usr/local/../local"
+    elif mutation == "sys_base_prefix_venv":
+        resource["process"]["sys_base_prefix"] = resource["process"]["sys_prefix"]
+    elif mutation == "proc_exe_int":
+        resource["process"]["proc_exe"] = 1
+    elif mutation == "proc_exe_relative":
+        resource["process"]["proc_exe"] = "usr/local/bin/python3.13"
+    else:
+        resource["process"]["proc_exe"] = "/usr/local/../local/bin/python3.13"
+    payloads[resource_name] = runtime.canonical_ascii_json(resource)
+    resource_digest = runtime._sha256_bytes(payloads[resource_name])
+
+    index_name = "strict_gym_child_runtime/index.json"
+    index = json.loads(payloads[index_name])
+    index["children"][0]["receipt"]["sha256"] = resource_digest
+    payloads[index_name] = runtime.canonical_ascii_json(index)
+    index_digest = runtime._sha256_bytes(payloads[index_name])
+
+    terminal["resource_receipt"]["sha256"] = resource_digest
+    terminal["child_index"]["sha256"] = index_digest
+    terminal_name = "strict_gym_child_runtime/format-verification-call-index.json"
+    payloads[terminal_name] = runtime.canonical_ascii_json(terminal)
+    terminal_digest = runtime._sha256_bytes(payloads[terminal_name])
+    poisoned_roster = tuple((name, payloads[name]) for name, _payload in _format_payload_roster(tmp_path))
+
+    with pytest.raises(ValueError, match="resource process paths|resource receipt"):
+        runtime.validate_finalized_format_verification_call_index_payloads(
+            poisoned_roster,
+            expected_sha256=terminal_digest,
+            expected_receipt_root=tmp_path,
+            expected_bootstrap_root=session.bootstrap_root,
+            expected_bootstrap_sha256=session.bootstrap_sha256,
+            expected_pair_id="strict-pair-1",
+            expected_job_id="12345",
+            expected_environment="citation",
+            expected_profile_id="citation-string-match-v1",
+        )
+
+
+def test_format_path_loader_delegates_owned_payload_roster(monkeypatch, tmp_path: Path) -> None:
+    session, expected, _documents, run_helper = _format_finalizer_fixture(monkeypatch, tmp_path)
+    terminal, digest = session.finalize_format_verification_calls(expected, run_helper=run_helper)
+    validator = runtime.validate_finalized_format_verification_call_index_payloads
+    observed: list[tuple[tuple[tuple[str, bytes], ...], dict[str, Any]]] = []
+
+    def spy(payload_roster, **kwargs):
+        observed.append((payload_roster, kwargs))
+        return validator(payload_roster, **kwargs)
+
+    monkeypatch.setattr(
+        runtime,
+        "validate_finalized_format_verification_call_index_payloads",
+        spy,
     )
+
+    admitted = runtime.load_finalized_format_verification_call_index(
+        tmp_path / "format-verification-call-index.json",
+        expected_sha256=digest,
+        expected_receipt_root=tmp_path,
+        expected_pair_id="strict-pair-1",
+        expected_job_id="12345",
+        expected_environment="citation",
+        expected_profile_id="citation-string-match-v1",
+    )
+
+    assert admitted == (terminal, digest)
+    assert len(observed) == 1
+    payload_roster, arguments = observed[0]
+    assert payload_roster == _format_payload_roster(tmp_path)
+    assert arguments["expected_bootstrap_root"] == session.bootstrap_root
+    assert arguments["expected_bootstrap_sha256"] == session.bootstrap_sha256
+
+
+def test_format_finalizer_rejects_negative_zero_expected_call(monkeypatch, tmp_path: Path) -> None:
+    session, expected, _documents, run_helper = _format_finalizer_fixture(monkeypatch, tmp_path)
     expected[0]["float_result"] = -0.0
 
     with pytest.raises(ValueError, match="expected format verification call 1"):
         session.finalize_format_verification_calls(expected, run_helper=run_helper)
 
 
-def test_format_offline_loader_rejects_coherently_rehashed_negative_zero(
-    monkeypatch, tmp_path: Path
-) -> None:
-    session, expected, _documents, run_helper = _format_finalizer_fixture(
-        monkeypatch, tmp_path
-    )
-    terminal, _digest = session.finalize_format_verification_calls(
-        expected, run_helper=run_helper
-    )
+def test_format_offline_loader_rejects_coherently_rehashed_negative_zero(monkeypatch, tmp_path: Path) -> None:
+    session, expected, _documents, run_helper = _format_finalizer_fixture(monkeypatch, tmp_path)
+    terminal, _digest = session.finalize_format_verification_calls(expected, run_helper=run_helper)
 
     def replace_document(filename: str, document: dict[str, Any]) -> str:
         path = tmp_path / filename
@@ -1866,12 +1942,8 @@ def test_format_offline_loader_rejects_coherently_rehashed_negative_zero(
     "poison",
     ["positional", "custom", "request_subclass", "dict_subclass", "list_subclass"],
 )
-def test_format_hook_rejects_nonexact_request_boundary(
-    monkeypatch, tmp_path: Path, poison: str
-) -> None:
-    endpoint, request_type, payload, _published = _format_hook_fixture(
-        monkeypatch, tmp_path
-    )
+def test_format_hook_rejects_nonexact_request_boundary(monkeypatch, tmp_path: Path, poison: str) -> None:
+    endpoint, request_type, payload, _published = _format_hook_fixture(monkeypatch, tmp_path)
 
     if poison == "positional":
         invoke = lambda: endpoint(request_type(payload))
@@ -1907,9 +1979,7 @@ def test_format_hook_rejects_nonexact_request_boundary(
         asyncio.run(invoke())
 
 
-def test_reasoning_score_instrumentation_records_success(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_reasoning_score_instrumentation_records_success(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     published: list[tuple[str, dict[str, Any]]] = []
 
@@ -1922,9 +1992,7 @@ def test_reasoning_score_instrumentation_records_success(
         "_publish",
         publish,
     )
-    reasoning_gym = SimpleNamespace(
-        get_score_answer_fn=lambda task_name: lambda *, answer, entry: 1.0
-    )
+    reasoning_gym = SimpleNamespace(get_score_answer_fn=lambda task_name: lambda *, answer, entry: 1.0)
     spec = {
         "environment": "reasoning_gym",
         "pair_id": "pair-1",
@@ -1953,9 +2021,7 @@ def test_reasoning_score_instrumentation_records_success(
     }
 
 
-def test_reasoning_score_instrumentation_records_exception(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_reasoning_score_instrumentation_records_exception(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     published: list[dict[str, Any]] = []
 
@@ -1989,9 +2055,7 @@ def test_reasoning_score_instrumentation_records_exception(
         frozen_normalize_fn=_test_reasoning_normalize,
     )
     with pytest.raises(LookupError, match="hidden"):
-        reasoning_gym.get_score_answer_fn("knights_knaves")(
-            answer="sage", entry={"answer": "sage", "question": "q"}
-        )
+        reasoning_gym.get_score_answer_fn("knights_knaves")(answer="sage", entry={"answer": "sage", "question": "q"})
 
     assert published[0]["outcome"] == {
         "kind": "exception",
@@ -2044,9 +2108,7 @@ def test_reasoning_score_instrumentation_rejects_inputs_hidden_by_pinned_scorer(
     }
 
 
-def test_reasoning_score_instrumentation_rejects_swallowed_internal_failure(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_reasoning_score_instrumentation_rejects_swallowed_internal_failure(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     published: list[dict[str, Any]] = []
 
@@ -2071,9 +2133,7 @@ def test_reasoning_score_instrumentation_rejects_swallowed_internal_failure(
     )
 
     with pytest.raises(ValueError, match="authenticated normalization"):
-        reasoning_gym.get_score_answer_fn("knights_knaves")(
-            answer="sage", entry={"answer": "sage", "question": "q"}
-        )
+        reasoning_gym.get_score_answer_fn("knights_knaves")(answer="sage", entry={"answer": "sage", "question": "q"})
 
     assert published[0]["outcome"] == {
         "kind": "exception",
@@ -2082,9 +2142,7 @@ def test_reasoning_score_instrumentation_rejects_swallowed_internal_failure(
     }
 
 
-def test_reasoning_score_instrumentation_admits_valid_zero_without_exception(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_reasoning_score_instrumentation_admits_valid_zero_without_exception(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     published: list[dict[str, Any]] = []
 
@@ -2123,9 +2181,7 @@ def test_reasoning_score_instrumentation_admits_valid_zero_without_exception(
     assert published[0]["outcome"] == {"kind": "returned", "float_result": 0.0}
 
 
-def test_reasoning_score_instrumentation_rejects_caught_exception_at_valid_zero(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_reasoning_score_instrumentation_rejects_caught_exception_at_valid_zero(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     published: list[dict[str, Any]] = []
     normalization_calls = 0
@@ -2190,9 +2246,7 @@ def test_reasoning_normalizer_staticmethod_identity_is_plain_function() -> None:
     assert getattr(instance.normalize, "__func__", None) is None
 
 
-def test_reasoning_score_instrumentation_rejects_receiver_normalizer_rebind(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_reasoning_score_instrumentation_rejects_receiver_normalizer_rebind(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
 
     class Dataset:
@@ -2201,10 +2255,7 @@ def test_reasoning_score_instrumentation_rejects_receiver_normalizer_rebind(
             return {(answer, "role")}
 
         def score_answer(self, *, answer, entry):
-            return float(
-                self._normalize_answer(answer)
-                == self._normalize_answer(entry["answer"])
-            )
+            return float(self._normalize_answer(answer) == self._normalize_answer(entry["answer"]))
 
     monkeypatch.setitem(
         bootstrap._publish.__globals__,
@@ -2230,9 +2281,7 @@ def test_reasoning_score_instrumentation_rejects_receiver_normalizer_rebind(
     dataset._normalize_answer = lambda answer: {(answer, "hostile")}
 
     with pytest.raises(RuntimeError, match="semantics changed"):
-        reasoning_gym.get_score_answer_fn("knights_knaves")(
-            answer="sage", entry={"answer": "sage"}
-        )
+        reasoning_gym.get_score_answer_fn("knights_knaves")(answer="sage", entry={"answer": "sage"})
 
 
 def test_reasoning_score_instrumentation_freezes_callable_and_closes_exact_k4(
@@ -2339,14 +2388,10 @@ def test_reasoning_score_instrumentation_serializes_blocked_fifth_behind_close(
         frozen_normalize_fn=_test_reasoning_normalize,
     )
     for index in range(3):
-        reasoning_gym.get_score_answer_fn("knights_knaves")(
-            answer=str(index), entry={"answer": str(index)}
-        )
+        reasoning_gym.get_score_answer_fn("knights_knaves")(answer=str(index), entry={"answer": str(index)})
 
     fourth = threading.Thread(
-        target=lambda: reasoning_gym.get_score_answer_fn("knights_knaves")(
-            answer="fourth", entry={"answer": "fourth"}
-        )
+        target=lambda: reasoning_gym.get_score_answer_fn("knights_knaves")(answer="fourth", entry={"answer": "fourth"})
     )
 
     def fifth_call() -> None:
@@ -2371,9 +2416,7 @@ def test_reasoning_score_instrumentation_serializes_blocked_fifth_behind_close(
     assert not any(name.endswith("00000005.json") for name in published)
 
 
-def test_reasoning_score_instrumentation_hashes_precall_deep_copy(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_reasoning_score_instrumentation_hashes_precall_deep_copy(monkeypatch, tmp_path: Path) -> None:
     bootstrap = _bootstrap_module(monkeypatch)
     published: list[dict[str, Any]] = []
 
@@ -2404,9 +2447,7 @@ def test_reasoning_score_instrumentation_hashes_precall_deep_copy(
     reasoning_gym.get_score_answer_fn("knights_knaves")(answer="sage", entry=entry)
 
     assert entry == {"answer": "mutated"}
-    assert published[0]["input"]["entry_sha256"] == runtime._sha256_bytes(
-        b'{"answer":"original"}'
-    )
+    assert published[0]["input"]["entry_sha256"] == runtime._sha256_bytes(b'{"answer":"original"}')
 
 
 @pytest.mark.parametrize("bad_result", [1, True, -0.0, float("inf")])
@@ -2437,9 +2478,7 @@ def test_reasoning_score_instrumentation_rejects_nonexact_float_result(
     )
 
     with pytest.raises(ValueError, match="not an admitted exact float"):
-        reasoning_gym.get_score_answer_fn("knights_knaves")(
-            answer="sage", entry={"answer": "sage"}
-        )
+        reasoning_gym.get_score_answer_fn("knights_knaves")(answer="sage", entry={"answer": "sage"})
 
 
 def test_reasoning_score_expectation_binds_exact_input() -> None:
@@ -2465,9 +2504,7 @@ def test_reasoning_score_expectation_binds_exact_input() -> None:
         )
 
 
-def test_scorer_only_k4_finalizer_publishes_terminal_index(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_scorer_only_k4_finalizer_publishes_terminal_index(monkeypatch, tmp_path: Path) -> None:
     session, expected, _, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
 
     terminal, digest = session.finalize_score_calls(expected, run_helper=run_helper)
@@ -2480,9 +2517,7 @@ def test_scorer_only_k4_finalizer_publishes_terminal_index(
     assert terminal["quiescence"]["child_termination_signal"] == "SIGINT"
     assert run_helper._processes == {}
     assert len(digest) == 64
-    assert (
-        tmp_path / "reasoning-score-call-index.json"
-    ).stat().st_mode & 0o777 == 0o400
+    assert (tmp_path / "reasoning-score-call-index.json").stat().st_mode & 0o777 == 0o400
     reloaded, reloaded_digest = runtime.load_finalized_reasoning_score_call_index(
         tmp_path / "reasoning-score-call-index.json",
         expected_sha256=digest,
@@ -2494,9 +2529,7 @@ def test_scorer_only_k4_finalizer_publishes_terminal_index(
     assert reloaded_digest == digest
 
 
-def test_finalized_score_loader_requires_external_digest_and_exact_inventory(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_finalized_score_loader_requires_external_digest_and_exact_inventory(monkeypatch, tmp_path: Path) -> None:
     session, expected, _, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
     _, digest = session.finalize_score_calls(expected, run_helper=run_helper)
     terminal_path = tmp_path / "reasoning-score-call-index.json"
@@ -2521,9 +2554,7 @@ def test_finalized_score_loader_requires_external_digest_and_exact_inventory(
         )
 
 
-def test_finalized_score_loader_binds_current_sealed_bootstrap(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_finalized_score_loader_binds_current_sealed_bootstrap(monkeypatch, tmp_path: Path) -> None:
     session, expected, _, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
     _, digest = session.finalize_score_calls(expected, run_helper=run_helper)
     monkeypatch.setattr(
@@ -2585,14 +2616,10 @@ def test_finalized_score_loader_rejects_coherently_rehashed_type_and_path_aliase
         elif mutation == "sys_base_prefix_int":
             resource["process"]["sys_base_prefix"] = 1
         else:
-            resource["scorer"]["resolved_origin"] = resource["scorer"][
-                "resolver_resolved_origin"
-            ]
+            resource["scorer"]["resolved_origin"] = resource["scorer"]["resolver_resolved_origin"]
         resource_payload = replace_file("resource.json", resource)
         index = load("index.json")
-        index["children"][0]["receipt"]["sha256"] = runtime._sha256_bytes(
-            resource_payload
-        )
+        index["children"][0]["receipt"]["sha256"] = runtime._sha256_bytes(resource_payload)
         index_payload = replace_file("index.json", index)
         terminal["resource_receipt"]["sha256"] = runtime._sha256_bytes(resource_payload)
         terminal["child_index"]["sha256"] = runtime._sha256_bytes(index_payload)
@@ -2608,12 +2635,8 @@ def test_finalized_score_loader_rejects_coherently_rehashed_type_and_path_aliase
         )
 
 
-def test_scorer_only_k4_finalizer_rejects_caught_exception(
-    monkeypatch, tmp_path: Path
-) -> None:
-    session, expected, documents, run_helper = _score_finalizer_fixture(
-        monkeypatch, tmp_path
-    )
+def test_scorer_only_k4_finalizer_rejects_caught_exception(monkeypatch, tmp_path: Path) -> None:
+    session, expected, documents, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
     first_path = tmp_path / "reasoning-score-call-00000001.json"
     first_path.chmod(0o600)
     documents[0]["outcome"] = {
@@ -2623,9 +2646,7 @@ def test_scorer_only_k4_finalizer_rejects_caught_exception(
     }
     _write_immutable(first_path, documents[0])
 
-    with pytest.raises(
-        ValueError, match="reasoning score outcome has the wrong keyset"
-    ):
+    with pytest.raises(ValueError, match="reasoning score outcome has the wrong keyset"):
         session.finalize_score_calls(expected, run_helper=run_helper)
 
 
@@ -2668,9 +2689,7 @@ def test_scorer_only_k4_finalizer_rejects_nonexact_receipt_types(
     value: Any,
     match: str,
 ) -> None:
-    session, expected, documents, run_helper = _score_finalizer_fixture(
-        monkeypatch, tmp_path
-    )
+    session, expected, documents, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
     call_path = tmp_path / f"reasoning-score-call-{sequence:08d}.json"
     call_path.chmod(0o600)
     documents[sequence - 1][section][field] = value
@@ -2686,9 +2705,7 @@ def test_scorer_only_k4_finalizer_rejects_nonexact_call_inventory(
     tmp_path: Path,
     mutation: str,
 ) -> None:
-    session, expected, documents, run_helper = _score_finalizer_fixture(
-        monkeypatch, tmp_path
-    )
+    session, expected, documents, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
     if mutation == "extra":
         extra = json.loads(json.dumps(documents[-1]))
         extra["sequence"] = 5
@@ -2718,9 +2735,7 @@ def test_scorer_only_k4_finalizer_rejects_stale_resource_process(
 
         monkeypatch.setattr(runtime, "_process_stat", missing)
     else:
-        monkeypatch.setattr(
-            runtime, "_listening_socket_inodes", lambda pid, host, port: []
-        )
+        monkeypatch.setattr(runtime, "_listening_socket_inodes", lambda pid, host, port: [])
 
     expected_exception = ProcessLookupError if failure == "dead" else RuntimeError
     with pytest.raises(expected_exception):
@@ -2740,15 +2755,11 @@ def test_score_finalizer_rejects_wrong_scope_or_environment(
     session, expected, _, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
     session = replace(session, **{field: value})
 
-    with pytest.raises(
-        RuntimeError, match="only valid for scorer-only reasoning replay"
-    ):
+    with pytest.raises(RuntimeError, match="only valid for scorer-only reasoning replay"):
         session.finalize_score_calls(expected, run_helper=run_helper)
 
 
-def test_scorer_only_k4_finalizer_rejects_second_finalization(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_scorer_only_k4_finalizer_rejects_second_finalization(monkeypatch, tmp_path: Path) -> None:
     session, expected, _, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
     session.finalize_score_calls(expected, run_helper=run_helper)
 
@@ -2756,9 +2767,7 @@ def test_scorer_only_k4_finalizer_rejects_second_finalization(
         session.finalize_score_calls(expected, run_helper=run_helper)
 
 
-def test_scorer_only_k4_finalizer_closes_child_receipt_reference(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_scorer_only_k4_finalizer_closes_child_receipt_reference(monkeypatch, tmp_path: Path) -> None:
     session, expected, _, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
     index_path = tmp_path / "index.json"
     child_index, _ = runtime._load_canonical_document(index_path)
@@ -2767,9 +2776,7 @@ def test_scorer_only_k4_finalizer_closes_child_receipt_reference(
     resource["job_id"] = "54321"
     resource_path.chmod(0o600)
     replacement_payload = _write_immutable(resource_path, resource)
-    child_index["children"][0]["receipt"]["sha256"] = runtime._sha256_bytes(
-        replacement_payload
-    )
+    child_index["children"][0]["receipt"]["sha256"] = runtime._sha256_bytes(replacement_payload)
     index_path.chmod(0o600)
     _write_immutable(index_path, child_index)
 

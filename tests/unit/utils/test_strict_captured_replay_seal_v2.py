@@ -5,12 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
+from collections import Counter
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
+import nemo_rl.utils.strict_captured_replay_seal_v2 as seal_module
 from nemo_rl.utils.strict_captured_replay_profiles import (
     FORMAT_RESULT_FILE_SCHEMAS,
     FORMAT_RESULT_FILES,
@@ -27,6 +30,7 @@ from nemo_rl.utils.strict_captured_replay_seal_v2 import (
     consume_verified_sealed_result,
     consume_verified_sealed_result_v2,
     publish_sealed_result_v2,
+    snapshot_verified_sealed_result_v2,
     verify_sealed_result_v2,
 )
 
@@ -42,9 +46,7 @@ def _profile_payload(
     *,
     reaped: bool = True,
 ) -> bytes:
-    schema = dict(zip(profile.result_files, profile.result_file_schemas, strict=True))[
-        relative
-    ]
+    schema = dict(zip(profile.result_files, profile.result_file_schemas, strict=True))[relative]
     if relative == profile.scorer_terminal_index_path:
         document = {
             "environment": profile.environment,
@@ -123,10 +125,7 @@ def _restore_modes(tmp_path: Path):
 def test_profile_registry_is_closed_frozen_and_exact() -> None:
     assert type(STRICT_CAPTURED_REPLAY_PROFILES) is tuple
     assert (
-        tuple(
-            (profile.environment, profile.profile_id)
-            for profile in STRICT_CAPTURED_REPLAY_PROFILES
-        )
+        tuple((profile.environment, profile.profile_id) for profile in STRICT_CAPTURED_REPLAY_PROFILES)
         == _PROFILE_PAIRS
     )
     assert len(FORMAT_RESULT_FILES) == 13
@@ -144,18 +143,9 @@ def test_profile_registry_is_closed_frozen_and_exact() -> None:
     assert citation.disabled_config_path_name == "citation_format_simple_agent"
     assert citation.verifier_type == "string_match"
     assert citation.method == "_verify_string_match"
-    assert (
-        citation.resource_app_sha256
-        == "6e0a4bd8eae96b073598f12b68805772644a0c60e5a5ef61f09ad12ea8761f36"
-    )
-    assert (
-        citation.resource_config_sha256
-        == "da549a29c31219d8eeb14ea23f888c05479578c61619f684387efd97fadb0796"
-    )
-    assert (
-        citation.requirements_sha256
-        == "18e0d5e99020599c4d033912b39d4569276b1b9278db73469ea9708742cfaa7d"
-    )
+    assert citation.resource_app_sha256 == "6e0a4bd8eae96b073598f12b68805772644a0c60e5a5ef61f09ad12ea8761f36"
+    assert citation.resource_config_sha256 == "da549a29c31219d8eeb14ea23f888c05479578c61619f684387efd97fadb0796"
+    assert citation.requirements_sha256 == "18e0d5e99020599c4d033912b39d4569276b1b9278db73469ea9708742cfaa7d"
     with pytest.raises(FrozenInstanceError):
         citation.profile_id = "changed"  # type: ignore[misc]
     with pytest.raises(ValueError, match="unsupported"):
@@ -203,12 +193,346 @@ def test_publish_verify_consume_v2_uses_exact_profile_order(
     assert inventory["schema"] == RESULT_INVENTORY_V2_SCHEMA
     assert inventory["environment"] == environment
     assert inventory["profile_id"] == profile_id
-    assert [record["path"] for record in inventory["files"]] == list(
-        profile.result_files
-    )
+    assert [record["path"] for record in inventory["files"]] == list(profile.result_files)
     assert not (root / RESULT_INVENTORY_FILENAME).exists()
     assert stat.S_IMODE(os.lstat(root).st_mode) == 0o555
     assert stat.S_IMODE(os.lstat(root / "strict_gym_child_runtime").st_mode) == 0o555
+
+
+@pytest.mark.parametrize(("environment", "profile_id"), _PROFILE_PAIRS)
+def test_snapshot_v2_returns_fresh_retained_bytes_without_filesystem_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment: str,
+    profile_id: str,
+) -> None:
+    root, profile, anchors = _profile_tree(
+        tmp_path,
+        environment=environment,
+        profile_id=profile_id,
+    )
+    _, digest = publish_sealed_result_v2(
+        result_root=str(root),
+        anchored_sha256=anchors,
+        expected_environment=environment,
+        expected_profile_id=profile_id,
+    )
+    capability = verify_sealed_result_v2(
+        result_root=str(root),
+        expected_inventory_sha256=digest,
+        expected_environment=environment,
+        expected_profile_id=profile_id,
+    )
+    expected_inventory_raw = (root / RESULT_INVENTORY_V2_FILENAME).read_bytes()
+    retained_inventory_raw = object.__getattribute__(
+        capability,
+        "_VerifiedSealedResultV2__inventory_raw",
+    )
+    retained_members = object.__getattribute__(
+        capability,
+        "_VerifiedSealedResultV2__files",
+    )
+
+    def forbidden_filesystem_io(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("retained-byte snapshot must not reopen the filesystem")
+
+    monkeypatch.setattr(seal_module, "_open_absolute_directory", forbidden_filesystem_io)
+    monkeypatch.setattr(seal_module, "_read_relative_file", forbidden_filesystem_io)
+    monkeypatch.setattr(seal_module, "_read_nested_sealed", forbidden_filesystem_io)
+
+    snapshots = [snapshot_verified_sealed_result_v2(capability) for _ in range(2)]
+    first, second = snapshots
+    assert type(first) is dict
+    assert set(first) == {
+        "environment",
+        "profile_id",
+        "result_root",
+        "inventory",
+        "members",
+    }
+    assert first["environment"] == environment
+    assert first["profile_id"] == profile_id
+    assert first["result_root"] == str(root)
+    assert type(first["inventory"]) is dict
+    assert first["inventory"] == {
+        "path": f"{root}/{RESULT_INVENTORY_V2_FILENAME}",
+        "schema": RESULT_INVENTORY_V2_SCHEMA,
+        "sha256": digest,
+        "raw": expected_inventory_raw,
+    }
+    assert type(first["inventory"]["raw"]) is bytes
+    assert first["inventory"]["raw"] is not retained_inventory_raw
+    assert hashlib.sha256(first["inventory"]["raw"]).hexdigest() == digest
+    assert type(first["members"]) is tuple
+    assert [relative for relative, _ in first["members"]] == list(profile.result_files)
+    assert all(
+        type(item) is tuple and len(item) == 2 and type(item[0]) is str and type(item[1]) is bytes
+        for item in first["members"]
+    )
+    assert all(
+        returned[1] == retained[1] and returned[1] is not retained[1]
+        for returned, retained in zip(first["members"], retained_members, strict=True)
+    )
+    assert first is not second
+    assert first["inventory"] is not second["inventory"]
+    assert first["inventory"]["raw"] is not second["inventory"]["raw"]
+    assert first["members"] is not second["members"]
+    assert all(left[1] is not right[1] for left, right in zip(first["members"], second["members"], strict=True))
+
+    first["inventory"]["path"] = "/changed"
+    first["members"] = ()
+    assert second["inventory"]["path"] == f"{root}/{RESULT_INVENTORY_V2_FILENAME}"
+    assert len(second["members"]) == 13
+    with pytest.raises(StrictCapturedReplaySealError, match="exact V2 verifier-minted"):
+        snapshot_verified_sealed_result_v2(object())
+
+
+def test_v2_verifier_stable_reads_inventory_and_every_member_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, profile, anchors = _profile_tree(
+        tmp_path,
+        environment="citation",
+        profile_id="citation-string-match-v1",
+    )
+    _, digest = publish_sealed_result_v2(
+        result_root=str(root),
+        anchored_sha256=anchors,
+        expected_environment=profile.environment,
+        expected_profile_id=profile.profile_id,
+    )
+    calls: Counter[str] = Counter()
+    original = seal_module._read_regular_at
+
+    def counted_read(*args, relative: str, **kwargs):
+        calls[relative] += 1
+        return original(*args, relative=relative, **kwargs)
+
+    monkeypatch.setattr(seal_module, "_read_regular_at", counted_read)
+    verify_sealed_result_v2(
+        result_root=str(root),
+        expected_inventory_sha256=digest,
+        expected_environment=profile.environment,
+        expected_profile_id=profile.profile_id,
+    )
+
+    assert calls == Counter(
+        {
+            RESULT_INVENTORY_V2_FILENAME: 2,
+            **{relative: 2 for relative in profile.result_files},
+        }
+    )
+
+
+def test_v2_verifier_rejects_member_mutated_after_its_first_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, profile, anchors = _profile_tree(
+        tmp_path,
+        environment="citation",
+        profile_id="citation-string-match-v1",
+    )
+    _, digest = publish_sealed_result_v2(
+        result_root=str(root),
+        anchored_sha256=anchors,
+        expected_environment=profile.environment,
+        expected_profile_id=profile.profile_id,
+    )
+    target_relative = profile.result_files[0]
+    target = root / target_relative
+    replacement = json.loads(target.read_bytes())
+    replacement["race_mutation"] = True
+    replacement_raw = json.dumps(
+        replacement,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    original = seal_module._read_regular_at
+    target_reads = 0
+
+    def mutate_after_first_read(*args, relative: str, **kwargs):
+        nonlocal target_reads
+        raw, metadata = original(*args, relative=relative, **kwargs)
+        if relative == target_relative:
+            target_reads += 1
+            if target_reads == 1:
+                target.chmod(0o600)
+                target.write_bytes(replacement_raw)
+                target.chmod(0o400)
+        return raw, metadata
+
+    monkeypatch.setattr(seal_module, "_read_regular_at", mutate_after_first_read)
+    with pytest.raises(
+        StrictCapturedReplaySealError,
+        match="changed between verification reads",
+    ):
+        verify_sealed_result_v2(
+            result_root=str(root),
+            expected_inventory_sha256=digest,
+            expected_environment=profile.environment,
+            expected_profile_id=profile.profile_id,
+        )
+    assert target_reads == 2
+
+
+def test_v2_verifier_rejects_inventory_mutated_after_its_second_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, profile, anchors = _profile_tree(
+        tmp_path,
+        environment="citation",
+        profile_id="citation-string-match-v1",
+    )
+    _, digest = publish_sealed_result_v2(
+        result_root=str(root),
+        anchored_sha256=anchors,
+        expected_environment=profile.environment,
+        expected_profile_id=profile.profile_id,
+    )
+    inventory_path = root / RESULT_INVENTORY_V2_FILENAME
+    replacement = json.loads(inventory_path.read_bytes())
+    replacement["race_mutation"] = True
+    replacement_raw = json.dumps(
+        replacement,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    target_relative = profile.result_files[0]
+    original = seal_module._read_pinned_profile_member_v2
+    target_reads = 0
+
+    def mutate_after_inventory_second_read(root_fd, child_fd, relative):
+        nonlocal target_reads
+        raw, metadata = original(root_fd, child_fd, relative)
+        if relative == target_relative:
+            target_reads += 1
+            if target_reads == 2:
+                inventory_path.chmod(0o600)
+                inventory_path.write_bytes(replacement_raw)
+                inventory_path.chmod(0o400)
+        return raw, metadata
+
+    monkeypatch.setattr(
+        seal_module,
+        "_read_pinned_profile_member_v2",
+        mutate_after_inventory_second_read,
+    )
+    with pytest.raises(
+        StrictCapturedReplaySealError,
+        match="inventory changed after its second stable read",
+    ):
+        verify_sealed_result_v2(
+            result_root=str(root),
+            expected_inventory_sha256=digest,
+            expected_environment=profile.environment,
+            expected_profile_id=profile.profile_id,
+        )
+    assert target_reads == 2
+
+
+def test_v2_verifier_rejects_byte_identical_child_name_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, profile, anchors = _profile_tree(
+        tmp_path,
+        environment="citation",
+        profile_id="citation-string-match-v1",
+    )
+    _, digest = publish_sealed_result_v2(
+        result_root=str(root),
+        anchored_sha256=anchors,
+        expected_environment=profile.environment,
+        expected_profile_id=profile.profile_id,
+    )
+    child = root / "strict_gym_child_runtime"
+    replacement = tmp_path / "replacement-child"
+    displaced = tmp_path / "displaced-child"
+    shutil.copytree(child, replacement)
+    original = seal_module._read_regular_at
+    inventory_reads = 0
+
+    def swap_after_inventory_read(*args, relative: str, **kwargs):
+        nonlocal inventory_reads
+        raw, metadata = original(*args, relative=relative, **kwargs)
+        if relative == RESULT_INVENTORY_V2_FILENAME:
+            inventory_reads += 1
+            if inventory_reads == 1:
+                root.chmod(0o755)
+                in_root_displaced = root / "displaced-child"
+                child.rename(in_root_displaced)
+                replacement.chmod(0o755)
+                replacement.rename(child)
+                child.chmod(0o555)
+                in_root_displaced.chmod(0o755)
+                in_root_displaced.rename(displaced)
+                displaced.chmod(0o555)
+                root.chmod(0o555)
+        return raw, metadata
+
+    monkeypatch.setattr(seal_module, "_read_regular_at", swap_after_inventory_read)
+    with pytest.raises(
+        StrictCapturedReplaySealError,
+        match="strict Gym result directory changed canonical name",
+    ):
+        verify_sealed_result_v2(
+            result_root=str(root),
+            expected_inventory_sha256=digest,
+            expected_environment=profile.environment,
+            expected_profile_id=profile.profile_id,
+        )
+    assert inventory_reads == 2
+
+
+def test_v2_verifier_rejects_byte_identical_canonical_root_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, profile, anchors = _profile_tree(
+        tmp_path,
+        environment="citation",
+        profile_id="citation-string-match-v1",
+    )
+    _, digest = publish_sealed_result_v2(
+        result_root=str(root),
+        anchored_sha256=anchors,
+        expected_environment=profile.environment,
+        expected_profile_id=profile.profile_id,
+    )
+    replacement = tmp_path / "replacement-root"
+    displaced = tmp_path / "displaced-root"
+    shutil.copytree(root, replacement)
+    replacement.chmod(0o755)
+    original = seal_module._read_regular_at
+    inventory_reads = 0
+
+    def swap_after_inventory_read(*args, relative: str, **kwargs):
+        nonlocal inventory_reads
+        raw, metadata = original(*args, relative=relative, **kwargs)
+        if relative == RESULT_INVENTORY_V2_FILENAME:
+            inventory_reads += 1
+            if inventory_reads == 1:
+                root.rename(displaced)
+                replacement.rename(root)
+                root.chmod(0o555)
+        return raw, metadata
+
+    monkeypatch.setattr(seal_module, "_read_regular_at", swap_after_inventory_read)
+    with pytest.raises(
+        StrictCapturedReplaySealError,
+        match="result root changed canonical path",
+    ):
+        verify_sealed_result_v2(
+            result_root=str(root),
+            expected_inventory_sha256=digest,
+            expected_environment=profile.environment,
+            expected_profile_id=profile.profile_id,
+        )
+    assert inventory_reads == 2
 
 
 def test_v2_never_autodetects_or_accepts_a_different_profile(tmp_path: Path) -> None:
