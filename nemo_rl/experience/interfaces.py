@@ -24,6 +24,16 @@ from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 NEMO_GYM_RESERVED_KEY_PREFIX = "_ng_"
 NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+NEMO_GYM_REQUEST_SEEDS_METADATA_KEY = "_ng_request_seeds"
+NEMO_GYM_TRANSCRIPT_BUNDLE_SHA256_METADATA_KEY = "_ng_strict_transcript_bundle_sha256"
+NEMO_GYM_REWARD_PENALTY_FLAGS_KEY = "_ng_reward_penalty_flags"
+NEMO_GYM_STRICT_TRANSCRIPT_KEY = "_ng_strict_transcript"
+NEMO_GYM_REWARD_PENALTY_FLAG_KEYS = (
+    "reasoning_equal_to_final_answer",
+    "empty_final_answer",
+    "unwanted_token",
+    "malformed_think_tag",
+)
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 
 # Slim DataPlane columns used to preserve message-level Gym detector semantics
@@ -57,6 +67,12 @@ class Completion:
     # existing fields to preserve positional construction compatibility.
     raw_environment_reward: Optional[float] = None
     pre_penalty_reward: Optional[float] = None
+    # Exact per-result reward-zeroing decisions. This remains out of env_extras:
+    # it is NeMo-RL's interpretation of configured penalties, not Gym output.
+    reward_penalty_flags: Optional[dict[str, bool]] = None
+    # Raw strict JSON transport objects captured inside the Gym actor before its
+    # normal postprocessor mutates the response. Present only in strict submits.
+    strict_transcript: Optional[dict[str, Any]] = None
 
 
 def completion_reward_boundaries(completion: Completion) -> tuple[float, float, float]:

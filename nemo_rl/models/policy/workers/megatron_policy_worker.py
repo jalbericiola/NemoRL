@@ -1608,6 +1608,7 @@ class MegatronPolicyWorkerImpl(
             "model_dtype": self.dtype,
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
+            "update_successful": bool(update_successful),
             "train_elapsed_seconds": metrics_train_elapsed,  # pragma: no cover
         }
         # Read "config" via getattr-by-string so the token stays out of
@@ -2347,6 +2348,10 @@ class MegatronPolicyWorkerImpl(
             "model_dtype": self.dtype,
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
+            # A returned step is not necessarily an applied update: Megatron's
+            # optimizer reports false on overflow. Preserve the model-parallel
+            # consensus so strict evidence cannot be published for a skipped step.
+            "update_successful": bool(update_successful),
         }
 
         # MoE aux-loss metrics: same convention as sync train() — scale

@@ -75,6 +75,10 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Fail-closed strict single-environment evidence mode. ``capture`` records
+    # the exact four step-one HTTP request/response bodies; ``replay`` is used
+    # only by the separately authenticated captured-cohort calibration.
+    strict_model_transport: NotRequired[Literal["disabled", "capture", "replay"]]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
     # Invalidate weight-dependent multimodal encoder outputs after a successful

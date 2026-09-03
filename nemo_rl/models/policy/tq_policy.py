@@ -192,10 +192,15 @@ def _aggregate_train_results(
     replicas = results if replicated_results is None else replicated_results
     if not replicas:
         raise ValueError("cannot validate an empty list of replicated results")
-
+    update_successful = [result.get("update_successful") for result in results]
+    if any(type(value) is not bool for value in update_successful):
+        raise RuntimeError(
+            "finish_train_step workers did not return exact update_successful booleans"
+        )
     out: dict[str, Any] = {
         "loss": results[0]["global_loss"],
         "grad_norm": results[0]["grad_norm"],
+        "update_successful": all(update_successful),
     }
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
