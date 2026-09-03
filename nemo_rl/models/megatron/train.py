@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed.nn.functional
+from megatron.core.transformer.module import Float16Module
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -129,6 +130,25 @@ def suspend_activation_offload_for_forward_only(
                 model_config.fine_grained_activation_offloading = original_value
 
 
+
+def _wraps_float16_module(model: object) -> bool:
+    """Whether a ``Float16Module`` sits anywhere in ``model``'s wrapper chain.
+
+    Megatron hands the forward function the outermost wrapper (typically
+    ``DistributedDataParallel``), whose ``forward`` forwards keyword arguments
+    to ``Float16Module``; that class accepts ``fp32_output`` and swallows it.
+    """
+    module = model
+    for _ in range(8):
+        if isinstance(module, Float16Module):
+            return True
+        inner = getattr(module, "module", None)
+        if inner is None or inner is module:
+            return False
+        module = inner
+    return False
+
+
 def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
@@ -221,10 +241,17 @@ def model_forward(
         additional_kwargs["media_token_validity_mask"] = media_token_validity_mask
 
     # GPTModel accepts ``fp32_output`` to suppress its optional logits cast.
-    # Raw MCore HybridModel does not expose that keyword and already returns
-    # output-layer dtype, which is the representation required by the bounded
-    # shared-prefix log-probability gather below.
-    if defer_fp32_logits and not shared_prefix_train_mode:
+    # Raw MCore HybridModel does not expose that keyword, but the trainer is
+    # wrapped (DDP -> Float16Module -> model) and ``Float16Module.forward``
+    # consumes ``fp32_output`` itself without forwarding it; when the flag is
+    # left at its default the wrapper upcasts the whole [1, T/CP, V/TP] output
+    # to fp32. In shared-prefix train mode pass the flag whenever that wrapper
+    # is present so the star path receives output-layer-dtype logits exactly
+    # like the dense path (the bounded log-probability gather below casts its
+    # own chunks to fp32); an unwrapped HybridModel would reject the keyword.
+    if defer_fp32_logits and (
+        not shared_prefix_train_mode or _wraps_float16_module(model)
+    ):
         additional_kwargs["fp32_output"] = False
     if use_fused_linear_logprobs:
         additional_kwargs["labels"] = input_ids_cp_sharded
