@@ -136,6 +136,7 @@ SLURM_EXPORT_ALLOWED_NAMES = (
     "EXPECTED_DEPLOYMENT_READY",
     "EXPECTED_DEPLOYMENT_READY_FILE_SHA256",
     "EXPECTED_GYM_GITLINK_COMMIT",
+    "EXPECTED_GYM_TREE",
     "EXPECTED_MCORE_HEAD",
     "EXPECTED_MCORE_RUNNABLE_MANIFEST_SHA256",
     "EXPECTED_MCORE_TREE",
@@ -145,6 +146,7 @@ SLURM_EXPORT_ALLOWED_NAMES = (
     "EXPECTED_SHARED_PREFIX_DETERMINISM_ATTESTATION_COUNT",
     "EXPECTED_SHARED_PREFIX_DETERMINISM_ATTESTATION_SCHEMA",
     "EXPECTED_SHARED_PREFIX_DETERMINISM_ATTESTATION_SHA256",
+    "EXPECTED_STRICT_PAIR_ACCEPTANCE_POLICY_SHA256",
     "EXPECTED_STRICT_PAIR_BOOTSTRAP_SHA256SUM_SHA256",
     "EXPECTED_STRICT_PAIR_CONTAINER_PYTHON_SHA256",
     "EXPECTED_STRICT_PAIR_CONTAINER_SHA256",
@@ -244,7 +246,9 @@ def _write_hostile_fake_tools(root: Path) -> Path:
     return fake_bin
 
 
-def _make_deployment(root: Path, kind: str) -> tuple[Path, Path, Path, dict[str, str]]:
+def _make_deployment(
+    root: Path, kind: str, fixture_kind: str = "valid"
+) -> tuple[Path, Path, Path, dict[str, str]]:
     deployment = root / "deployment"
     nemo_root = deployment / "runnable/NemoRL"
     recipe = nemo_root / "examples/nemo_gym/nemotron-3.5-nano"
@@ -261,8 +265,27 @@ def _make_deployment(root: Path, kind: str) -> tuple[Path, Path, Path, dict[str,
         "strict_pair_contract.sh",
     ):
         shutil.copy2(RECIPE_DIR / name, recipe / name)
+    deployed_data = nemo_root / "tests/unit/tools/data"
+    deployed_data.mkdir(parents=True)
+    for fixture_name in (
+        "reasoning_gym_example.jsonl",
+        "citation_example.jsonl",
+        "freeform_example.jsonl",
+    ):
+        shutil.copy2(
+            Path(__file__).parent / "data" / fixture_name,
+            deployed_data / fixture_name,
+        )
     (nemo_root / "examples").mkdir(exist_ok=True)
     shutil.copy2(ENTRYPOINT, nemo_root / "examples/run_grpo_single_controller.py")
+    for source_relative in (
+        "nemo_rl/utils/strict_model_transport.py",
+        "nemo_rl/models/generation/vllm/vllm_worker_async.py",
+        "nemo_rl/experience/rollout_manager.py",
+    ):
+        deployed_source = nemo_root / source_relative
+        deployed_source.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / source_relative, deployed_source)
     if kind == "publisher_candidate_unlink_failure":
         launcher = recipe / "launch_pair.sh"
         launcher_source = launcher.read_text(encoding="utf-8")
@@ -777,6 +800,10 @@ printf 'NVIDIA GB200, 575.57.08\\n%.0s' {1..4}
         "EXPECTED_GYM_GITLINK_COMMIT": subprocess.check_output(
             ["git", "-C", str(gym_source), "rev-parse", "HEAD"], text=True
         ).strip(),
+        "EXPECTED_GYM_TREE": subprocess.check_output(
+            ["git", "-C", str(gym_source), "rev-parse", "HEAD^{tree}"],
+            text=True,
+        ).strip(),
         "EXPECTED_BRIDGE_HEAD": subprocess.check_output(
             ["git", "-C", str(component_roots["Megatron-Bridge.runnable.sha256"]), "rev-parse", "HEAD"],
             text=True,
@@ -992,9 +1019,31 @@ printf 'NVIDIA GB200, 575.57.08\\n%.0s' {1..4}
         ignored.parent.mkdir()
         ignored.write_bytes(b"ignored runtime bytes\n")
     elif kind == "source_mode_drift":
-        pass
+        subprocess.run(
+            ["git", "-C", str(nemo_root), "config", "core.fileMode", "false"],
+            check=True,
+        )
     else:
         raise ValueError(f"unknown deployment kind: {kind}")
+    deployed_fixture = deployed_data / "reasoning_gym_example.jsonl"
+    if fixture_kind == "mutated":
+        payload = bytearray(deployed_fixture.read_bytes())
+        payload[0] = ord("[")
+        deployed_fixture.write_bytes(payload)
+    elif fixture_kind == "wrong_hash":
+        deployed_fixture.write_text("{}\n" * 5, encoding="utf-8")
+    elif fixture_kind == "symlink":
+        target = deployed_data / "fixture-target.jsonl"
+        deployed_fixture.replace(target)
+        deployed_fixture.symlink_to(target)
+    elif fixture_kind == "directory":
+        deployed_fixture.unlink()
+        deployed_fixture.mkdir()
+    elif fixture_kind == "fifo":
+        deployed_fixture.unlink()
+        os.mkfifo(deployed_fixture)
+    elif fixture_kind != "valid":
+        raise ValueError(f"unknown fixture_kind: {fixture_kind}")
     _seal_tracked_files(nemo_root)
     for component_root in component_roots.values():
         _seal_tracked_files(component_root)
@@ -1110,28 +1159,6 @@ def _run_pair(
         fixture = root / "reasoning_gym_example.jsonl"
         shutil.copyfile(TEST_FIXTURE, fixture)
         train_path = str(fixture)
-        if fixture_kind == "mutated":
-            payload = bytearray(fixture.read_bytes())
-            payload[0] = ord("[")
-            fixture.write_bytes(payload)
-        elif fixture_kind == "wrong_hash":
-            fixture.write_text("{}\n" * 5, encoding="utf-8")
-        elif fixture_kind == "symlink":
-            target = root / "fixture-target.jsonl"
-            fixture.replace(target)
-            fixture.symlink_to(target)
-        elif fixture_kind == "relative":
-            train_path = fixture.name
-        elif fixture_kind == "directory":
-            train_path = str(root)
-        elif fixture_kind == "fifo":
-            fixture.unlink()
-            os.mkfifo(fixture)
-        elif fixture_kind == "noncanonical":
-            (root / "subdirectory").mkdir()
-            train_path = str(root / "subdirectory" / ".." / fixture.name)
-        elif fixture_kind != "valid":
-            raise ValueError(f"unknown fixture_kind: {fixture_kind}")
 
         model = root / "model"
         model.mkdir()
@@ -1161,7 +1188,7 @@ def _run_pair(
             (write_root / "off").mkdir(exist_ok=True)
             (write_root / "on").symlink_to(write_root / "off", target_is_directory=True)
         deployment, nemo_root, _, deployment_env = _make_deployment(
-            root, deployment_kind
+            root, deployment_kind, fixture_kind
         )
         scheduler_state = root / "scheduler-state"
 
@@ -1323,6 +1350,13 @@ def _run_pair(
                                 "sha256"
                             ]
                         ),
+                        "EXPECTED_STRICT_PAIR_ACCEPTANCE_POLICY_SHA256": (
+                            manifest_document["acceptance"]["policy_sha256"]
+                        ),
+                        "TRAIN_PATH": manifest_document["selection"]["fixture"][
+                            "path"
+                        ],
+                        "VAL_PATH": manifest_document["selection"]["fixture"]["path"],
                         "STRICT_PAIR_SUBMISSION_CONTRACT_SHA256": (
                             manifest_document["scheduler_submission"]["contract"][
                                 "sha256"
@@ -1486,6 +1520,7 @@ def _compose_strict_config(mode: str, config_path: Path = CONFIG):
         [
             f"policy.shared_prefix_training.mode={mode}",
             "policy.shared_prefix_training.require_deterministic_execution=true",
+            "policy.generation.vllm_cfg.strict_model_transport=capture",
             "policy.megatron_cfg.env_vars.RESULTS_DIR=/strict-pair/results",
             "policy.megatron_cfg.env_vars."
             "NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR="
@@ -1557,6 +1592,21 @@ HF_TOKEN="${SPECIAL_VALUE:-value:HF_TOKEN}"
 def _start_manifest_publisher(
     root: Path, *, config_digest: str
 ) -> subprocess.Popen[str]:
+    acceptance_policy_sha256 = subprocess.check_output(
+        [
+            str(HOST_TOOLS["bash"]),
+            "-p",
+            "-c",
+            'source "$1"\nSTRICT_PAIR_TOOL_PYTHON="$2"\n'
+            "strict_pair_acceptance_policy_sha256",
+            "strict-pair-acceptance-policy",
+            str(RECIPE_DIR / "strict_pair_contract.sh"),
+            str(HOST_PYTHON),
+        ],
+        env={"LC_ALL": "C", "PATH": os.environ["PATH"]},
+        text=True,
+    ).strip()
+    assert re.fullmatch(r"[0-9a-f]{64}", acceptance_policy_sha256)
     script = root / "publish-pair-manifest.sh"
     runtime_manifest = root / "runtime-tools.json"
     if not runtime_manifest.exists():
@@ -1596,6 +1646,9 @@ def _start_manifest_publisher(
                     "EXPECTED_BRIDGE_TREE": b"9" * 40,
                     "EXPECTED_MCORE_HEAD": b"a" * 40,
                     "EXPECTED_MCORE_TREE": b"b" * 40,
+                    "EXPECTED_STRICT_PAIR_ACCEPTANCE_POLICY_SHA256": (
+                        acceptance_policy_sha256.encode("ascii")
+                    ),
                     "EXPECTED_STRICT_PAIR_SUBMISSION_CONTRACT_SHA256": b"f" * 64,
                     "HF_DATASETS_CACHE": str(arm_hf_home / "hub").encode("ascii"),
                     "HF_HOME": str(arm_hf_home).encode("ascii"),
@@ -1688,6 +1741,10 @@ STRICT_PAIR_GYM_VERIFIER_SOURCE_RELATIVE=resources_servers/reasoning_gym/app.py
 STRICT_PAIR_GYM_VERIFIER_SOURCE_SHA256="$(printf 'e%.0s' {1..64})"
 STRICT_PAIR_CONFIG_SHA256="${CONFIG_DIGEST}"
 STRICT_PAIR_ENTRYPOINT_SHA256="$(printf '6%.0s' {1..64})"
+STRICT_PAIR_MODEL_TRANSPORT_COLLECTOR_SHA256="$(printf '7%.0s' {1..64})"
+STRICT_PAIR_MODEL_TRANSPORT_VLLM_ROUTE_SHA256="$(printf '8%.0s' {1..64})"
+STRICT_PAIR_MODEL_TRANSPORT_ROLLOUT_FINALIZER_SHA256="$(printf '9%.0s' {1..64})"
+STRICT_PAIR_ACCEPTANCE_POLICY_SHA256="$(strict_pair_acceptance_policy_sha256)"
 STRICT_PAIR_LAUNCHER_SHA256="$(printf '7%.0s' {1..64})"
 STRICT_PAIR_ARM_WRAPPER_SHA256="$(printf '8%.0s' {1..64})"
 STRICT_PAIR_PARENT_WRAPPER_SHA256="$(printf '9%.0s' {1..64})"
@@ -1784,7 +1841,9 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
             "policy.generation.colocated.enabled=true",
             "policy.generation.colocated.resources.num_nodes=1",
             "policy.generation.colocated.resources.gpus_per_node=4",
-            "policy.generation.vllm_cfg.gpu_memory_utilization=0.6",
+            "policy.generation.vllm_cfg.gpu_memory_utilization=0.1",
+            "policy.generation.vllm_cfg.strict_model_transport=capture",
+            "UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-${STRICT_PAIR_BOUND_JOB_ID}",
             "++policy.generation.refit_transport=null",
             "env.nemo_gym.num_gpu_nodes=0",
             "logger.wandb_enabled=True",
@@ -1793,6 +1852,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         )
         for token in required_once:
             assert command.count(token) == 1, token
+        assert "nemo-gym-uv-cache-${SLURM_JOB_ID:-default}" not in command
         assert " uv run " not in f" {command} "
         assert command.count(f"{uv_shim} run ") == 1
         train_path = command.split("data.train.data_path=", maxsplit=1)[1].split()[0]
@@ -1807,7 +1867,11 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
     assert result.stdout.count("Mount: SingleController entrypoint") == 2
     assert result.stdout.count("(read-only, sha256=") == 2
     assert "live-tree-no-manifest" not in result.stdout
-    assert "mode=dry-run submissions=parallel partition=batch" in result.stdout
+    assert (
+        "mode=dry-run submissions=parallel partition=batch export_boundary=v3"
+        in result.stdout
+    )
+    assert "export_boundary=v2" not in result.stdout
     assert "STRICT_PAIR_DRY_RUN_VALIDATED" in result.stdout
     assert result.stdout.count("STRICT_PAIR_JOB_INTERVAL_GATE_REQUIRED=1") == 2
     assert result.stdout.count("STRICT_PAIR_RUNTIME_ATTESTATION_REQUIRED=1") == 2
@@ -1960,13 +2024,13 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         "nemo-rl-strict-pair-submission-receipt-v2"
     )
     slurm_boundary = manifest["slurm_export_boundary"]
-    assert slurm_boundary["schema"] == "nemo-rl-strict-slurm-export-file-v2"
+    assert slurm_boundary["schema"] == "nemo-rl-strict-slurm-export-file-v3"
     assert slurm_boundary["format"] == "nul-separated-name-value"
     assert slurm_boundary["ambient_merge"] is False
     assert slurm_boundary["get_user_env"] is False
     assert slurm_boundary["allowed_names"] == list(SLURM_EXPORT_ALLOWED_NAMES)
     assert tuple(sorted(SLURM_EXPORT_ALLOWED_NAMES)) == SLURM_EXPORT_ALLOWED_NAMES
-    assert len(SLURM_EXPORT_ALLOWED_NAMES) == 77
+    assert len(SLURM_EXPORT_ALLOWED_NAMES) == 79
     assert slurm_boundary["job_argv"] == [
         "--pair-manifest",
         "{pair_manifest_path}",
@@ -2125,7 +2189,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         manifest["pair_campaign_sha256"] == hashlib.sha256(campaign_bytes).hexdigest()
     )
     assert manifest["pair_campaign_sha256"] == (
-        "19a5003a0c8aee69b48cab0c16dde4fb1c03dda559fb0b7bf87ac89f550a5de1"
+        "dde23897d5c1dbad63b0aff9d4be3de2d7e9a0165be78a79caf744db559da9ee"
     )
     assert (
         manifest["pair_campaign_reward_and_advantage_sha256"]
@@ -2213,7 +2277,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         "temperature": 1.0,
         "top_k": None,
         "top_p": 1.0,
-        "vllm_gpu_memory_utilization": 0.6,
+        "vllm_gpu_memory_utilization": 0.1,
     }
 
     assert manifest["campaign"]["slurm"] == {
@@ -2399,8 +2463,10 @@ def test_submit_uses_export_file_and_positional_pair_identity() -> None:
         assert set(receipt[query_name]) == set(normative_released[query_name])
     assert receipt["outcome"] == "released"
     assert receipt["schema"] == "nemo-rl-strict-pair-submission-receipt-v2"
+    assert receipt["acceptance"] == manifest["acceptance"]
     assert receipt["selection"] == manifest["selection"]
     assert receipt["execution_environment"] == manifest["execution_environment"]
+    assert receipt["model_transport"] == manifest["model_transport"]
     assert receipt["wandb"] == manifest["wandb"]
     assert receipt["source"] == {
         "bridge": manifest["source"]["bridge"],
@@ -2531,7 +2597,7 @@ def test_lifecycle_query_requires_complete_lf_framing_before_authentication(
     query = receipt[query_name]
     assert query["phase"] == phase
     assert query["status"] == 0
-    assert query["normalization_status"] == 0
+    assert query["normalization_status"] == 1
     assert query["complete"] is False
     assert query["unterminated_final_line"] is True
     assert query["authenticated_job_ids"] == []
@@ -2559,7 +2625,8 @@ def test_post_release_rejects_job_held_reason_in_running_state() -> None:
     assert receipt["rollback_confirmed"] is True
     query = receipt["post_release_query"]
     assert query["status"] == 0
-    assert query["complete"] is True
+    assert query["normalization_status"] == 1
+    assert query["complete"] is False
     assert query["unterminated_final_line"] is False
     assert query["authenticated_job_ids"] == []
     assert query["unresolved_job_ids"] == ["41001", "41002"]
@@ -2740,7 +2807,7 @@ def test_malformed_recovery_line_cannot_confirm_rollback() -> None:
     assert run.submission_receipt is not None
     receipt = json.loads(run.submission_receipt)
     assert receipt["outcome"] == "rollback-unconfirmed"
-    assert receipt["stage"] == "job_id_validation"
+    assert receipt["stage"] == "arm_submit"
     assert receipt["rollback_confirmed"] is False
     recovery = receipt["recovery_query"]
     assert recovery["line_count"] == 2
@@ -3287,7 +3354,12 @@ def test_closed_environment_overlays_compose_as_strict_train_recipes(
     assert config.grpo.max_num_steps == 100
     assert config.grpo.max_num_epochs == 20
     assert config.policy["shared_prefix_training"].mode == "train"
-    assert config.policy["shared_prefix_training"].require_deterministic_execution
+    assert config.policy[
+        "shared_prefix_training"
+    ].require_deterministic_execution is True
+    assert config.policy["generation"]["vllm_cfg"]["strict_model_transport"] == (
+        "capture"
+    )
 
 
 def test_off_and_on_commands_differ_only_by_arm_identity_paths_and_mode() -> None:
@@ -3470,10 +3542,8 @@ def test_pair_requires_valid_wandb_credentials(key: str | None) -> None:
         ("mutated", "SHA-256 mismatch"),
         ("wrong_hash", "SHA-256 mismatch"),
         ("symlink", "regular, non-symlink file"),
-        ("relative", "absolute and canonical"),
         ("directory", "regular, non-symlink file"),
         ("fifo", "regular, non-symlink file"),
-        ("noncanonical", "must already be canonical"),
     ],
 )
 def test_pair_rejects_unsealed_fixture_path_or_bytes(

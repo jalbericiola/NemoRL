@@ -686,12 +686,15 @@ STRICT_PAIR_SLURM_EXPORT_ALLOWED_NAMES=(
   EXPECTED_SHARED_PREFIX_DETERMINISM_ATTESTATION_SCHEMA
   EXPECTED_SHARED_PREFIX_DETERMINISM_ATTESTATION_SHA256
   EXPECTED_STRICT_PAIR_ACCEPTANCE_POLICY_SHA256
+  EXPECTED_STRICT_PAIR_BOOTSTRAP_SHA256SUM_SHA256
   EXPECTED_STRICT_PAIR_CONTAINER_PYTHON_SHA256
   EXPECTED_STRICT_PAIR_CONTAINER_SHA256
   EXPECTED_STRICT_PAIR_CONTAINER_UV_SHA256
   EXPECTED_STRICT_PAIR_FIXTURE_SHA256
+  EXPECTED_STRICT_PAIR_HOST_PYTHON_SHA256
   EXPECTED_STRICT_PAIR_JOB_WRAPPER_SHA256
   EXPECTED_STRICT_PAIR_MODEL_TREE_SHA256
+  EXPECTED_STRICT_PAIR_RUNTIME_TOOL_MANIFEST_SHA256
   EXPECTED_STRICT_PAIR_SANDBOX_CONTAINER_SHA256
   EXPECTED_STRICT_PAIR_SUBMISSION_CONTRACT_SHA256
   EXPECTED_STRICT_PAIR_UV_SHIM_SHA256
@@ -721,8 +724,10 @@ STRICT_PAIR_SLURM_EXPORT_ALLOWED_NAMES=(
   STRICT_PAIR_CONTAINER_PYTHON
   STRICT_PAIR_CONTAINER_UV
   STRICT_PAIR_ENVIRONMENT
+  STRICT_PAIR_HOST_PYTHON
   STRICT_PAIR_JOB_WRAPPER
   STRICT_PAIR_LAUNCH_MODE
+  STRICT_PAIR_RUNTIME_TOOL_MANIFEST
   STRICT_PAIR_SHARED_PREFIX_MODE
   STRICT_PAIR_UV_SHIM
   STRICT_PREBUILT_SNAPSHOT_DIR
@@ -2573,9 +2578,7 @@ def state(arm, job_id, job_state, reason):
 
 
 def recovery_state(arm, candidate_job_id, job_state, reason):
-    record = state(arm, candidate_job_id, job_state, reason)
-    record["candidate_job_id"] = record.pop("job_id")
-    return record
+    return state(arm, candidate_job_id, job_state, reason)
 
 
 def query(phase, job_ids_csv, records, *, on_job_id=None):
@@ -3941,7 +3944,7 @@ manifest = {
             "--arm",
             "{arm}",
         ],
-        "schema": "nemo-rl-strict-slurm-export-file-v2",
+        "schema": "nemo-rl-strict-slurm-export-file-v3",
     },
     "runtime_attestation": {
         "expected_count_per_fresh_process_group": 4,

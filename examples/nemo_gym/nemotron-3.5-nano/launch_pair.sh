@@ -375,6 +375,7 @@ run_arm_phase() {
     EXPECTED_STRICT_PAIR_JOB_WRAPPER_SHA256="${EXPECTED_STRICT_PAIR_JOB_WRAPPER_SHA256}" \
     EXPECTED_NEMO_HEAD="${EXPECTED_NEMO_HEAD}" \
     EXPECTED_GYM_GITLINK_COMMIT="${EXPECTED_GYM_GITLINK_COMMIT}" \
+    EXPECTED_GYM_TREE="${EXPECTED_GYM_TREE}" \
     EXPECTED_BRIDGE_HEAD="${EXPECTED_BRIDGE_HEAD}" \
     EXPECTED_BRIDGE_TREE="${EXPECTED_BRIDGE_TREE}" \
     EXPECTED_MCORE_HEAD="${EXPECTED_MCORE_HEAD}" \
@@ -387,6 +388,7 @@ run_arm_phase() {
     EXPECTED_STRICT_PAIR_MODEL_TREE_SHA256="${STRICT_PAIR_MODEL_TREE_SHA256}" \
     EXPECTED_STRICT_PAIR_CONTAINER_SHA256="${STRICT_PAIR_CONTAINER_SHA256}" \
     EXPECTED_STRICT_PAIR_SANDBOX_CONTAINER_SHA256="${STRICT_PAIR_SANDBOX_CONTAINER_SHA256}" \
+    EXPECTED_STRICT_PAIR_ACCEPTANCE_POLICY_SHA256="${STRICT_PAIR_ACCEPTANCE_POLICY_SHA256}" \
     STRICT_PAIR_RUNTIME_TOOL_MANIFEST="${STRICT_PAIR_RUNTIME_TOOL_MANIFEST}" \
     EXPECTED_STRICT_PAIR_RUNTIME_TOOL_MANIFEST_SHA256="${EXPECTED_STRICT_PAIR_RUNTIME_TOOL_MANIFEST_SHA256}" \
     STRICT_PAIR_HOST_PYTHON="${STRICT_PAIR_HOST_PYTHON}" \
@@ -437,7 +439,7 @@ STRICT_PAIR_ON_SLURM_EXPORT_SHA256="$(
 
 strict_pair_publish_manifest
 echo "STRICT_PAIR_MANIFEST_SHA256=${STRICT_PAIR_MANIFEST_SHA256} path=${STRICT_PAIR_MANIFEST_PATH}"
-echo "STRICT_PAIR_PLAN pair_id=${PAIR_ID} environment=${STRICT_PAIR_ENVIRONMENT} config=${STRICT_PAIR_CONFIG_RELATIVE} arms=off:observe,on:train mode=${STRICT_PAIR_LAUNCH_MODE} submissions=parallel partition=batch export_boundary=v2"
+echo "STRICT_PAIR_PLAN pair_id=${PAIR_ID} environment=${STRICT_PAIR_ENVIRONMENT} config=${STRICT_PAIR_CONFIG_RELATIVE} arms=off:observe,on:train mode=${STRICT_PAIR_LAUNCH_MODE} submissions=parallel partition=batch export_boundary=v3"
 
 prepare_strict_pair_accepted_id_records() {
   local state_root="${RESULTS_DIR}/strict_pair_submission_state"
@@ -2342,7 +2344,14 @@ for resource_name, expected_path in expected_selection_paths[
         raise SystemExit(f"Pair manifest selected Gym {resource_name} is invalid")
 artifacts = pair_manifest_document.get("artifacts")
 source = pair_manifest_document.get("source")
-if not isinstance(artifacts, dict) or not isinstance(source, dict):
+acceptance = pair_manifest_document.get("acceptance")
+model_transport = pair_manifest_document.get("model_transport")
+if (
+    not isinstance(artifacts, dict)
+    or not isinstance(source, dict)
+    or not isinstance(acceptance, dict)
+    or not isinstance(model_transport, dict)
+):
     raise SystemExit("Pair manifest selection provenance parents are malformed")
 gym_source = source.get("gym")
 if not isinstance(gym_source, dict):
@@ -3025,10 +3034,12 @@ if outcome == "rollback-unconfirmed" and rollback_evidence_confirmed:
     raise SystemExit("rollback-unconfirmed outcome contradicts scheduler evidence")
 
 document = {
+    "acceptance": acceptance,
     "authenticated_jobs": authenticated_jobs,
     "cancellations": cancellations,
     "execution_environment": execution_environment,
     "held_submissions": held_submissions,
+    "model_transport": model_transport,
     "outcome": outcome,
     "pair": {
         "id": pair_id,
@@ -3541,10 +3552,14 @@ if (
     raise SystemExit("committed Pair selection provenance is inconsistent")
 if document.get("selection") != selection:
     raise SystemExit("committed submission receipt selection binding mismatch")
+if document.get("acceptance") != pair_manifest_document.get("acceptance"):
+    raise SystemExit("committed submission receipt acceptance-policy binding mismatch")
 if document.get("execution_environment") != pair_manifest_document.get(
     "execution_environment"
 ):
     raise SystemExit("committed submission receipt execution binding mismatch")
+if document.get("model_transport") != pair_manifest_document.get("model_transport"):
+    raise SystemExit("committed submission receipt model-transport binding mismatch")
 if document.get("wandb") != pair_manifest_document.get("wandb"):
     raise SystemExit("committed submission receipt W&B binding mismatch")
 if document.get("source") != {
