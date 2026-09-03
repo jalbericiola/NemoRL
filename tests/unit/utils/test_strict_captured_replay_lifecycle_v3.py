@@ -483,7 +483,8 @@ def _publish_real_terminal_outputs(
         return {(answer, "role")} if answer else set()
 
     def frozen_score(*, answer: str, entry: dict[str, Any]) -> float:
-        del answer, entry
+        if answer and normalize_reasoning_answer(answer) == normalize_reasoning_answer(entry["answer"]):
+            return 1.0
         return 0.0
 
     reasoning_gym = SimpleNamespace(get_score_answer_fn=lambda task_name: frozen_score)
@@ -506,10 +507,7 @@ def _publish_real_terminal_outputs(
         source_entry = authenticated_source.transcript_bundle["entries"][rollout_index]
         assert generation_seed == source_entry["generation_seed"]
         assert derived_verifier_request == source_entry["derived_verifier_request"]
-        response = copy.deepcopy(source_entry["verifier_response"])
-        response["score"] = 0.0
-        response["reward"] = 0.0
-        return response
+        return copy.deepcopy(source_entry["verifier_response"])
 
     def independent_score_check(
         rollout_index: int,

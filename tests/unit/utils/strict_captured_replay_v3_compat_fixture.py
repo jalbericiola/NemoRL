@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,6 +46,9 @@ from nemo_rl.utils.strict_captured_replay_manifest import (
     REPLAY_EXECUTION_MANIFEST_SCHEMA,
     AuthenticatedOffSourceCapture,
 )
+from nemo_rl.utils.strict_model_transport_replay import (
+    validate_strict_model_transport_replay_consumption,
+)
 from nemo_rl.utils.strict_captured_replay_seal import (
     RESULT_ANCHOR_ALLOWLIST,
     RESULT_FILE_ALLOWLIST,
@@ -63,6 +67,11 @@ __all__ = [
 ]
 
 _ORIGINAL_LIFECYCLE_BOOTSTRAP_MODULE = lifecycle._bootstrap_module
+_ORIGINAL_LIFECYCLE_EXECUTE_CAPTURED_REPLAY_COHORT = lifecycle.execute_captured_replay_cohort
+_ORIGINAL_PATH_RESOLVE = Path.resolve
+
+_SCORER_SYS_BASE_PREFIX = "/root/.local/share/uv/python/cpython-3.13.14-linux-aarch64-gnu"
+_SCORER_RESOLVED_PACKAGE_ROOT = "/root/.cache/uv/archive-v0/vjPtRmNH2jG9KTGj/reasoning_gym"
 
 
 @dataclass(frozen=True)
@@ -205,6 +214,366 @@ def _result_roster(result_root: Path) -> tuple[tuple[str, bytes], ...]:
     if type(quiescence.get("wrapper_returncode")) is not int:
         raise AssertionError("reasoning scorer call index lacks an exact wrapper return code")
     return roster
+
+
+def _replace_immutable_json(path: Path, document: dict[str, Any]) -> tuple[bytes, str]:
+    """Replace one fixture-owned canonical document and restore mode 0400."""
+
+    if not path.is_file() or path.is_symlink():
+        raise AssertionError(f"scorer fixture member is not one regular file: {path}")
+    payload = child_runtime.canonical_ascii_json(document)
+    path.chmod(0o600)
+    path.write_bytes(payload)
+    path.chmod(0o400)
+    return payload, hashlib.sha256(payload).hexdigest()
+
+
+def _container_scorer_identity(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], str, str]:
+    """Derive the scorer spec identity from one authenticated replay contract."""
+
+    scorer_contract = manifest["replay_contract"]["gym_scorer"]
+    source = scorer_contract["source"]
+    source_root = scorer_contract["source_root"]
+    launcher = scorer_contract["launcher"]
+    resources = scorer_contract["resources"]
+    runtime = scorer_contract["runtime"]
+    gym_root = source_root["container_path"]
+    if gym_root != "/opt/nemo-rl/3rdparty/Gym-workspace/Gym":
+        raise AssertionError("compat fixture scorer container root differs")
+    venv_root = "/opt/gym_venvs"
+    venv = f"{venv_root}/resources_servers/reasoning_gym/.venv"
+    component = f"{gym_root}/resources_servers/reasoning_gym"
+    distributions = copy.deepcopy(runtime["required_common_distributions"])
+    distributions["reasoning-gym"] = runtime["scorer_pin"]["required_distribution_version"]
+    modules = copy.deepcopy(runtime["required_module_versions"])
+    modules["reasoning_gym"] = runtime["scorer_pin"]["module_internal_version_literal"]
+    scorer = copy.deepcopy(child_runtime._RESOURCE_TARGETS["reasoning_gym"]["scorer"])
+    target = {
+        "role": "resource",
+        "server_type": "resources_servers",
+        "server_name": "reasoning_gym",
+        "component_relative": "resources_servers/reasoning_gym",
+        "component_dir": component,
+        "entrypoint": "app.py",
+        "source_relative": "resources_servers/reasoning_gym/app.py",
+        "source_path": f"{component}/app.py",
+        "source_sha256": runtime["selected_resource_app"]["sha256"],
+        "config_path": "reasoning_gym",
+        "resource_config_path": None,
+        "config_relative": ("resources_servers/reasoning_gym/configs/resources_only.yaml"),
+        "config_path_source": f"{component}/configs/resources_only.yaml",
+        "config_sha256": launcher["resource_only_config"]["sha256"],
+        "requirements_relative": "resources_servers/reasoning_gym/requirements.txt",
+        "requirements_path": f"{component}/requirements.txt",
+        "requirements_sha256": resources["requirements"]["sha256"],
+        "venv": venv,
+        "interpreter": f"{venv}/bin/python",
+        "receipt_filename": "resource.json",
+        "distribution_versions": distributions,
+        "module_versions": modules,
+        "scorer": scorer,
+    }
+    gym = {
+        "git_commit": source["gitlink_commit"],
+        "tree": source["tree"],
+        "root": gym_root,
+        "venv_root": venv_root,
+        "sources": {
+            "nemo_gym/__init__.py": child_runtime._GYM_SOURCE_PINS["nemo_gym/__init__.py"],
+            "nemo_gym/global_config.py": launcher["allocator"]["sha256"],
+            "nemo_gym/cli/setup_command.py": launcher["setup"]["sha256"],
+            "nemo_gym/cli/env.py": launcher["generator"]["sha256"],
+        },
+    }
+    bootstrap_program = manifest["replay_contract"]["program"]["gym_child_bootstrap"]
+    bootstrap_relative = Path(bootstrap_program["path"])
+    if (
+        bootstrap_relative.is_absolute()
+        or bootstrap_relative.name != "sitecustomize.py"
+        or ".." in bootstrap_relative.parts
+    ):
+        raise AssertionError("compat fixture scorer bootstrap path differs")
+    bootstrap_root = str(Path("/opt/nemo-rl") / bootstrap_relative.parent)
+    return gym, target, bootstrap_root, bootstrap_program["sha256"]
+
+
+def _normalize_finalized_scorer_graph(
+    *,
+    manifest: dict[str, Any],
+    authenticated_job_id: str,
+    receipt_root: Path,
+) -> tuple[dict[str, Any], str, dict[str, Any], str]:
+    """Project a locally exercised scorer graph into its admitted container view."""
+
+    old_terminal = json.loads((receipt_root / "reasoning-score-call-index.json").read_text(encoding="ascii"))
+    old_resource = json.loads((receipt_root / "resource.json").read_text(encoding="ascii"))
+    old_child_index = json.loads((receipt_root / "index.json").read_text(encoding="ascii"))
+    if old_terminal.get("call_count") != 4 or len(old_terminal.get("calls", [])) != 4:
+        raise AssertionError("local scorer finalizer did not close exact K=4")
+
+    gym, target, bootstrap_root, bootstrap_sha256 = _container_scorer_identity(manifest)
+    spec = {
+        "schema": child_runtime.STRICT_GYM_CHILD_SPEC_SCHEMA,
+        "hash_domain": child_runtime.STRICT_GYM_CHILD_HASH_DOMAIN,
+        "environment": "reasoning_gym",
+        "scope": "scorer-only",
+        "pair_id": manifest["pair_id"],
+        "job_id": authenticated_job_id,
+        "gym": gym,
+        "results_dir": str(receipt_root.parent),
+        "receipt_root": str(receipt_root),
+        "bootstrap": {
+            "root": bootstrap_root,
+            "filename": "sitecustomize.py",
+            "sha256": bootstrap_sha256,
+        },
+        "targets": [target],
+    }
+    spec_path = receipt_root / "spec.json"
+    _, spec_sha256 = _replace_immutable_json(spec_path, spec)
+
+    old_process = old_resource["process"]
+    bootstrap_source = f"{bootstrap_root}/sitecustomize.py"
+    process = {
+        "pid": old_process["pid"],
+        "ppid": old_process["ppid"],
+        "uid": os.geteuid(),
+        "gid": os.getegid(),
+        "cwd": target["component_dir"],
+        "sys_executable": target["interpreter"],
+        "sys_prefix": target["venv"],
+        "sys_base_prefix": _SCORER_SYS_BASE_PREFIX,
+        "proc_exe": target["interpreter"],
+        "sys_argv": [bootstrap_source, target["source_path"]],
+        "proc_argv": [
+            target["interpreter"],
+            "-I",
+            "-S",
+            "-B",
+            bootstrap_source,
+            target["source_path"],
+        ],
+        "start_ticks": old_process["start_ticks"],
+        "boot_id": old_process["boot_id"],
+        "hostname": old_process["hostname"],
+    }
+    server = {
+        "config_path": target["config_path"],
+        "server_type": target["server_type"],
+        "server_name": target["server_name"],
+        "entrypoint": target["entrypoint"],
+        "host": "127.0.0.1",
+        "port": old_resource["server"]["port"],
+        "num_workers": old_resource["server"]["num_workers"],
+    }
+    target_record_keys = (
+        "role",
+        "config_path",
+        "server_type",
+        "server_name",
+        "component_dir",
+        "entrypoint",
+        "source_path",
+        "source_sha256",
+        "config_path_source",
+        "config_sha256",
+        "requirements_path",
+        "requirements_sha256",
+        "venv",
+        "interpreter",
+    )
+    purelib = f"{target['venv']}/lib/python3.13/site-packages"
+    scorer_static = copy.deepcopy(target["scorer"])
+    scorer = {
+        **scorer_static,
+        "package_root": f"{purelib}/reasoning_gym",
+        "package_resolved_root": _SCORER_RESOLVED_PACKAGE_ROOT,
+        "module_origin": (f"{purelib}/{scorer_static['module_origin_relative_to_purelib']}"),
+        "module_resolved_origin": f"{_SCORER_RESOLVED_PACKAGE_ROOT}/__init__.py",
+        "resolver_origin": (f"{purelib}/{scorer_static['resolver_origin_relative_to_purelib']}"),
+        "resolver_resolved_origin": f"{_SCORER_RESOLVED_PACKAGE_ROOT}/factory.py",
+        "origin": f"{purelib}/{scorer_static['origin_relative_to_purelib']}",
+        "resolved_origin": (f"{_SCORER_RESOLVED_PACKAGE_ROOT}/logic/knights_knaves.py"),
+    }
+    resource = {
+        "schema": child_runtime.STRICT_GYM_CHILD_RECEIPT_SCHEMA,
+        "hash_domain": child_runtime.STRICT_GYM_CHILD_HASH_DOMAIN,
+        "environment": "reasoning_gym",
+        "pair_id": manifest["pair_id"],
+        "job_id": authenticated_job_id,
+        "stage": "isolated-runner-pre-entrypoint",
+        "spec_sha256": spec_sha256,
+        "target": {name: copy.deepcopy(target[name]) for name in target_record_keys},
+        "server": server,
+        "process": process,
+        "distribution_versions": copy.deepcopy(target["distribution_versions"]),
+        "module_versions": copy.deepcopy(target["module_versions"]),
+        "scorer": scorer,
+    }
+    resource_path = receipt_root / "resource.json"
+    _, resource_sha256 = _replace_immutable_json(resource_path, resource)
+
+    observation = {
+        "pid": process["pid"],
+        "start_ticks": process["start_ticks"],
+        "wrapper_pid": process["pid"],
+        "host": server["host"],
+        "port": server["port"],
+        "listener_socket_inodes": copy.deepcopy(
+            old_child_index["children"][0]["observation"]["listener_socket_inodes"]
+        ),
+    }
+
+    def reference(path: Path, schema: str, sha256: str) -> dict[str, str]:
+        return {"path": str(path), "sha256": sha256, "schema": schema}
+
+    spec_ref = reference(spec_path, child_runtime.STRICT_GYM_CHILD_SPEC_SCHEMA, spec_sha256)
+    resource_ref = reference(
+        resource_path,
+        child_runtime.STRICT_GYM_CHILD_RECEIPT_SCHEMA,
+        resource_sha256,
+    )
+    child_index = {
+        "schema": child_runtime.STRICT_GYM_CHILD_INDEX_SCHEMA,
+        "hash_domain": child_runtime.STRICT_GYM_CHILD_HASH_DOMAIN,
+        "environment": "reasoning_gym",
+        "scope": "scorer-only",
+        "pair_id": manifest["pair_id"],
+        "job_id": authenticated_job_id,
+        "gym": gym,
+        "spec": spec_ref,
+        "children": [
+            {
+                "role": "resource",
+                "config_path": target["config_path"],
+                "receipt": resource_ref,
+                "observation": observation,
+            }
+        ],
+    }
+    child_index_path = receipt_root / "index.json"
+    _, child_index_sha256 = _replace_immutable_json(child_index_path, child_index)
+
+    process_projection = {
+        "pid": process["pid"],
+        "start_ticks": process["start_ticks"],
+    }
+    call_refs: list[dict[str, Any]] = []
+    terminal_calls: list[dict[str, Any]] = []
+    for sequence, old_record in enumerate(old_terminal["calls"], start=1):
+        call = {
+            "schema": child_runtime.STRICT_GYM_SCORE_CALL_SCHEMA,
+            "hash_domain": child_runtime.STRICT_GYM_CHILD_HASH_DOMAIN,
+            "environment": "reasoning_gym",
+            "pair_id": manifest["pair_id"],
+            "job_id": authenticated_job_id,
+            "spec_sha256": spec_sha256,
+            "process": process_projection,
+            "sequence": sequence,
+            "task_name": old_record["task_name"],
+            "input": copy.deepcopy(old_record["input"]),
+            "outcome": {
+                "kind": "returned",
+                "float_result": old_record["float_result"],
+            },
+        }
+        call_path = receipt_root / f"reasoning-score-call-{sequence:08d}.json"
+        _, call_sha256 = _replace_immutable_json(call_path, call)
+        call_ref = reference(call_path, child_runtime.STRICT_GYM_SCORE_CALL_SCHEMA, call_sha256)
+        call_refs.append({"sequence": sequence, **call_ref})
+        terminal_calls.append(
+            {
+                "sequence": sequence,
+                "task_name": old_record["task_name"],
+                "input": copy.deepcopy(old_record["input"]),
+                "float_result": old_record["float_result"],
+                "receipt": call_ref,
+            }
+        )
+    closed = {
+        "schema": child_runtime.STRICT_GYM_SCORE_CLOSED_SCHEMA,
+        "hash_domain": child_runtime.STRICT_GYM_CHILD_HASH_DOMAIN,
+        "environment": "reasoning_gym",
+        "pair_id": manifest["pair_id"],
+        "job_id": authenticated_job_id,
+        "spec_sha256": spec_sha256,
+        "process": process_projection,
+        "call_count": 4,
+        "calls": call_refs,
+    }
+    closed_path = receipt_root / "reasoning-score-closed.json"
+    _, closed_sha256 = _replace_immutable_json(closed_path, closed)
+    terminal = {
+        "schema": child_runtime.STRICT_GYM_SCORE_CALL_INDEX_SCHEMA,
+        "hash_domain": child_runtime.STRICT_GYM_CHILD_HASH_DOMAIN,
+        "environment": "reasoning_gym",
+        "scope": "scorer-only",
+        "pair_id": manifest["pair_id"],
+        "job_id": authenticated_job_id,
+        "spec": spec_ref,
+        "child_index": reference(
+            child_index_path,
+            child_runtime.STRICT_GYM_CHILD_INDEX_SCHEMA,
+            child_index_sha256,
+        ),
+        "resource_receipt": resource_ref,
+        "score_closed": reference(closed_path, child_runtime.STRICT_GYM_SCORE_CLOSED_SCHEMA, closed_sha256),
+        "quiescence": copy.deepcopy(old_terminal["quiescence"]),
+        "call_count": 4,
+        "calls": terminal_calls,
+    }
+    terminal_path = receipt_root / "reasoning-score-call-index.json"
+    _, terminal_sha256 = _replace_immutable_json(terminal_path, terminal)
+    return terminal, terminal_sha256, target, bootstrap_root
+
+
+def _activate_container_scorer_loader_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    manifest: dict[str, Any],
+    target: dict[str, Any],
+    bootstrap_root: str,
+) -> None:
+    """Narrowly project image-owned paths for the producer's offline loader."""
+
+    purelib = f"{target['venv']}/lib/python3.13/site-packages"
+    scorer = target["scorer"]
+    resolved_paths = {
+        _SCORER_SYS_BASE_PREFIX: _SCORER_SYS_BASE_PREFIX,
+        f"{purelib}/reasoning_gym": _SCORER_RESOLVED_PACKAGE_ROOT,
+        f"{purelib}/{scorer['module_origin_relative_to_purelib']}": (f"{_SCORER_RESOLVED_PACKAGE_ROOT}/__init__.py"),
+        f"{purelib}/{scorer['resolver_origin_relative_to_purelib']}": (f"{_SCORER_RESOLVED_PACKAGE_ROOT}/factory.py"),
+        f"{purelib}/{scorer['origin_relative_to_purelib']}": (
+            f"{_SCORER_RESOLVED_PACKAGE_ROOT}/logic/knights_knaves.py"
+        ),
+    }
+
+    def projected_resolve(path: Path, strict: bool = False) -> Path:
+        replacement = resolved_paths.get(str(path))
+        if replacement is not None:
+            return Path(replacement)
+        return _ORIGINAL_PATH_RESOLVE(path, strict=strict)
+
+    _, _, _, bootstrap_sha256 = _container_scorer_identity(manifest)
+    monkeypatch.setattr(Path, "resolve", projected_resolve)
+    monkeypatch.setattr(
+        child_runtime,
+        "STRICT_GYM_ROOT",
+        Path("/opt/nemo-rl/3rdparty/Gym-workspace/Gym"),
+    )
+    monkeypatch.setattr(child_runtime, "STRICT_GYM_VENV_ROOT", Path("/opt/gym_venvs"))
+    monkeypatch.setitem(
+        child_runtime._RESOURCE_TARGETS["reasoning_gym"],
+        "requirements_sha256",
+        target["requirements_sha256"],
+    )
+    monkeypatch.setattr(
+        child_runtime,
+        "_require_sealed_bootstrap_root",
+        lambda: (Path(bootstrap_root), bootstrap_sha256),
+    )
 
 
 def _external_score_finalizer_fixture(
@@ -586,6 +955,50 @@ def _build_attempt(
         lifecycle,
         "_score_finalizer_fixture",
         score_finalizer_fixture,
+    )
+
+    def execute_with_container_scorer_graph(**kwargs: Any) -> Any:
+        documents = _ORIGINAL_LIFECYCLE_EXECUTE_CAPTURED_REPLAY_COHORT(**kwargs)
+        receipt_root = Path(manifest_document["artifacts"]["outputs"]["reasoning_score_call_index"]["path"]).parent
+        terminal, terminal_sha256, target, bootstrap_root = _normalize_finalized_scorer_graph(
+            manifest=manifest_document,
+            authenticated_job_id=replay_job_id,
+            receipt_root=receipt_root,
+        )
+        _activate_container_scorer_loader_projection(
+            monkeypatch,
+            manifest=manifest_document,
+            target=target,
+            bootstrap_root=bootstrap_root,
+        )
+        admitted_terminal, admitted_sha256 = child_runtime.load_finalized_reasoning_score_call_index(
+            receipt_root / "reasoning-score-call-index.json",
+            expected_sha256=terminal_sha256,
+            expected_receipt_root=receipt_root,
+            expected_pair_id=manifest_document["pair_id"],
+            expected_job_id=replay_job_id,
+        )
+        if admitted_terminal != terminal or admitted_sha256 != terminal_sha256:
+            raise AssertionError("container-view scorer graph admission differs")
+        terminal_ref = {
+            "path": str(receipt_root / "reasoning-score-call-index.json"),
+            "schema": child_runtime.STRICT_GYM_SCORE_CALL_INDEX_SCHEMA,
+            "sha256": terminal_sha256,
+        }
+        consumption = copy.deepcopy(documents.transport_consumption)
+        consumption["replay"]["scorer_evidence"]["terminal_index"] = terminal_ref
+        validate_strict_model_transport_replay_consumption(consumption)
+        return type(documents)(
+            transcript_bundle=copy.deepcopy(documents.transcript_bundle),
+            replay_ledger=copy.deepcopy(documents.replay_ledger),
+            transport_consumption=consumption,
+            reasoning_score_call_index=terminal_ref,
+        )
+
+    monkeypatch.setattr(
+        lifecycle,
+        "execute_captured_replay_cohort",
+        execute_with_container_scorer_graph,
     )
     outputs = lifecycle._publish_real_terminal_outputs(
         manifest=manifest_document,
