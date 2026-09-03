@@ -127,6 +127,15 @@ GYM_REASONING_RESOURCE_ONLY_CONFIG = {
     "path": "resources_servers/reasoning_gym/configs/resources_only.yaml",
     "sha256": "e11a3084f050e4c24101550f63efe71ac6c10f3bc125489ba7293cd81778de68",
 }
+REASONING_GYM_SCORER_PIN = {
+    "distribution": "reasoning-gym",
+    "required_distribution_version": "0.1.25",
+    "module": "reasoning_gym.logic.knights_knaves",
+    "module_internal_version_literal": "0.1.19",
+    "module_relative_path": "reasoning_gym/logic/knights_knaves.py",
+    "module_sha256": "8837a3c6dfc72bb40db168b82ad6b3da45a08a4000a006fc306368b77b622705",
+    "score_function": "KnightsKnavesDataset.score_answer",
+}
 GYM_SNAPSHOT_RELATIVE_ROOT = "3rdparty/Gym-workspace/Gym"
 GYM_CONTAINER_ROOT = "/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 REPLAY_CONTAINER_OWNER_UID = 153493
@@ -3993,7 +4002,7 @@ def _profile_v2(
     expected_environment: str,
     expected_profile_id: str,
 ) -> StrictCapturedReplayProfile:
-    """Resolve only one exact caller-selected citation/freeform profile."""
+    """Resolve only one exact caller-selected strict replay profile."""
     from nemo_rl.utils.strict_captured_replay_profiles import (
         get_strict_captured_replay_profile,
     )
@@ -4111,6 +4120,14 @@ def _result_inventory_contract_v2(
 def _gym_scorer_launcher_v2(
     profile: StrictCapturedReplayProfile,
 ) -> dict[str, Any]:
+    directory = GYM_SCORER_DIRECTORY.get(profile.environment)
+    if type(directory) is not str:
+        raise ValueError("profiled Gym scorer environment is not admitted")
+    effective_differs_from_pair = (
+        profile.scorer_config_path_name != profile.resource_config_path_name
+        or profile.scorer_config_path != profile.resource_config_path
+        or profile.scorer_config_sha256 != profile.resource_config_sha256
+    )
     return {
         "scope": "selected-resource-scorer-only-not-full-main-run-helper-process-set",
         "mechanism": "nemo-gym-run-helper-shell-subprocess",
@@ -4135,11 +4152,18 @@ def _gym_scorer_launcher_v2(
             "selection": "python-random-randint-inclusive",
         },
         "host_policy": "loopback-127.0.0.1",
-        "working_directory": (f"{GYM_CONTAINER_ROOT}/resources_servers/format_verification"),
-        "venv_directory": ("/opt/gym_venvs/resources_servers/format_verification/.venv"),
+        "working_directory": f"{GYM_CONTAINER_ROOT}/resources_servers/{directory}",
+        "venv_directory": f"/opt/gym_venvs/resources_servers/{directory}/.venv",
         "entrypoint": "app.py",
-        "config_path_name": profile.resource_config_path_name,
-        "resource_only_config": None,
+        "config_path_name": profile.scorer_config_path_name,
+        "resource_only_config": (
+            {
+                "path": profile.scorer_config_path,
+                "sha256": profile.scorer_config_sha256,
+            }
+            if effective_differs_from_pair
+            else None
+        ),
         "resolved_evidence_requirement": (
             "authenticated-replay-pre-and-exit-command-workdir-interpreter-host-port-process"
         ),
@@ -4149,7 +4173,7 @@ def _gym_scorer_launcher_v2(
 def _gym_scorer_runtime_v2(
     profile: StrictCapturedReplayProfile,
 ) -> dict[str, Any]:
-    return {
+    runtime: dict[str, Any] = {
         "required_common_distributions": {
             "nemo-gym": "0.5.0rc0",
             "openai": "2.6.1",
@@ -4178,8 +4202,8 @@ def _gym_scorer_runtime_v2(
             "sha256": profile.resource_app_sha256,
         },
         "selected_resource_config": {
-            "path": profile.resource_config_path,
-            "sha256": profile.resource_config_sha256,
+            "path": profile.scorer_config_path,
+            "sha256": profile.scorer_config_sha256,
         },
         "selected_resource_requirements": {
             "path": profile.requirements_path,
@@ -4192,6 +4216,9 @@ def _gym_scorer_runtime_v2(
             "method": profile.method,
         },
     }
+    if profile.environment == "reasoning_gym":
+        runtime["scorer_pin"] = copy.deepcopy(REASONING_GYM_SCORER_PIN)
+    return runtime
 
 
 def _runtime_requirements_v2(
@@ -4341,7 +4368,7 @@ def build_replay_execution_manifest_v2(
     expected_environment: str,
     expected_profile_id: str,
 ) -> dict[str, Any]:
-    """Build a profile-bound citation/freeform execution manifest."""
+    """Build an execution manifest bound to one exact scorer profile."""
     profile = _profile_v2(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,

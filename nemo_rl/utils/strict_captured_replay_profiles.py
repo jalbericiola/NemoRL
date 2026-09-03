@@ -67,6 +67,50 @@ FORMAT_SCORER_TERMINAL_INDEX_PATH = (
     "strict_gym_child_runtime/format-verification-call-index.json"
 )
 
+REASONING_RESULT_DIRECTORIES = (".", "strict_gym_child_runtime")
+REASONING_RESULT_FILES = (
+    "evidence-index.json",
+    "model-transport-replay-consumption.json",
+    "replay-ledger.json",
+    "strict_gym_child_runtime/index.json",
+    "strict_gym_child_runtime/reasoning-score-call-00000001.json",
+    "strict_gym_child_runtime/reasoning-score-call-00000002.json",
+    "strict_gym_child_runtime/reasoning-score-call-00000003.json",
+    "strict_gym_child_runtime/reasoning-score-call-00000004.json",
+    "strict_gym_child_runtime/reasoning-score-call-index.json",
+    "strict_gym_child_runtime/reasoning-score-closed.json",
+    "strict_gym_child_runtime/resource.json",
+    "strict_gym_child_runtime/spec.json",
+    "transcript-bundle.json",
+)
+REASONING_RESULT_FILE_SCHEMAS = (
+    "nemo-rl-strict-captured-replay-evidence-index-v4",
+    "nemo-rl-strict-model-transport-replay-consumption-v3",
+    "nemo-rl-strict-captured-replay-step1-ledger-v5",
+    "nemo-rl-strict-gym-child-index-v1",
+    "nemo-rl-strict-reasoning-score-call-v1",
+    "nemo-rl-strict-reasoning-score-call-v1",
+    "nemo-rl-strict-reasoning-score-call-v1",
+    "nemo-rl-strict-reasoning-score-call-v1",
+    "nemo-rl-strict-reasoning-score-call-index-v1",
+    "nemo-rl-strict-reasoning-score-closed-v1",
+    "nemo-rl-strict-gym-child-receipt-v1",
+    "nemo-rl-strict-gym-child-spec-v1",
+    "nemo-rl-strict-step1-transcript-bundle-v4",
+)
+REASONING_RESULT_ANCHOR_PATHS = frozenset(
+    {
+        "evidence-index.json",
+        "model-transport-replay-consumption.json",
+        "replay-ledger.json",
+        "strict_gym_child_runtime/reasoning-score-call-index.json",
+        "transcript-bundle.json",
+    }
+)
+REASONING_SCORER_TERMINAL_INDEX_PATH = (
+    "strict_gym_child_runtime/reasoning-score-call-index.json"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class StrictCapturedReplayProfile:
@@ -82,6 +126,9 @@ class StrictCapturedReplayProfile:
     resource_app_sha256: str
     resource_config_path: str
     resource_config_sha256: str
+    scorer_config_path_name: str
+    scorer_config_path: str
+    scorer_config_sha256: str
     requirements_path: str
     requirements_sha256: str
     fixture_path: str
@@ -113,6 +160,13 @@ STRICT_CAPTURED_REPLAY_PROFILES = (
             "resources_servers/format_verification/configs/citation_format.yaml"
         ),
         resource_config_sha256=(
+            "da549a29c31219d8eeb14ea23f888c05479578c61619f684387efd97fadb0796"
+        ),
+        scorer_config_path_name="citation_format",
+        scorer_config_path=(
+            "resources_servers/format_verification/configs/citation_format.yaml"
+        ),
+        scorer_config_sha256=(
             "da549a29c31219d8eeb14ea23f888c05479578c61619f684387efd97fadb0796"
         ),
         requirements_path="resources_servers/format_verification/requirements.txt",
@@ -150,6 +204,13 @@ STRICT_CAPTURED_REPLAY_PROFILES = (
         resource_config_sha256=(
             "92a38a70b922f9dcd837a7336c8ce5b13588cb3c1a85d05270486601d18ba6aa"
         ),
+        scorer_config_path_name="freeform_formatting",
+        scorer_config_path=(
+            "resources_servers/format_verification/configs/freeform_formatting.yaml"
+        ),
+        scorer_config_sha256=(
+            "92a38a70b922f9dcd837a7336c8ce5b13588cb3c1a85d05270486601d18ba6aa"
+        ),
         requirements_path="resources_servers/format_verification/requirements.txt",
         requirements_sha256=(
             "18e0d5e99020599c4d033912b39d4569276b1b9278db73469ea9708742cfaa7d"
@@ -167,6 +228,48 @@ STRICT_CAPTURED_REPLAY_PROFILES = (
         result_file_schemas=FORMAT_RESULT_FILE_SCHEMAS,
         result_anchor_paths=FORMAT_RESULT_ANCHOR_PATHS,
         scorer_terminal_index_path=FORMAT_SCORER_TERMINAL_INDEX_PATH,
+    ),
+    StrictCapturedReplayProfile(
+        environment="reasoning_gym",
+        profile_id="reasoning-gym-exact-match-v1",
+        verifier_type="score_answer",
+        method="KnightsKnavesDataset.score_answer",
+        resource_config_path_name="reasoning_gym",
+        disabled_config_path_name="reasoning_gym_simple_agent",
+        resource_app_path="resources_servers/reasoning_gym/app.py",
+        resource_app_sha256=(
+            "3a35c5d27392dae05499ceefac04e9c32ad963b51a54d77bb470ee59b1fe3127"
+        ),
+        resource_config_path=(
+            "resources_servers/reasoning_gym/configs/reasoning_gym.yaml"
+        ),
+        resource_config_sha256=(
+            "bdbb459a4a920bc47cf84b1d7dc30aeaa9be35cf0dfac09c77879e45b62a52ab"
+        ),
+        scorer_config_path_name="resources_only",
+        scorer_config_path=(
+            "resources_servers/reasoning_gym/configs/resources_only.yaml"
+        ),
+        scorer_config_sha256=(
+            "e11a3084f050e4c24101550f63efe71ac6c10f3bc125489ba7293cd81778de68"
+        ),
+        requirements_path="resources_servers/reasoning_gym/requirements.txt",
+        requirements_sha256=(
+            "b00b45db433d797d8a5c5c5602f24ab94d9d5620d83b4bef21fbee851287d411"
+        ),
+        fixture_path="tests/unit/tools/data/reasoning_gym_example.jsonl",
+        fixture_sha256=(
+            "da8ebd2b43d002ba9a6946fe458db7df8bf7e1b3068be3e2f9f014bfdd5229ce"
+        ),
+        fixture_rows=5,
+        call_schema="nemo-rl-strict-reasoning-score-call-v1",
+        closed_schema="nemo-rl-strict-reasoning-score-closed-v1",
+        call_index_schema="nemo-rl-strict-reasoning-score-call-index-v1",
+        result_directories=REASONING_RESULT_DIRECTORIES,
+        result_files=REASONING_RESULT_FILES,
+        result_file_schemas=REASONING_RESULT_FILE_SCHEMAS,
+        result_anchor_paths=REASONING_RESULT_ANCHOR_PATHS,
+        scorer_terminal_index_path=REASONING_SCORER_TERMINAL_INDEX_PATH,
     ),
 )
 
@@ -196,6 +299,11 @@ __all__ = [
     "FORMAT_RESULT_FILES",
     "FORMAT_RESULT_FILE_SCHEMAS",
     "FORMAT_SCORER_TERMINAL_INDEX_PATH",
+    "REASONING_RESULT_ANCHOR_PATHS",
+    "REASONING_RESULT_DIRECTORIES",
+    "REASONING_RESULT_FILES",
+    "REASONING_RESULT_FILE_SCHEMAS",
+    "REASONING_SCORER_TERMINAL_INDEX_PATH",
     "STRICT_CAPTURED_REPLAY_PROFILES",
     "StrictCapturedReplayProfile",
     "get_strict_captured_replay_profile",

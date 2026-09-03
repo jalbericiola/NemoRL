@@ -35,6 +35,7 @@ from nemo_rl.utils.strict_captured_replay_manifest_v2 import (
     validate_replay_execution_manifest_v2,
 )
 from nemo_rl.utils.strict_captured_replay_profiles import (
+    STRICT_CAPTURED_REPLAY_PROFILES,
     StrictCapturedReplayProfile,
     get_strict_captured_replay_profile,
 )
@@ -47,7 +48,21 @@ from tests.unit.utils.test_strict_captured_replay_manifest import (
 _PROFILE_PAIRS = (
     ("citation", "citation-string-match-v1"),
     ("freeform", "freeform-regex-v1"),
+    ("reasoning_gym", "reasoning-gym-exact-match-v1"),
 )
+
+_FORMAT_WIRE_SHA256 = {
+    "citation": {
+        "launcher": "fc58b59291668690fa69143b8e82b694c436344f717fce0f8b3aeb15ee8883a1",
+        "runtime": "fa5ac912c62ad0b51b0c36ca087d3c76ccb70c4f375fab75e271738cd3272f53",
+        "scorer_profile": "5b4e35fe3dcf039a907827a7f984ec26e400d82e616151f2b22a68f8318acbbe",
+    },
+    "freeform": {
+        "launcher": "c6a0e7e3097b1fa4c53d61a72a366b555a4c2b8c5af411809633f76f8023ab06",
+        "runtime": "fe5550af5e4597e5f5fabdf92bfa4af4e68c6e9e60d43e508f5d19f1f9449dde",
+        "scorer_profile": "9feda72c66aeeb237c5e73d16e1b586dbb4ce3bce37cf1077bcae385862566ea",
+    },
+}
 
 _PAIR79_V2_ADDITIONS = {
     "EXPECTED_STRICT_PAIR_BOOTSTRAP_SHA256SUM_SHA256",
@@ -69,6 +84,89 @@ def test_v2_pair_export_roster_adds_exact_runtime_anchors_without_changing_v1() 
     assert len(manifest_module.SLURM_EXPORT_ALLOWED_NAMES) == 79
     assert v2_names - v1_names == _PAIR79_V2_ADDITIONS
     assert v1_names - v2_names == set()
+
+
+def test_reasoning_gym_profile_has_distinct_pair_and_scorer_config_authorities() -> None:
+    assert tuple(
+        (profile.environment, profile.profile_id)
+        for profile in STRICT_CAPTURED_REPLAY_PROFILES
+    ) == _PROFILE_PAIRS
+    profile = get_strict_captured_replay_profile(
+        expected_environment="reasoning_gym",
+        expected_profile_id="reasoning-gym-exact-match-v1",
+    )
+
+    assert profile.verifier_type == "score_answer"
+    assert profile.method == "KnightsKnavesDataset.score_answer"
+    assert profile.disabled_config_path_name == "reasoning_gym_simple_agent"
+    assert profile.resource_config_path_name == "reasoning_gym"
+    assert profile.resource_config_path == ("resources_servers/reasoning_gym/configs/reasoning_gym.yaml")
+    assert profile.resource_config_sha256 == ("bdbb459a4a920bc47cf84b1d7dc30aeaa9be35cf0dfac09c77879e45b62a52ab")
+    assert profile.scorer_config_path_name == "resources_only"
+    assert profile.scorer_config_path == ("resources_servers/reasoning_gym/configs/resources_only.yaml")
+    assert profile.scorer_config_sha256 == ("e11a3084f050e4c24101550f63efe71ac6c10f3bc125489ba7293cd81778de68")
+    assert profile.resource_app_sha256 == ("3a35c5d27392dae05499ceefac04e9c32ad963b51a54d77bb470ee59b1fe3127")
+    assert profile.requirements_sha256 == ("b00b45db433d797d8a5c5c5602f24ab94d9d5620d83b4bef21fbee851287d411")
+    assert profile.fixture_sha256 == ("da8ebd2b43d002ba9a6946fe458db7df8bf7e1b3068be3e2f9f014bfdd5229ce")
+    assert profile.fixture_rows == 5
+    assert len(profile.result_files) == 13
+    assert profile.result_files[4:10] == (
+        "strict_gym_child_runtime/reasoning-score-call-00000001.json",
+        "strict_gym_child_runtime/reasoning-score-call-00000002.json",
+        "strict_gym_child_runtime/reasoning-score-call-00000003.json",
+        "strict_gym_child_runtime/reasoning-score-call-00000004.json",
+        "strict_gym_child_runtime/reasoning-score-call-index.json",
+        "strict_gym_child_runtime/reasoning-score-closed.json",
+    )
+    assert profile.result_file_schemas[:4] == (
+        "nemo-rl-strict-captured-replay-evidence-index-v4",
+        "nemo-rl-strict-model-transport-replay-consumption-v3",
+        "nemo-rl-strict-captured-replay-step1-ledger-v5",
+        "nemo-rl-strict-gym-child-index-v1",
+    )
+    assert profile.scorer_terminal_index_path == ("strict_gym_child_runtime/reasoning-score-call-index.json")
+
+
+@pytest.mark.parametrize(
+    ("environment", "profile_id"),
+    _PROFILE_PAIRS[:2],
+)
+def test_format_profile_wire_projections_are_byte_identical_to_slice_a(
+    environment: str,
+    profile_id: str,
+) -> None:
+    profile = get_strict_captured_replay_profile(
+        expected_environment=environment,
+        expected_profile_id=profile_id,
+    )
+    projections = {
+        "scorer_profile": manifest_module._scorer_profile_v2(profile),
+        "launcher": manifest_module._gym_scorer_launcher_v2(profile),
+        "runtime": manifest_module._gym_scorer_runtime_v2(profile),
+    }
+
+    assert profile.scorer_config_path_name == profile.resource_config_path_name
+    assert profile.scorer_config_path == profile.resource_config_path
+    assert profile.scorer_config_sha256 == profile.resource_config_sha256
+    assert set(projections["scorer_profile"]) == {
+        "call_index_schema",
+        "call_schema",
+        "closed_schema",
+        "disabled_config_path_name",
+        "environment",
+        "fixture",
+        "method",
+        "profile_id",
+        "requirements",
+        "resource_app",
+        "resource_config",
+        "resource_config_path_name",
+        "verifier_type",
+    }
+    actual_sha256 = {
+        name: hashlib.sha256(canonical_ascii_json(value)).hexdigest() for name, value in projections.items()
+    }
+    assert actual_sha256 == _FORMAT_WIRE_SHA256[environment]
 
 
 def _profiled_authority(
@@ -316,6 +414,184 @@ def test_manifest_v2_binds_profile_lifecycle_and_inventory(
     assert document["scheduler_submission"]["receipt"]["schema"] == (
         REPLAY_SUBMISSION_RECEIPT_V2_SCHEMA
     )
+
+
+def test_reasoning_gym_manifest_keeps_pair_config_full_and_launches_resources_only(
+    tmp_path: Path,
+    isolated_authority,
+) -> None:
+    profile, source, _ = isolated_authority(
+        tmp_path,
+        environment="reasoning_gym",
+        profile_id="reasoning-gym-exact-match-v1",
+    )
+    document = build_replay_execution_manifest_v2(
+        authenticated_source=source,
+        attempt_id="replay-1",
+        expected_environment=profile.environment,
+        expected_profile_id=profile.profile_id,
+    )
+
+    full_config = {
+        "path": profile.resource_config_path,
+        "sha256": profile.resource_config_sha256,
+    }
+    scorer_config = {
+        "path": profile.scorer_config_path,
+        "sha256": profile.scorer_config_sha256,
+    }
+    scorer_profile = document["scorer_profile"]
+    scorer = document["replay_contract"]["gym_scorer"]
+    launcher = scorer["launcher"]
+    runtime = scorer["runtime"]
+
+    assert set(scorer_profile) == {
+        "call_index_schema",
+        "call_schema",
+        "closed_schema",
+        "disabled_config_path_name",
+        "environment",
+        "fixture",
+        "method",
+        "profile_id",
+        "requirements",
+        "resource_app",
+        "resource_config",
+        "resource_config_path_name",
+        "verifier_type",
+    }
+    assert scorer_profile["resource_config_path_name"] == "reasoning_gym"
+    assert scorer_profile["resource_config"] == full_config
+    assert scorer["resources"]["config"] == full_config
+    assert launcher["working_directory"] == ("/opt/nemo-rl/3rdparty/Gym-workspace/Gym/resources_servers/reasoning_gym")
+    assert launcher["venv_directory"] == ("/opt/gym_venvs/resources_servers/reasoning_gym/.venv")
+    assert launcher["config_path_name"] == "resources_only"
+    assert launcher["resource_only_config"] == scorer_config
+    assert runtime["selected_resource_config"] == scorer_config
+    assert runtime["scorer_pin"] == {
+        "distribution": "reasoning-gym",
+        "required_distribution_version": "0.1.25",
+        "module": "reasoning_gym.logic.knights_knaves",
+        "module_internal_version_literal": "0.1.19",
+        "module_relative_path": "reasoning_gym/logic/knights_knaves.py",
+        "module_sha256": ("8837a3c6dfc72bb40db168b82ad6b3da45a08a4000a006fc306368b77b622705"),
+        "score_function": "KnightsKnavesDataset.score_answer",
+    }
+    assert document["runtime_attestation_requirements"]["resource_scorer_child"] == runtime
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "full_swap",
+        "full_missing",
+        "full_name_mutation",
+        "full_path_mutation",
+        "full_sha_mutation",
+        "effective_swap",
+        "effective_missing",
+        "effective_name_mutation",
+        "effective_path_mutation",
+        "effective_sha_mutation",
+        "effective_runtime_swap",
+        "effective_runtime_missing",
+        "effective_runtime_path_mutation",
+        "effective_runtime_mutation",
+    ),
+)
+def test_reasoning_gym_manifest_rejects_independent_config_authority_poison(
+    tmp_path: Path,
+    isolated_authority,
+    mutation: str,
+) -> None:
+    profile, source, _ = isolated_authority(
+        tmp_path,
+        environment="reasoning_gym",
+        profile_id="reasoning-gym-exact-match-v1",
+    )
+    document = build_replay_execution_manifest_v2(
+        authenticated_source=source,
+        attempt_id="replay-1",
+        expected_environment=profile.environment,
+        expected_profile_id=profile.profile_id,
+    )
+    scorer = document["replay_contract"]["gym_scorer"]
+    full_config = {
+        "path": profile.resource_config_path,
+        "sha256": profile.resource_config_sha256,
+    }
+    scorer_config = {
+        "path": profile.scorer_config_path,
+        "sha256": profile.scorer_config_sha256,
+    }
+    if mutation == "full_swap":
+        document["scorer_profile"]["resource_config"] = scorer_config
+    elif mutation == "full_missing":
+        scorer["resources"].pop("config")
+    elif mutation == "full_name_mutation":
+        document["scorer_profile"]["resource_config_path_name"] = "resources_only"
+    elif mutation == "full_path_mutation":
+        scorer["resources"]["config"]["path"] = profile.scorer_config_path
+    elif mutation == "full_sha_mutation":
+        scorer["resources"]["config"]["sha256"] = "1" * 64
+    elif mutation == "effective_swap":
+        scorer["launcher"]["resource_only_config"] = full_config
+    elif mutation == "effective_missing":
+        scorer["launcher"]["resource_only_config"] = None
+    elif mutation == "effective_name_mutation":
+        scorer["launcher"]["config_path_name"] = "reasoning_gym"
+    elif mutation == "effective_path_mutation":
+        scorer["launcher"]["resource_only_config"]["path"] = (
+            profile.resource_config_path
+        )
+    elif mutation == "effective_sha_mutation":
+        scorer["launcher"]["resource_only_config"]["sha256"] = "2" * 64
+    elif mutation == "effective_runtime_swap":
+        scorer["runtime"]["selected_resource_config"] = full_config
+    elif mutation == "effective_runtime_missing":
+        scorer["runtime"].pop("selected_resource_config")
+    elif mutation == "effective_runtime_path_mutation":
+        scorer["runtime"]["selected_resource_config"]["path"] = (
+            profile.resource_config_path
+        )
+    else:
+        scorer["runtime"]["selected_resource_config"]["sha256"] = "3" * 64
+
+    with pytest.raises(
+        ValueError,
+        match="scorer_profile|launcher|resource pins|runtime requirements",
+    ):
+        validate_replay_execution_manifest_v2(
+            document,
+            authenticated_source=source,
+            expected_environment=profile.environment,
+            expected_profile_id=profile.profile_id,
+        )
+
+
+def test_reasoning_gym_builder_rejects_resources_only_as_pair_full_config(
+    tmp_path: Path,
+    isolated_authority,
+) -> None:
+    profile, source, _ = isolated_authority(
+        tmp_path,
+        environment="reasoning_gym",
+        profile_id="reasoning-gym-exact-match-v1",
+    )
+    source.pair_manifest["selection"]["gym_resources"]["config"] = {
+        "path": profile.scorer_config_path,
+        "sha256": profile.scorer_config_sha256,
+    }
+    pair_sha256 = hashlib.sha256(canonical_ascii_json(source.pair_manifest) + b"\n").hexdigest()
+    source = replace(source, pair_manifest_sha256=pair_sha256)
+
+    with pytest.raises(ValueError, match="resource pins"):
+        build_replay_execution_manifest_v2(
+            authenticated_source=source,
+            attempt_id="replay-1",
+            expected_environment=profile.environment,
+            expected_profile_id=profile.profile_id,
+        )
 
 
 def test_manifest_v2_publish_and_reload_require_same_explicit_pair(
