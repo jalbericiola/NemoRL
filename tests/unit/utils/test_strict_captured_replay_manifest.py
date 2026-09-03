@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -208,9 +209,9 @@ def _pair(root: str) -> dict[str, object]:
             "contract_sha256": _digest("contract"),
             "entrypoint_sha256": _digest("main-entrypoint"),
             "gym": {
-                "gitlink_commit": "3" * 40,
+                "gitlink_commit": "354babf7e3554fcd006807c86e80ef476aec9408",
                 "path": f"{root}/gym",
-                "tree": "4" * 40,
+                "tree": "f24e1ff729c3aed1957df382364c516097218fe0",
             },
             "head": "5" * 40,
             "job_wrapper": _file(f"{root}/strict_pair_job_wrapper.sh", "wrapper"),
@@ -1194,7 +1195,7 @@ def _build_fixture_source_ledger(
     )
     rows: list[dict[str, object]] = []
     for index, entry in enumerate(transcript["entries"]):
-        response_item = entry["model_response"]["output"][0]
+        response_item = entry["model_response"]["output"][-1]
         prompt = response_item["prompt_token_ids"]
         completion = response_item["generation_token_ids"]
         token_ids = [*prompt, *completion]
@@ -1296,6 +1297,7 @@ def _authenticated_source_fixture(
     }
     pair["execution_environment"]["arms"] = {
         arm: {
+            "results_dir": f"{root}/results/{arm}",
             "scheduler": {"batch_working_directory": f"{root}/snapshots/{arm}-pair-abc"},
             "setup_command": {"byte_count": 12, "sha256": _digest("setup")},
         }
@@ -1549,9 +1551,11 @@ def _authenticated_source_fixture(
     model_path = pair["artifacts"]["model"]["path"]
     requests = [_request(index) for index in range(4)]
     responses = [_response(index) for index in range(4)]
-    for request, response in zip(requests, responses, strict=True):
+    for index, (request, response) in enumerate(zip(requests, responses, strict=True)):
         request["model"] = model_path
         response["model"] = model_path
+        if index % 2:
+            response["choices"][0]["message"]["content"] = "Zoey"
     entries = [
         build_model_transport_call(
             pair_id="pair-abc",
@@ -1601,9 +1605,39 @@ def _authenticated_source_fixture(
 
     def transcript_entry(index: int) -> dict[str, object]:
         entry = _transcript_entry(index, transport_bundle["entries"][index])
-        entry["model_response"]["model"] = model_path
-        entry["derived_verifier_request"]["response"]["model"] = model_path
-        entry["verifier_response"]["response"]["model"] = model_path
+        model_response = entry["model_response"]
+        model_response["model"] = model_path
+        if index % 2:
+            reasoning_output = model_response["output"][0]
+            token_fields = {
+                name: reasoning_output.pop(name)
+                for name in (
+                    "generation_log_probs",
+                    "generation_token_ids",
+                    "prompt_token_ids",
+                    "routed_experts",
+                )
+            }
+            model_response["output"].append(
+                {
+                    "content": [
+                        {
+                            "annotations": [],
+                            "logprobs": None,
+                            "text": "Zoey",
+                            "type": "output_text",
+                        }
+                    ],
+                    "id": f"msg_{index:012x}40008000{index:012x}",
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                    **token_fields,
+                }
+            )
+        entry["derived_verifier_request"]["response"] = copy.deepcopy(model_response)
+        entry["verifier_response"]["response"] = copy.deepcopy(model_response)
+        entry["verifier_response"]["extracted_answer"] = "Zoey" if index % 2 else ""
         return entry
 
     transcript = build_transcript_bundle(
