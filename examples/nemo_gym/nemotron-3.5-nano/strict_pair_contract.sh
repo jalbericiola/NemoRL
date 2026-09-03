@@ -3123,7 +3123,7 @@ manifest = {
             "temperature": 1.0,
             "top_k": None,
             "top_p": 1.0,
-            "vllm_gpu_memory_utilization": 0.6,
+            "vllm_gpu_memory_utilization": 0.1,
         },
         "generation_seed_base": 42,
         "hardware": {"gpu_model": "NVIDIA GB200"},

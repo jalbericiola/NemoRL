@@ -382,9 +382,7 @@ def _make_deployment(root: Path, kind: str) -> tuple[Path, Path, Path, dict[str,
         )
 
     component_roots = {
-        "Megatron-Bridge.runnable.sha256": (
-            deployment / "runnable/Megatron-Bridge"
-        ),
+        "Megatron-Bridge.runnable.sha256": (deployment / "runnable/Megatron-Bridge"),
         "Megatron-LM.runnable.sha256": deployment / "runnable/Megatron-LM",
     }
     for component_root in component_roots.values():
@@ -778,19 +776,43 @@ printf 'NVIDIA GB200, 575.57.08\\n%.0s' {1..4}
             ["git", "-C", str(gym_source), "rev-parse", "HEAD"], text=True
         ).strip(),
         "EXPECTED_BRIDGE_HEAD": subprocess.check_output(
-            ["git", "-C", str(component_roots["Megatron-Bridge.runnable.sha256"]), "rev-parse", "HEAD"],
+            [
+                "git",
+                "-C",
+                str(component_roots["Megatron-Bridge.runnable.sha256"]),
+                "rev-parse",
+                "HEAD",
+            ],
             text=True,
         ).strip(),
         "EXPECTED_BRIDGE_TREE": subprocess.check_output(
-            ["git", "-C", str(component_roots["Megatron-Bridge.runnable.sha256"]), "rev-parse", "HEAD^{tree}"],
+            [
+                "git",
+                "-C",
+                str(component_roots["Megatron-Bridge.runnable.sha256"]),
+                "rev-parse",
+                "HEAD^{tree}",
+            ],
             text=True,
         ).strip(),
         "EXPECTED_MCORE_HEAD": subprocess.check_output(
-            ["git", "-C", str(component_roots["Megatron-LM.runnable.sha256"]), "rev-parse", "HEAD"],
+            [
+                "git",
+                "-C",
+                str(component_roots["Megatron-LM.runnable.sha256"]),
+                "rev-parse",
+                "HEAD",
+            ],
             text=True,
         ).strip(),
         "EXPECTED_MCORE_TREE": subprocess.check_output(
-            ["git", "-C", str(component_roots["Megatron-LM.runnable.sha256"]), "rev-parse", "HEAD^{tree}"],
+            [
+                "git",
+                "-C",
+                str(component_roots["Megatron-LM.runnable.sha256"]),
+                "rev-parse",
+                "HEAD^{tree}",
+            ],
             text=True,
         ).strip(),
     }
@@ -964,9 +986,7 @@ printf 'NVIDIA GB200, 575.57.08\\n%.0s' {1..4}
             manifests["NemoRL.runnable.sha256"]
         )
     elif kind == "bridge_unstaged":
-        dirty_path = (
-            component_roots["Megatron-Bridge.runnable.sha256"] / "runtime.py"
-        )
+        dirty_path = component_roots["Megatron-Bridge.runnable.sha256"] / "runtime.py"
         dirty_path.write_text("# unstaged Bridge drift\n", encoding="ascii")
         _rewrite_runnable_manifest_digest(
             manifests["Megatron-Bridge.runnable.sha256"], dirty_path
@@ -1574,12 +1594,7 @@ def _start_manifest_publisher(
     for arm in ("off", "on"):
         export_path = exports / f"{arm}.env"
         if not export_path.exists():
-            snapshot = (
-                root
-                / "snapshots"
-                / "concurrent-pair"
-                / f"{arm}-concurrent-pair"
-            )
+            snapshot = root / "snapshots" / "concurrent-pair" / f"{arm}-concurrent-pair"
             arm_hf_home = root / "hf-home" / arm
             values = {
                 name: f"value:{name}".encode("ascii")
@@ -1589,9 +1604,7 @@ def _start_manifest_publisher(
                 {
                     "BASE_LOG_DIR": str(root / arm / "ray_logs").encode("ascii"),
                     "CPUS_PER_WORKER": b"144",
-                    "EXP_NAME": f"{arm}-reasoning_gym-concurrent-pair".encode(
-                        "ascii"
-                    ),
+                    "EXP_NAME": f"{arm}-reasoning_gym-concurrent-pair".encode("ascii"),
                     "EXPECTED_BRIDGE_HEAD": b"8" * 40,
                     "EXPECTED_BRIDGE_TREE": b"9" * 40,
                     "EXPECTED_MCORE_HEAD": b"a" * 40,
@@ -1623,7 +1636,9 @@ def _start_manifest_publisher(
                             "nemo-rl-strict-wandb-v1:reasoning_gym:"
                             f"concurrent-pair:{arm}"
                         ).encode("ascii")
-                    ).hexdigest().encode("ascii"),
+                    )
+                    .hexdigest()
+                    .encode("ascii"),
                 }
             )
             payload = b"".join(
@@ -1785,7 +1800,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
             "policy.generation.colocated.enabled=true",
             "policy.generation.colocated.resources.num_nodes=1",
             "policy.generation.colocated.resources.gpus_per_node=4",
-            "policy.generation.vllm_cfg.gpu_memory_utilization=0.6",
+            "policy.generation.vllm_cfg.gpu_memory_utilization=0.1",
             "++policy.generation.refit_transport=null",
             "env.nemo_gym.num_gpu_nodes=0",
             "logger.wandb_enabled=True",
@@ -1855,7 +1870,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
     ):
         source_record = manifest["source"][component]
         assert source_record["root"] == (
-            f'{manifest["deployment"]["root"]}/runnable/{directory}'
+            f"{manifest['deployment']['root']}/runnable/{directory}"
         )
         assert re.fullmatch(r"[0-9a-f]{40}", source_record["head"])
         assert re.fullmatch(r"[0-9a-f]{40}", source_record["tree"])
@@ -1866,8 +1881,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
                 "name_template": f"{arm}-{{environment}}-{{pair_id}}",
                 "run_id": hashlib.sha256(
                     (
-                        f"nemo-rl-strict-wandb-v1:reasoning_gym:"
-                        f"{run.pair_id}:{arm}"
+                        f"nemo-rl-strict-wandb-v1:reasoning_gym:{run.pair_id}:{arm}"
                     ).encode("ascii")
                 ).hexdigest(),
             }
@@ -1881,8 +1895,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         "project": "nano35-rlvr-convergence",
         "resume": "never",
         "run_id_derivation": (
-            "sha256-ascii:nemo-rl-strict-wandb-v1:"
-            "{environment}:{pair_id}:{arm}"
+            "sha256-ascii:nemo-rl-strict-wandb-v1:{environment}:{pair_id}:{arm}"
         ),
     }
     execution_environment = manifest["execution_environment"]
@@ -1927,7 +1940,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         assert arm_execution["cache_read"] == {
             "entry_count": 0,
             "mode": "0700",
-            "path": f'{arm_execution["persistent_cache"]}/cache_read',
+            "path": f"{arm_execution['persistent_cache']}/cache_read",
             "policy": "empty-at-publication-and-job-entry-no-read",
         }
         snapshot_path = manifest["source"]["snapshots"][arm]["path"]
@@ -1937,11 +1950,13 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
             "sbatch_client_cwd": snapshot_path,
             "slurm_submit_dir": snapshot_path,
         }
-    assert execution_environment["arms"]["off"]["persistent_cache"] != (
-        execution_environment["arms"]["on"]["persistent_cache"]
+    assert (
+        execution_environment["arms"]["off"]["persistent_cache"]
+        != (execution_environment["arms"]["on"]["persistent_cache"])
     )
-    assert execution_environment["arms"]["off"]["hf_home"] != (
-        execution_environment["arms"]["on"]["hf_home"]
+    assert (
+        execution_environment["arms"]["off"]["hf_home"]
+        != (execution_environment["arms"]["on"]["hf_home"])
     )
     assert run.submission_contract is not None
     assert run.submission_contract_mode == 0o400
@@ -2016,24 +2031,22 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         assert values["WANDB_RUN_GROUP"] == (
             f"reasoning_gym-{run.pair_id}".encode("ascii")
         )
-        assert values["WANDB_NAME"] == manifest["wandb"]["arms"][arm][
-            "name"
-        ].encode("ascii")
+        assert values["WANDB_NAME"] == manifest["wandb"]["arms"][arm]["name"].encode(
+            "ascii"
+        )
         assert values["WANDB_RUN_ID"] == manifest["wandb"]["arms"][arm][
             "run_id"
         ].encode("ascii")
-        assert values["HF_HOME"] == manifest["execution_environment"]["arms"][
+        assert values["HF_HOME"] == manifest["execution_environment"]["arms"][arm][
+            "hf_home"
+        ].encode("ascii")
+        assert values["HF_HUB_CACHE"] == manifest["execution_environment"]["arms"][arm][
+            "hf_hub_cache"
+        ].encode("ascii")
+        assert values["HF_DATASETS_CACHE"] == manifest["execution_environment"]["arms"][
             arm
-        ]["hf_home"].encode("ascii")
-        assert values["HF_HUB_CACHE"] == manifest["execution_environment"][
-            "arms"
-        ][arm]["hf_hub_cache"].encode("ascii")
-        assert values["HF_DATASETS_CACHE"] == manifest["execution_environment"][
-            "arms"
-        ][arm]["hf_datasets_cache"].encode("ascii")
-        setup_command = manifest["execution_environment"]["arms"][arm][
-            "setup_command"
-        ]
+        ]["hf_datasets_cache"].encode("ascii")
+        setup_command = manifest["execution_environment"]["arms"][arm]["setup_command"]
         assert values["SETUP_COMMAND"] == STRICT_SETUP_COMMAND
         assert not any(
             forbidden in values["SETUP_COMMAND"].lower()
@@ -2127,7 +2140,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         manifest["pair_campaign_sha256"] == hashlib.sha256(campaign_bytes).hexdigest()
     )
     assert manifest["pair_campaign_sha256"] == (
-        "19a5003a0c8aee69b48cab0c16dde4fb1c03dda559fb0b7bf87ac89f550a5de1"
+        "dde23897d5c1dbad63b0aff9d4be3de2d7e9a0165be78a79caf744db559da9ee"
     )
     assert (
         manifest["pair_campaign_reward_and_advantage_sha256"]
@@ -2215,7 +2228,7 @@ def test_authoritative_pair_builds_exact_parallel_arm_contract() -> None:
         "temperature": 1.0,
         "top_k": None,
         "top_p": 1.0,
-        "vllm_gpu_memory_utilization": 0.6,
+        "vllm_gpu_memory_utilization": 0.1,
     }
 
     assert manifest["campaign"]["slurm"] == {
@@ -2454,8 +2467,9 @@ def test_submit_uses_export_file_and_positional_pair_identity() -> None:
         assert query["unresolved_job_ids"] == []
         assert query["line_count"] == 2
         for arm in ("off", "on"):
-            assert query["records"][arm][0]["work_dir"] == (
-                manifest["source"]["snapshots"][arm]["path"]
+            assert (
+                query["records"][arm][0]["work_dir"]
+                == (manifest["source"]["snapshots"][arm]["path"])
             )
         assert query["byte_count"] > 0
         assert re.fullmatch(r"[0-9a-f]{64}", query["output_sha256_raw"])
@@ -2586,15 +2600,18 @@ def test_scheduler_workdir_mismatch_is_never_authenticated() -> None:
     assert recovery["line_count"] == 2
     assert recovery["parsed_record_count"] == 2
     assert recovery["identity_match_counts"] == {"off": 1, "on": 0}
-    assert recovery["records"]["off"][0]["work_dir"] == (
-        receipt["execution_environment"]["arms"]["off"]["scheduler"][
-            "slurm_submit_dir"
-        ]
+    assert (
+        recovery["records"]["off"][0]["work_dir"]
+        == (
+            receipt["execution_environment"]["arms"]["off"]["scheduler"][
+                "slurm_submit_dir"
+            ]
+        )
     )
     assert recovery["records"]["on"] == []
-    assert [
-        record["job_id"] for record in receipt["authenticated_jobs"]["off"]
-    ] == ["41001"]
+    assert [record["job_id"] for record in receipt["authenticated_jobs"]["off"]] == [
+        "41001"
+    ]
     assert receipt["authenticated_jobs"]["on"] == []
     assert receipt["cancellations"][0]["job_ids"] == ["41001"]
     assert run.scheduler_states == {"41001": "CANCELLED", "41002": "HELD"}
@@ -2735,9 +2752,7 @@ def test_duplicate_job_id_with_failed_recovery_uses_unattributed_retry() -> None
 
 
 def test_malformed_recovery_line_cannot_confirm_rollback() -> None:
-    run = _run_pair(
-        "--submit", deployment_kind="recovery_malformed_identity_no_relay"
-    )
+    run = _run_pair("--submit", deployment_kind="recovery_malformed_identity_no_relay")
     assert run.process.returncode != 0
     assert run.submission_receipt is not None
     receipt = json.loads(run.submission_receipt)
@@ -3269,10 +3284,7 @@ printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \\
         ),
         (
             "single_env_freeform_sc.yaml",
-            (
-                "resources_servers/format_verification/configs/"
-                "freeform_formatting.yaml"
-            ),
+            ("resources_servers/format_verification/configs/freeform_formatting.yaml"),
             4096,
         ),
     ],
@@ -3294,10 +3306,8 @@ def test_closed_environment_overlays_compose_as_strict_train_recipes(
     assert config.env["nemo_gym"]["config_paths"][-1] == gym_config
     assert config.grpo.max_num_steps == 100
     assert config.grpo.max_num_epochs == 20
-    assert config.policy["shared_prefix_training"]["mode"] == "train"
-    assert config.policy["shared_prefix_training"][
-        "require_deterministic_execution"
-    ]
+    assert config.policy["shared_prefix_training"].mode == "train"
+    assert config.policy["shared_prefix_training"].require_deterministic_execution
 
 
 def test_off_and_on_commands_differ_only_by_arm_identity_paths_and_mode() -> None:

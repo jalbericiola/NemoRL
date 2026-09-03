@@ -17,6 +17,9 @@ training (`on`) arms on `reasoning_gym`, `citation`, and `freeform`.
   in every environment so a complete K=4 cohort fits one shared-prefix bin.
 - Logging: W&B online in `nvidia/nano35-rlvr-convergence`; TensorBoard off.
 - Scheduler: `batch`, account `nemotron_sw_post`, QoS `normal`.
+- Colocated vLLM memory utilization: `0.1`. This is the completed freeform
+  canary setting; the earlier `0.4` and `0.6` attempts exhausted device memory
+  during optimizer initialization.
 
 The strict launcher submits the OFF and ON arms concurrently. Each arm uses
 one four-GPU node with colocated policy and generation, matching the geometry
@@ -34,11 +37,15 @@ Do not submit the six 100-step arms until all of the following are true:
 1. The PR-consistent NeMo/Bridge/MCore stack has one immutable deployment and
    externally recorded READY and runnable-manifest digests.
 2. The strict captured-output replay producer, terminal evidence seal, and
-   isolated evaluator are frozen and pass their full tests.
+   isolated evaluator are frozen and pass their full tests for every selected
+   environment. The current replay-v3 sealer is Reasoning-Gym-only; citation
+   and freeform need their environment-specific sealed scorer profiles before
+   this gate is closed.
 3. Exact-container config composition passes for all three YAMLs.
-4. A short all-five-row live calibration demonstrates nonconstant reward for
-   Reasoning Gym and citation; freeform already demonstrated it in the
-   two-step GPU pair.
+4. A short all-five-row live calibration at the exact `0.1` colocated memory
+   setting demonstrates valid tokenization and nonconstant reward for all
+   three environments. Freeform's completed two-step pair is useful preliminary
+   evidence, but it did not cover all five rows.
 5. The operator explicitly confirms the six-node/24-GPU launch.
 
 `launch_pair.sh --dry-run` is the final non-executing validation for each

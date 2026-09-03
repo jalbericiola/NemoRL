@@ -450,6 +450,9 @@ if [[ "${STRICT_PAIR_EXPORT_PREPARE_ONLY}" == "0" ]]; then
     )
   fi
 fi
+# The policy and vLLM share the same four GPUs.  0.4 and 0.6 have both
+# exhausted memory during policy optimizer initialization; 0.1 is the exact
+# colocated setting proven by the two-step freeform GPU pair.
 exec "${STRICT_PAIR_TOOL_ENV}" -i \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   LC_ALL=C \
@@ -551,6 +554,6 @@ exec "${STRICT_PAIR_TOOL_ENV}" -i \
   "${STRICT_PAIR_TOOL_BASH}" -p "${LAUNCHER}" swe \
   "policy.shared_prefix_training.mode=${SHARED_PREFIX_MODE}" \
   "policy.shared_prefix_training.require_deterministic_execution=true" \
-  "policy.generation.vllm_cfg.gpu_memory_utilization=0.6" \
+  "policy.generation.vllm_cfg.gpu_memory_utilization=0.1" \
   'policy.megatron_cfg.env_vars.RESULTS_DIR=${RESULTS_DIR}' \
   'policy.megatron_cfg.env_vars.NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR=${NRL_SHARED_PREFIX_DETERMINISM_RECEIPT_DIR}'
