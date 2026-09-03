@@ -1085,7 +1085,7 @@ def test_released_receipt_is_reloaded_through_public_profile_bound_v2_api(
     source = _source(tmp_path)
     replay_manifest_path = tmp_path / "results/captured_replay/manifests/pair-citation/replay-1.json"
     submission_receipt_path = (
-        tmp_path / "results/captured_replay/replay_submission_state/pair-citation/" "replay-1.submission-receipt.json"
+        tmp_path / "results/captured_replay/replay_submission_state/pair-citation/replay-1/submission-receipt.json"
     )
     prepared = _prepared(
         source,
