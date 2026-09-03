@@ -420,6 +420,8 @@ def test_reasoning_gym_manifest_keeps_pair_config_full_and_launches_resources_on
     tmp_path: Path,
     isolated_authority,
 ) -> None:
+    from nemo_rl.environments.strict_gym_child_runtime_v2 import _target_matrix
+
     profile, source, _ = isolated_authority(
         tmp_path,
         environment="reasoning_gym",
@@ -470,6 +472,16 @@ def test_reasoning_gym_manifest_keeps_pair_config_full_and_launches_resources_on
     assert launcher["config_path_name"] == "reasoning_gym"
     assert launcher["resource_only_config"] == scorer_config
     assert runtime["selected_resource_config"] == scorer_config
+    child_target = _target_matrix(
+        "reasoning_gym",
+        Path("/opt/nemo-rl/3rdparty/Gym-workspace/Gym"),
+        scope="scorer-only",
+    )[0]
+    assert launcher["config_path_name"] == child_target["config_path"]
+    assert scorer_config == {
+        "path": child_target["config_relative"],
+        "sha256": child_target["config_sha256"],
+    }
     assert runtime["scorer_pin"] == {
         "distribution": "reasoning-gym",
         "required_distribution_version": "0.1.25",
