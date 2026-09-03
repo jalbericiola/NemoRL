@@ -190,6 +190,37 @@ class RayFinalSyncScalingTest(unittest.TestCase):
             source,
         )
 
+    def test_sandbox_srun_must_exit_zero_instead_of_being_cancelled(self) -> None:
+        source = RAY_SUB.read_text(encoding="utf-8")
+        teardown_start = source.index(
+            "  # Sandbox sidecars are not provenance-bearing."
+        )
+        teardown_end = source.index("\n\n  set -e", teardown_start)
+        teardown = source[teardown_start:teardown_end]
+
+        self.assertNotIn('kill "${SRUN_PIDS["sandbox"]}"', teardown)
+        self.assertNotIn(
+            'wait "${SRUN_PIDS["sandbox"]}" 2>/dev/null || true', teardown
+        )
+        self.assertIn(
+            '10 "sandbox teardown" USR1 TERM 1 "${SRUN_PIDS["sandbox"]}"',
+            teardown,
+        )
+        self.assertIn("DerivedExitCode", teardown)
+
+        # The forwarded graceful signal is successful only after node-local
+        # sandbox descendants have stopped without a forced cleanup.
+        sandbox_stop = indented_bash_function_source(
+            source, "stop-sandbox-tree", "      "
+        )
+        self.assertIn("trap - USR1", sandbox_stop)
+        self.assertIn("exit 0", sandbox_stop)
+        self.assertIn(
+            "collection_failed == 1 || forced == 1 || reap_failed == 1",
+            sandbox_stop,
+        )
+        self.assertIn("while :; do sleep 1; done", sandbox_stop)
+
     def test_head_watchdog_enforces_deadline_and_preserves_head_status(self) -> None:
         source = RAY_SUB.read_text(encoding="utf-8")
         process_tree = bash_function_source(source, "collect-process-tree-pids")
