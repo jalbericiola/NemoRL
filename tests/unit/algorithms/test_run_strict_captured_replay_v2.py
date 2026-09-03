@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import importlib.util
 import inspect
@@ -226,16 +227,22 @@ def test_cli_and_slurm_job_argv_are_explicit_and_frozen(runner: Any) -> None:
 
 
 @pytest.mark.parametrize(
-    ("environment", "profile_id"),
+    ("environment", "profile_id", "method"),
     [
-        ("citation", "citation-string-match-v1"),
-        ("freeform", "freeform-regex-v1"),
+        ("citation", "citation-string-match-v1", "_verify_string_match"),
+        ("freeform", "freeform-regex-v1", "_verify_regex"),
+        (
+            "reasoning_gym",
+            "reasoning-gym-exact-match-v1",
+            "KnightsKnavesDataset.score_answer",
+        ),
     ],
 )
-def test_only_closed_format_profiles_are_admitted(
+def test_only_closed_scorer_profiles_are_admitted(
     runner: Any,
     environment: str,
     profile_id: str,
+    method: str,
 ) -> None:
     profile = runner._closed_profile(
         expected_environment=environment,
@@ -243,7 +250,7 @@ def test_only_closed_format_profiles_are_admitted(
     )
     assert profile["environment"] == environment
     assert profile["profile_id"] == profile_id
-    assert profile["method"] in {"_verify_string_match", "_verify_regex"}
+    assert profile["method"] == method
     assert profile["fixture"]["rows"] == 5
     assert profile["fixture"]["path"] == (
         f"tests/unit/tools/data/{environment}_example.jsonl"
@@ -256,6 +263,9 @@ def test_only_closed_format_profiles_are_admitted(
             ),
             "freeform": (
                 "8869b42f6a946833c1ca3a37316907fd3d621e460a3288ed309f1ca52ca67399"
+            ),
+            "reasoning_gym": (
+                "da8ebd2b43d002ba9a6946fe458db7df8bf7e1b3068be3e2f9f014bfdd5229ce"
             ),
         }[environment]
     )
@@ -373,14 +383,19 @@ def _install_fake_gym_modules(
         *, global_config_dict_parser_config: _FakeParserConfig
     ) -> dict[str, Any]:
         initial = dict(global_config_dict_parser_config.initial)
-        assert initial[disabled_name] == {"_delete_key": "responses_api_agents"}
+        if environment == "reasoning_gym":
+            assert disabled_name not in initial
+            server_name = "reasoning_gym"
+        else:
+            assert initial[disabled_name] == {"_delete_key": "responses_api_agents"}
+            server_name = "format_verification"
         leaf: dict[str, Any] = {"entrypoint": "app.py"}
         if poison:
             leaf["responses_api_models"] = {"poison": True}
         return {
             **{name: initial[name] for name in reserved_names},
-            disabled_name: {},
-            resource_name: {"resources_servers": {"format_verification": leaf}},
+            **({} if environment == "reasoning_gym" else {disabled_name: {}}),
+            resource_name: {"resources_servers": {server_name: leaf}},
         }
 
     global_module.get_global_config_dict = resolve
@@ -397,6 +412,7 @@ def _install_fake_gym_modules(
     [
         ("citation", "citation-string-match-v1"),
         ("freeform", "freeform-regex-v1"),
+        ("reasoning_gym", "reasoning-gym-exact-match-v1"),
     ],
 )
 def test_reduced_parser_keeps_exactly_one_resource_and_no_agent_or_model(
@@ -411,7 +427,12 @@ def test_reduced_parser_keeps_exactly_one_resource_and_no_agent_or_model(
         expected_profile_id=profile_id,
     )
     gym_root = tmp_path / runner._GYM_SOURCE_RELATIVE
-    config_path = gym_root / profile["resource_config"]["path"]
+    selected_config = (
+        runner._REASONING_GYM_RESOURCE_ONLY_CONFIG
+        if environment == "reasoning_gym"
+        else profile["resource_config"]
+    )
+    config_path = gym_root / selected_config["path"]
     config_path.parent.mkdir(parents=True)
     config_path.write_text("authenticated: yaml\n", encoding="ascii")
     _install_fake_gym_modules(
@@ -426,7 +447,7 @@ def test_reduced_parser_keeps_exactly_one_resource_and_no_agent_or_model(
     def stable_hash(path: Path, *, name: str) -> str:
         assert path == config_path
         hash_checks.append(name)
-        return profile["resource_config"]["sha256"]
+        return selected_config["sha256"]
 
     monkeypatch.setattr(runner, "_stable_regular_sha256", stable_hash)
     manifest = {
@@ -435,10 +456,15 @@ def test_reduced_parser_keeps_exactly_one_resource_and_no_agent_or_model(
             "gym_scorer": {
                 "launcher": {
                     "log_wrapper": "forbidden",
-                    "resource_only_config": None,
+                    "resource_only_config": (
+                        runner._REASONING_GYM_RESOURCE_ONLY_CONFIG
+                        if environment == "reasoning_gym"
+                        else None
+                    ),
                     "config_path_name": profile["resource_config_path_name"],
                 },
                 "resources": {"config": profile["resource_config"]},
+                "runtime": {"selected_resource_config": selected_config},
             }
         },
         "execution_environment": {"attempt": {"persistent_cache": "/strict/cache"}},
@@ -447,7 +473,7 @@ def test_reduced_parser_keeps_exactly_one_resource_and_no_agent_or_model(
     ray_module = types.SimpleNamespace(
         get_runtime_context=lambda: types.SimpleNamespace(gcs_address="127.0.0.1:6379")
     )
-    parser_config = runner._build_format_resource_only_parser_config(
+    parser_config = runner._build_profiled_resource_only_parser_config(
         manifest=manifest,
         execution_source_root=tmp_path,
         ray_module=ray_module,
@@ -455,12 +481,20 @@ def test_reduced_parser_keeps_exactly_one_resource_and_no_agent_or_model(
         expected_profile_id=profile_id,
     )
     assert type(parser_config) is _FakeParserConfig
-    assert parser_config.initial[profile["disabled_config_path_name"]] == {
-        "_delete_key": "responses_api_agents"
-    }
+    if environment == "reasoning_gym":
+        assert (
+            manifest["replay_contract"]["gym_scorer"]["launcher"]["config_path_name"]
+            == "reasoning_gym"
+        )
+        assert parser_config.initial["config_paths"] == [str(config_path)]
+        assert profile["disabled_config_path_name"] not in parser_config.initial
+    else:
+        assert parser_config.initial[profile["disabled_config_path_name"]] == {
+            "_delete_key": "responses_api_agents"
+        }
     assert hash_checks == [
-        "selected format Gym config",
-        "post-parse selected format Gym config",
+        "selected scorer Gym config",
+        "post-parse selected scorer Gym config",
     ]
 
 
@@ -499,6 +533,7 @@ def test_reduced_parser_poison_rejects_nested_model_server(
                     "config_path_name": profile["resource_config_path_name"],
                 },
                 "resources": {"config": profile["resource_config"]},
+                "runtime": {"selected_resource_config": profile["resource_config"]},
             }
         },
         "execution_environment": {"attempt": {"persistent_cache": "/strict/cache"}},
@@ -508,7 +543,7 @@ def test_reduced_parser_poison_rejects_nested_model_server(
         runner.StrictCapturedReplayEntrypointError,
         match="agent or model server",
     ):
-        runner._build_format_resource_only_parser_config(
+        runner._build_profiled_resource_only_parser_config(
             manifest=manifest,
             execution_source_root=tmp_path,
             ray_module=types.SimpleNamespace(
@@ -519,6 +554,202 @@ def test_reduced_parser_poison_rejects_nested_model_server(
             expected_environment="citation",
             expected_profile_id="citation-string-match-v1",
         )
+
+
+@pytest.mark.parametrize(
+    "poison",
+    [
+        "config-name",
+        "resource-only-path",
+        "resource-only-sha256",
+        "selected-path",
+        "selected-sha256",
+    ],
+)
+def test_reasoning_parser_rejects_effective_config_relabels(
+    runner: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    poison: str,
+) -> None:
+    environment = "reasoning_gym"
+    profile_id = "reasoning-gym-exact-match-v1"
+    profile = runner._closed_profile(
+        expected_environment=environment,
+        expected_profile_id=profile_id,
+    )
+    selected = copy.deepcopy(runner._REASONING_GYM_RESOURCE_ONLY_CONFIG)
+    gym_root = tmp_path / runner._GYM_SOURCE_RELATIVE
+    config_path = gym_root / selected["path"]
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("authenticated: yaml\n", encoding="ascii")
+    _install_fake_gym_modules(
+        monkeypatch,
+        gym_root=gym_root,
+        environment=environment,
+        profile=profile,
+        poison=False,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_stable_regular_sha256",
+        lambda *args, **kwargs: selected["sha256"],
+    )
+    manifest = {
+        "scorer_profile": profile,
+        "replay_contract": {
+            "gym_scorer": {
+                "launcher": {
+                    "log_wrapper": "forbidden",
+                    "resource_only_config": copy.deepcopy(selected),
+                    "config_path_name": profile["resource_config_path_name"],
+                },
+                "resources": {"config": profile["resource_config"]},
+                "runtime": {"selected_resource_config": copy.deepcopy(selected)},
+            }
+        },
+        "execution_environment": {"attempt": {"persistent_cache": "/strict/cache"}},
+        "artifacts": {"outputs": {"directory": {"path": "/strict/output"}}},
+    }
+    launcher = manifest["replay_contract"]["gym_scorer"]["launcher"]
+    runtime = manifest["replay_contract"]["gym_scorer"]["runtime"]
+    if poison == "config-name":
+        launcher["config_path_name"] = "resources_only"
+    elif poison == "resource-only-path":
+        launcher["resource_only_config"]["path"] = "configs/poison.yaml"
+    elif poison == "resource-only-sha256":
+        launcher["resource_only_config"]["sha256"] = "0a" * 32
+    elif poison == "selected-path":
+        runtime["selected_resource_config"]["path"] = "configs/poison.yaml"
+    elif poison == "selected-sha256":
+        runtime["selected_resource_config"]["sha256"] = "0b" * 32
+    else:  # pragma: no cover - parameterization closes this set.
+        raise AssertionError("unreachable effective-config poison")
+
+    with pytest.raises(
+        runner.StrictCapturedReplayEntrypointError,
+        match="effective config/launcher policy differs",
+    ):
+        runner._build_profiled_resource_only_parser_config(
+            manifest=manifest,
+            execution_source_root=tmp_path,
+            ray_module=types.SimpleNamespace(
+                get_runtime_context=lambda: types.SimpleNamespace(
+                    gcs_address="127.0.0.1:6379"
+                )
+            ),
+            expected_environment=environment,
+            expected_profile_id=profile_id,
+        )
+
+
+@pytest.mark.parametrize(
+    ("environment", "profile_id", "schema", "poison"),
+    [
+        (
+            "reasoning_gym",
+            "reasoning-gym-exact-match-v1",
+            "nemo-rl-strict-reasoning-score-call-index-v1",
+            None,
+        ),
+        (
+            "reasoning_gym",
+            "reasoning-gym-exact-match-v1",
+            "nemo-rl-strict-reasoning-score-call-index-v1",
+            "profile-id",
+        ),
+        (
+            "reasoning_gym",
+            "reasoning-gym-exact-match-v1",
+            "nemo-rl-strict-reasoning-score-call-index-v1",
+            "schema",
+        ),
+        (
+            "citation",
+            "citation-string-match-v1",
+            "nemo-rl-strict-format-verification-call-index-v1",
+            "missing-profile-id",
+        ),
+    ],
+)
+def test_scorer_terminal_identity_is_profile_discriminated(
+    runner: Any,
+    environment: str,
+    profile_id: str,
+    schema: str,
+    poison: str | None,
+) -> None:
+    terminal: dict[str, Any] = {
+        "schema": schema,
+        "environment": environment,
+        "call_count": 4,
+    }
+    if environment != "reasoning_gym":
+        terminal["profile_id"] = profile_id
+    if poison == "profile-id":
+        terminal["profile_id"] = profile_id
+    elif poison == "schema":
+        terminal["schema"] = "nemo-rl-strict-format-verification-call-index-v1"
+    elif poison == "missing-profile-id":
+        terminal.pop("profile_id")
+
+    if poison is None:
+        runner._validate_scorer_terminal_identity(
+            terminal,
+            expected_environment=environment,
+            expected_profile_id=profile_id,
+            expected_schema=schema,
+        )
+    else:
+        with pytest.raises(runner.StrictCapturedReplayEntrypointError):
+            runner._validate_scorer_terminal_identity(
+                terminal,
+                expected_environment=environment,
+                expected_profile_id=profile_id,
+                expected_schema=schema,
+            )
+
+
+def test_authenticated_wrapper_uses_exact_post_c_generic_callback_seam(
+    runner: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "nemo_rl.algorithms.strict_captured_replay_runtime_v2"
+    runtime = types.ModuleType(module_name)
+    observed: dict[str, Any] = {}
+    marker = object()
+
+    def execute_profiled_captured_replay_cohort(**kwargs: Any) -> object:
+        observed.update(kwargs)
+        return marker
+
+    runtime.execute_profiled_captured_replay_cohort = (
+        execute_profiled_captured_replay_cohort
+    )
+    monkeypatch.setitem(sys.modules, module_name, runtime)
+    scorer_check = object()
+    finalizer = object()
+    result = runner.run_from_authenticated_wrapper(
+        manifest={},
+        replay_execution_manifest_sha256="1" * 64,
+        submission_receipt_sha256="2" * 64,
+        authenticated_job_id="93001",
+        driver_process={},
+        driver_scheduler_device_environment={},
+        source_transcript_document={},
+        source_main_ledger_document={},
+        transport_source=object(),
+        post_verifier=object(),
+        independent_scorer_check=scorer_check,
+        finalize_scorer_call_evidence=finalizer,
+        expected_environment="reasoning_gym",
+        expected_profile_id="reasoning-gym-exact-match-v1",
+    )
+    assert result is marker
+    assert observed["independent_scorer_check"] is scorer_check
+    assert observed["finalize_scorer_call_evidence"] is finalizer
+    assert "independent_format_check" not in observed
+    assert "finalize_format_call_evidence" not in observed
 
 
 def test_child_lifecycle_uses_exact_parser_type_and_finalizes_before_transport(
@@ -533,9 +764,11 @@ def test_child_lifecycle_uses_exact_parser_type_and_finalizes_before_transport(
     )
     assert 'prepare_strict_gym_child_runtime(scope="scorer-only")' in child_source
     assert "session.finalize_format_verification_calls(" in child_source
+    assert "session.finalize_score_calls(" in child_source
+    assert "reasoning_gym_score_call_material(" in child_source
     runtime_source = inspect.getsource(runner.run_from_authenticated_wrapper)
     assert (
-        "finalize_format_call_evidence=finalize_format_call_evidence" in runtime_source
+        "finalize_scorer_call_evidence=finalize_scorer_call_evidence" in runtime_source
     )
 
 

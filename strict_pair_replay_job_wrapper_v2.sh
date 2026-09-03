@@ -94,7 +94,7 @@ strict_replay_parse_cli() {
   [[ "${14}" == /* && "${14}" != *$'\n'* && "${14}" != *$'\r'* ]] || strict_replay_die "manifest path must be one absolute line"
   [[ "${16}" =~ ^[0-9a-f]{64}$ ]] || strict_replay_die "manifest SHA-256 is malformed"
   case "${18}:${20}" in
-    citation:citation-string-match-v1|freeform:freeform-regex-v1) ;;
+    citation:citation-string-match-v1|freeform:freeform-regex-v1|reasoning_gym:reasoning-gym-exact-match-v1) ;;
     *) strict_replay_die "environment/profile pair is not admitted" ;;
   esac
   STRICT_REPLAY_PAIR_MANIFEST_PATH="$2"
@@ -178,6 +178,7 @@ REPLAY_MANIFEST_SCHEMA = "nemo-rl-strict-captured-replay-execution-manifest-v4"
 PROFILE_IDS = {
     "citation": "citation-string-match-v1",
     "freeform": "freeform-regex-v1",
+    "reasoning_gym": "reasoning-gym-exact-match-v1",
 }
 PAIR_SCHEMA = "nemo-rl-strict-single-env-pair-v2"
 PAIR_SUBMISSION_SCHEMA = "nemo-rl-strict-pair-submission-receipt-v2"
@@ -1509,10 +1510,14 @@ import_authenticated_module(
     legacy_evidence_path,
     raw=legacy_evidence_raw,
 )
-import_authenticated_module(
+profile_registry = import_authenticated_module(
     "nemo_rl.utils.strict_captured_replay_profiles",
     profile_registry_path,
     raw=profile_registry_raw,
+)
+profile = profile_registry.get_strict_captured_replay_profile(
+    expected_environment=expected_environment,
+    expected_profile_id=expected_profile_id,
 )
 evidence_utility = import_authenticated_module(
     "nemo_rl.utils.strict_captured_replay_evidence_v2",
@@ -1815,9 +1820,7 @@ anchored_sha256 = {
         "transport_consumption"
     ]["sha256"],
     "replay-ledger.json": outputs["replay_ledger"]["sha256"],
-    "strict_gym_child_runtime/format-verification-call-index.json": outputs[
-        "scorer_call_index"
-    ]["sha256"],
+    profile.scorer_terminal_index_path: outputs["scorer_call_index"]["sha256"],
     "transcript-bundle.json": outputs["transcript_bundle"]["sha256"],
 }
 if [record["path"] for record in result_inventory_declaration["anchors"]] != [

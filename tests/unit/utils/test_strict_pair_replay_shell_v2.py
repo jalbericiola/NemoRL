@@ -112,6 +112,20 @@ def test_v2_scripts_are_shell_and_embedded_python_syntax_clean() -> None:
         compile(_embedded_python(path), str(path), "exec")
 
 
+def test_v2_shell_and_python_gates_admit_exact_three_profile_pairs() -> None:
+    expected = {
+        "citation": "citation-string-match-v1",
+        "freeform": "freeform-regex-v1",
+        "reasoning_gym": "reasoning-gym-exact-match-v1",
+    }
+    case_arm = (
+        "citation:citation-string-match-v1|freeform:freeform-regex-v1|" "reasoning_gym:reasoning-gym-exact-match-v1"
+    )
+    for path in V2_SCRIPTS:
+        assert _dict_assignments(_embedded_python(path))["PROFILE_IDS"] == expected
+        assert case_arm in path.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("script", V2_SCRIPTS, ids=lambda path: path.name)
 @pytest.mark.parametrize(
     ("environment", "profile_id"),
@@ -180,6 +194,7 @@ def test_v2_script_program_maps_exactly_match_manifest_v2() -> None:
     [
         ("citation", "citation-string-match-v1"),
         ("freeform", "freeform-regex-v1"),
+        ("reasoning_gym", "reasoning-gym-exact-match-v1"),
     ],
 )
 def test_launcher_builds_exact_twenty_token_profiled_wrapper_tail(
@@ -433,6 +448,7 @@ def test_launcher_preflights_the_exact_attempt_scoped_cleanup_targets() -> None:
     [
         ("citation", "citation-string-match-v1"),
         ("freeform", "freeform-regex-v1"),
+        ("reasoning_gym", "reasoning-gym-exact-match-v1"),
     ],
 )
 def test_wrapper_builds_exact_profiled_driver_argv(
@@ -500,6 +516,13 @@ def test_wrapper_builds_exact_profiled_driver_argv(
             expected_environment=environment,
             expected_profile_id="wrong-profile",
         )
+
+
+def test_wrapper_derives_sealer_anchor_from_authenticated_profile() -> None:
+    source = _embedded_python(V2_SCRIPTS[1])
+    assert 'profile.scorer_terminal_index_path: outputs["scorer_call_index"]["sha256"]' in source
+    assert '"strict_gym_child_runtime/format-verification-call-index.json": outputs[' not in source
+    assert "profile_registry.get_strict_captured_replay_profile(" in source
 
 
 @pytest.mark.parametrize("poison", ["path", "sha256"])
@@ -668,7 +691,8 @@ def test_v2_scripts_use_only_profiled_lifecycle_and_generic_scorer_names() -> No
     ):
         assert api in combined
     assert "reasoning_score_call_index" not in wrapper
-    assert "strict_gym_child_runtime/format-verification-call-index.json" in wrapper
+    assert "profile.scorer_terminal_index_path" in wrapper
+    assert "strict_gym_child_runtime/format-verification-call-index.json" not in wrapper
     assert "RESULT_INVENTORY_V2_SCHEMA" in wrapper
     assert "RESULT_INVENTORY_V2_FILENAME" in wrapper
     assert '"--hold"' in launcher

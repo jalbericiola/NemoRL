@@ -1894,7 +1894,13 @@ def _validate_authenticated_result_snapshot(
     expected_driver_boot_id = hashlib.sha256((boot_id + "\n").encode("ascii")).hexdigest()
     if driver_boot_id != expected_driver_boot_id:
         _fail("authenticated result driver/scorer boot identity differs")
-    if (driver_pid, driver_start_ticks) == (scorer_pid, scorer_start_ticks):
+    if driver_pid == scorer_pid or (
+        driver_pid,
+        driver_start_ticks,
+    ) == (
+        scorer_pid,
+        scorer_start_ticks,
+    ):
         _fail("authenticated result driver/scorer process identity aliases")
 
     manifest_reference = _snapshot_artifact_reference(
@@ -2060,6 +2066,7 @@ def _validate_authenticated_result_snapshot(
             passed = details.get("passed")
             if type(passed) is not bool or passed is not (not details["missing"] and not details["spurious"]):
                 _fail(f"authenticated citation sample {index} passed differs")
+            expected_reward = 1.0 if passed else 0.0
         elif profile.environment == "freeform":
             if set(details) != {"matching_lines", "min_matches", "passed"}:
                 _fail(f"authenticated freeform sample {index} details differ")
@@ -2076,6 +2083,23 @@ def _validate_authenticated_result_snapshot(
             passed = details.get("passed")
             if type(passed) is not bool or passed is not (matching_lines >= minimum):
                 _fail(f"authenticated freeform sample {index} passed differs")
+            expected_reward = 1.0 if passed else 0.0
+        elif profile.environment == "reasoning_gym":
+            if set(details) != {"task_name", "score", "extracted_answer"}:
+                _fail(f"authenticated reasoning-gym sample {index} details differ")
+            if details.get("task_name") != "knights_knaves" or type(details.get("task_name")) is not str:
+                _fail(f"authenticated reasoning-gym sample {index} task differs")
+            score = details.get("score")
+            if (
+                type(score) is not float
+                or not math.isfinite(score)
+                or not 0.0 <= score <= 1.0
+                or (score == 0.0 and math.copysign(1.0, score) < 0.0)
+            ):
+                _fail(f"authenticated reasoning-gym sample {index} score differs")
+            if type(details.get("extracted_answer")) is not str:
+                _fail(f"authenticated reasoning-gym sample {index} extracted answer differs")
+            expected_reward = score
         else:  # pragma: no cover - the closed profile registry rejects this.
             raise AssertionError("unreachable authenticated scorer profile")
         reward = sample.get("raw_environment_reward")
@@ -2083,8 +2107,8 @@ def _validate_authenticated_result_snapshot(
             type(reward) is not float
             or not math.isfinite(reward)
             or (reward == 0.0 and math.copysign(1.0, reward) < 0.0)
-            or reward not in (0.0, 1.0)
-            or reward != (1.0 if passed else 0.0)
+            or not 0.0 <= reward <= 1.0
+            or reward != expected_reward
         ):
             _fail(f"authenticated result sample {index} reward differs")
     return snapshot

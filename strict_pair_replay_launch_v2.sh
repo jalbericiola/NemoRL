@@ -91,7 +91,7 @@ strict_replay_parse_cli() {
   [[ "${14}" == /* && "${14}" != *$'\n'* && "${14}" != *$'\r'* ]] || strict_replay_die "manifest path must be one absolute line"
   [[ "${16}" =~ ^[0-9a-f]{64}$ ]] || strict_replay_die "manifest SHA-256 is malformed"
   case "${18}:${20}" in
-    citation:citation-string-match-v1|freeform:freeform-regex-v1) ;;
+    citation:citation-string-match-v1|freeform:freeform-regex-v1|reasoning_gym:reasoning-gym-exact-match-v1) ;;
     *) strict_replay_die "environment/profile pair is not admitted" ;;
   esac
   STRICT_REPLAY_PAIR_MANIFEST_PATH="$2"
@@ -163,6 +163,7 @@ REPLAY_MANIFEST_SCHEMA = "nemo-rl-strict-captured-replay-execution-manifest-v4"
 PROFILE_IDS = {
     "citation": "citation-string-match-v1",
     "freeform": "freeform-regex-v1",
+    "reasoning_gym": "reasoning-gym-exact-match-v1",
 }
 PAIR_SCHEMA = "nemo-rl-strict-single-env-pair-v2"
 PAIR_SUBMISSION_SCHEMA = "nemo-rl-strict-pair-submission-receipt-v2"

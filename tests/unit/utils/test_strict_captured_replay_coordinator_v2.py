@@ -50,19 +50,62 @@ from nemo_rl.utils.strict_captured_replay_profiles import (
 )
 
 
+def _profile(environment: str) -> Any:
+    profile_id = _profile_id(environment)
+    if environment != "reasoning_gym":
+        return get_strict_captured_replay_profile(
+            expected_environment=environment,
+            expected_profile_id=profile_id,
+        )
+    base = get_strict_captured_replay_profile(
+        expected_environment="citation",
+        expected_profile_id="citation-string-match-v1",
+    )
+    replacements = dict(
+        environment=environment,
+        profile_id=profile_id,
+        verifier_type="score_answer",
+        method="KnightsKnavesDataset.score_answer",
+        resource_config_path_name="reasoning_gym",
+        disabled_config_path_name="reasoning_gym_simple_agent",
+        resource_app_path="resources_servers/reasoning_gym/app.py",
+        resource_app_sha256=("3a35c5d27392dae05499ceefac04e9c32ad963b51a54d77bb470ee59b1fe3127"),
+        resource_config_path=("resources_servers/reasoning_gym/configs/reasoning_gym.yaml"),
+        resource_config_sha256=("bdbb459a4a920bc47cf84b1d7dc30aeaa9be35cf0dfac09c77879e45b62a52ab"),
+        requirements_path="resources_servers/reasoning_gym/requirements.txt",
+        requirements_sha256=("b00b45db433d797d8a5c5c5602f24ab94d9d5620d83b4bef21fbee851287d411"),
+        fixture_path="tests/unit/tools/data/reasoning_gym_example.jsonl",
+        fixture_sha256=("da8ebd2b43d002ba9a6946fe458db7df8bf7e1b3068be3e2f9f014bfdd5229ce"),
+        call_schema="nemo-rl-strict-reasoning-score-call-v1",
+        closed_schema="nemo-rl-strict-reasoning-score-closed-v1",
+        call_index_schema="nemo-rl-strict-reasoning-score-call-index-v1",
+        scorer_terminal_index_path=("strict_gym_child_runtime/reasoning-score-call-index.json"),
+    )
+    if hasattr(base, "scorer_config_path_name"):
+        replacements.update(
+            scorer_config_path_name="reasoning_gym",
+            scorer_config_path=("resources_servers/reasoning_gym/configs/resources_only.yaml"),
+            scorer_config_sha256=("e11a3084f050e4c24101550f63efe71ac6c10f3bc125489ba7293cd81778de68"),
+        )
+    return replace(base, **replacements)
+
+
+def _install_profile_registry_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    def lookup(*, expected_environment: str, expected_profile_id: str) -> Any:
+        profile = _profile(expected_environment)
+        if profile.profile_id != expected_profile_id:
+            raise ValueError("unsupported strict captured-replay environment/profile pair")
+        return profile
+
+    monkeypatch.setattr(coordinator, "get_strict_captured_replay_profile", lookup)
+
+
 def _source(
     tmp_path: Path,
     *,
     environment: str = "citation",
 ) -> AuthenticatedOffSourceCapture:
-    profile_id = {
-        "citation": "citation-string-match-v1",
-        "freeform": "freeform-regex-v1",
-    }[environment]
-    profile = get_strict_captured_replay_profile(
-        expected_environment=environment,
-        expected_profile_id=profile_id,
-    )
+    profile = _profile(environment)
     results_root = tmp_path / "results"
     results_root.mkdir(mode=0o700)
     results_root.chmod(0o700)
@@ -132,6 +175,7 @@ def _profile_id(environment: str) -> str:
     return {
         "citation": "citation-string-match-v1",
         "freeform": "freeform-regex-v1",
+        "reasoning_gym": "reasoning-gym-exact-match-v1",
     }[environment]
 
 
@@ -239,6 +283,7 @@ def _authenticated_result_snapshot(
 ) -> dict[str, Any]:
     pair_id = f"pair-{environment}"
     profile_id = _profile_id(environment)
+    profile = _profile(environment)
     scorer_boot_id = "12345678-1234-1234-1234-123456789abc"
     result_root = tmp_path / "results/captured_replay/replay-1"
     manifest_path = tmp_path / f"results/captured_replay/manifests/{pair_id}/replay-1.json"
@@ -252,8 +297,8 @@ def _authenticated_result_snapshot(
 
     outputs = {
         "scorer_call_index": reference(
-            result_root / "strict_gym_child_runtime/format-verification-call-index.json",
-            "nemo-rl-strict-format-verification-call-index-v1",
+            result_root / profile.scorer_terminal_index_path,
+            profile.call_index_schema,
             "1" * 64,
         ),
         "transport_consumption": reference(
@@ -349,13 +394,21 @@ def _authenticated_result_snapshot(
                         "passed": True,
                     }
                     if environment == "citation"
-                    else {
-                        "matching_lines": 1,
-                        "min_matches": 1,
-                        "passed": True,
-                    }
+                    else (
+                        {
+                            "matching_lines": 1,
+                            "min_matches": 1,
+                            "passed": True,
+                        }
+                        if environment == "freeform"
+                        else {
+                            "task_name": "knights_knaves",
+                            "score": 0.625,
+                            "extracted_answer": "Zoey is a fool, and Riley is a sage.",
+                        }
+                    )
                 ),
-                "raw_environment_reward": 1.0,
+                "raw_environment_reward": (0.625 if environment == "reasoning_gym" else 1.0),
             }
             for index in range(4)
         ],
@@ -1226,12 +1279,13 @@ def _consume_kwargs(
     }
 
 
-@pytest.mark.parametrize("environment", ["citation", "freeform"])
+@pytest.mark.parametrize("environment", ["citation", "freeform", "reasoning_gym"])
 def test_consume_uses_external_final_loader_and_detached_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     environment: str,
 ) -> None:
+    _install_profile_registry_stub(monkeypatch)
     source = _source(tmp_path, environment=environment)
     snapshot = _authenticated_result_snapshot(tmp_path, environment=environment)
     capability = object()
@@ -1298,6 +1352,7 @@ def test_consume_uses_external_final_loader_and_detached_snapshot(
         "scorer-type",
         "boot-mismatch",
         "process-alias",
+        "pid-alias-different-start",
         "reference-schema",
         "result-root",
         "output-missing",
@@ -1342,6 +1397,9 @@ def test_consume_rejects_malformed_authenticated_snapshot_projection(
     elif poison == "process-alias":
         snapshot["scorer_process_identity"]["pid"] = snapshot["driver_process"]["pid"]
         snapshot["scorer_process_identity"]["start_ticks"] = snapshot["driver_process"]["start_time_ticks"]
+    elif poison == "pid-alias-different-start":
+        snapshot["scorer_process_identity"]["pid"] = snapshot["driver_process"]["pid"]
+        assert snapshot["scorer_process_identity"]["start_ticks"] != snapshot["driver_process"]["start_time_ticks"]
     elif poison == "reference-schema":
         snapshot["exit_receipt"]["schema"] = "synthetic-exit"
     elif poison == "result-root":
@@ -1389,6 +1447,73 @@ def test_consume_rejects_malformed_authenticated_snapshot_projection(
 
     with pytest.raises(coordinator.StrictCapturedReplayCoordinatorError):
         coordinator.consume_replay_result(**_consume_kwargs(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "poison",
+    [
+        None,
+        "task",
+        "score-int",
+        "score-negative-zero",
+        "score-out-of-range",
+        "reward-mismatch",
+        "extracted-answer-type",
+        "details-extra",
+    ],
+)
+def test_consume_validates_exact_reasoning_gym_sample_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    poison: str | None,
+) -> None:
+    environment = "reasoning_gym"
+    _install_profile_registry_stub(monkeypatch)
+    source = _source(tmp_path, environment=environment)
+    snapshot = copy.deepcopy(_authenticated_result_snapshot(tmp_path, environment=environment))
+    details = snapshot["samples"][0]["match_details"]
+    if poison == "task":
+        details["task_name"] = "relabelled_task"
+    elif poison == "score-int":
+        details["score"] = 1
+    elif poison == "score-negative-zero":
+        details["score"] = -0.0
+        snapshot["samples"][0]["raw_environment_reward"] = -0.0
+    elif poison == "score-out-of-range":
+        details["score"] = 1.125
+        snapshot["samples"][0]["raw_environment_reward"] = 1.125
+    elif poison == "reward-mismatch":
+        snapshot["samples"][0]["raw_environment_reward"] = 0.5
+    elif poison == "extracted-answer-type":
+        details["extracted_answer"] = None
+    elif poison == "details-extra":
+        details["passed"] = True
+    elif poison is not None:  # pragma: no cover - parameterization closes this set.
+        raise AssertionError("unreachable reasoning-gym poison")
+
+    capability = object()
+    monkeypatch.setattr(
+        coordinator,
+        "load_authenticated_replay_source",
+        lambda **_kwargs: source,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "load_authenticated_captured_replay_result_v2",
+        lambda **_kwargs: capability,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "snapshot_authenticated_captured_replay_result_v2",
+        lambda value: snapshot if value is capability else None,
+    )
+
+    if poison is None:
+        consumed = coordinator.consume_replay_result(**_consume_kwargs(tmp_path, environment=environment))
+        assert consumed.snapshot["samples"][0]["raw_environment_reward"] == 0.625
+    else:
+        with pytest.raises(coordinator.StrictCapturedReplayCoordinatorError):
+            coordinator.consume_replay_result(**_consume_kwargs(tmp_path, environment=environment))
 
 
 @pytest.mark.parametrize(

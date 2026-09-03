@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Authenticated executable entrypoint for citation/freeform replay V2.
+"""Authenticated executable entrypoint for profiled scorer replay V2.
 
 Only the external replay wrapper may invoke the driver phase.  This module is
 kept stdlib-only at import time: it authenticates the immutable replay manifest,
@@ -40,8 +40,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.strict_captured_replay_runtime_v2 import (
-        FinalizeFormatCallEvidence,
-        IndependentFormatCheck,
+        FinalizeScorerCallEvidence,
+        IndependentScorerCheck,
         ReplayDocumentsV2,
         StrictModelTransportReplaySourceV3,
         VerifierPost,
@@ -126,6 +126,38 @@ _FORMAT_PROFILES = {
         "closed_schema": "nemo-rl-strict-format-verification-closed-v1",
         "call_index_schema": "nemo-rl-strict-format-verification-call-index-v1",
     },
+    "reasoning_gym": {
+        "environment": "reasoning_gym",
+        "profile_id": "reasoning-gym-exact-match-v1",
+        "verifier_type": "score_answer",
+        "method": "KnightsKnavesDataset.score_answer",
+        "resource_config_path_name": "reasoning_gym",
+        "disabled_config_path_name": "reasoning_gym_simple_agent",
+        "resource_app": {
+            "path": "resources_servers/reasoning_gym/app.py",
+            "sha256": "3a35c5d27392dae05499ceefac04e9c32ad963b51a54d77bb470ee59b1fe3127",
+        },
+        "resource_config": {
+            "path": "resources_servers/reasoning_gym/configs/reasoning_gym.yaml",
+            "sha256": "bdbb459a4a920bc47cf84b1d7dc30aeaa9be35cf0dfac09c77879e45b62a52ab",
+        },
+        "requirements": {
+            "path": "resources_servers/reasoning_gym/requirements.txt",
+            "sha256": "b00b45db433d797d8a5c5c5602f24ab94d9d5620d83b4bef21fbee851287d411",
+        },
+        "fixture": {
+            "path": "tests/unit/tools/data/reasoning_gym_example.jsonl",
+            "sha256": "da8ebd2b43d002ba9a6946fe458db7df8bf7e1b3068be3e2f9f014bfdd5229ce",
+            "rows": 5,
+        },
+        "call_schema": "nemo-rl-strict-reasoning-score-call-v1",
+        "closed_schema": "nemo-rl-strict-reasoning-score-closed-v1",
+        "call_index_schema": "nemo-rl-strict-reasoning-score-call-index-v1",
+    },
+}
+_REASONING_GYM_RESOURCE_ONLY_CONFIG = {
+    "path": "resources_servers/reasoning_gym/configs/resources_only.yaml",
+    "sha256": "e11a3084f050e4c24101550f63efe71ac6c10f3bc125489ba7293cd81778de68",
 }
 _DISABLED_WANDB_POLICY = {
     "enabled": False,
@@ -517,14 +549,36 @@ def _closed_profile(
     """Return one explicitly selected stdlib-only bootstrap profile."""
     if type(expected_environment) is not str or type(expected_profile_id) is not str:
         raise StrictCapturedReplayEntrypointError(
-            "format environment/profile must be exact strings"
+            "scorer environment/profile must be exact strings"
         )
     profile = _FORMAT_PROFILES.get(expected_environment)
     if profile is None or profile.get("profile_id") != expected_profile_id:
         raise StrictCapturedReplayEntrypointError(
-            "format environment/profile pair is not admitted"
+            "scorer environment/profile pair is not admitted"
         )
     return json.loads(_canonical_ascii_json(profile).decode("ascii"))
+
+
+def _validate_scorer_terminal_identity(
+    terminal: Mapping[str, Any],
+    *,
+    expected_environment: str,
+    expected_profile_id: str,
+    expected_schema: str,
+) -> None:
+    """Validate the profile-discriminated identity of one K=4 terminal."""
+    reasoning_gym = expected_environment == "reasoning_gym"
+    if (
+        terminal.get("schema") != expected_schema
+        or terminal.get("environment") != expected_environment
+        or type(terminal.get("call_count")) is not int
+        or terminal.get("call_count") != 4
+        or (not reasoning_gym and terminal.get("profile_id") != expected_profile_id)
+        or (reasoning_gym and "profile_id" in terminal)
+    ):
+        raise StrictCapturedReplayEntrypointError(
+            "scorer-call terminal does not close the selected K=4 profile"
+        )
 
 
 def _contains_forbidden_server_type(value: Any) -> bool:
@@ -553,8 +607,8 @@ def run_from_authenticated_wrapper(
     source_main_ledger_document: Mapping[str, Any],
     transport_source: "StrictModelTransportReplaySourceV3",
     post_verifier: "VerifierPost",
-    independent_format_check: "IndependentFormatCheck | None",
-    finalize_format_call_evidence: "FinalizeFormatCallEvidence",
+    independent_scorer_check: "IndependentScorerCheck | None",
+    finalize_scorer_call_evidence: "FinalizeScorerCallEvidence",
     expected_environment: str,
     expected_profile_id: str,
 ) -> "ReplayDocumentsV2":
@@ -574,8 +628,8 @@ def run_from_authenticated_wrapper(
         source_main_ledger_document=source_main_ledger_document,
         transport_source=transport_source,
         post_verifier=post_verifier,
-        independent_format_check=independent_format_check,
-        finalize_format_call_evidence=finalize_format_call_evidence,
+        independent_scorer_check=independent_scorer_check,
+        finalize_scorer_call_evidence=finalize_scorer_call_evidence,
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
@@ -817,7 +871,7 @@ def run_profiled_replay_with_authenticated_resource_child(
     expected_environment: str,
     expected_profile_id: str,
 ) -> "ReplayDocumentsV2":
-    """Run a profile-selected format-verifier lifecycle after authentication.
+    """Run one profile-selected scorer lifecycle after authentication.
 
     Imports that can execute snapshot or Gym code occur only after the external
     wrapper's closed snapshot/program attestation is checked.  Ray must already
@@ -847,11 +901,12 @@ def run_profiled_replay_with_authenticated_resource_child(
         or manifest.get("scorer_profile") != profile
     ):
         raise StrictCapturedReplayEntrypointError(
-            "manifest differs from the explicit format-verifier profile"
+            "manifest differs from the explicit scorer profile"
         )
     from nemo_rl.algorithms.strict_captured_replay_runtime_v2 import (
         StrictCapturedReplayError,
         post_resource_verify,
+        reasoning_gym_score_call_material,
     )
 
     execution_source_root = _canonical_absolute_path(
@@ -909,6 +964,24 @@ def run_profiled_replay_with_authenticated_resource_child(
         program=program,
         required_program_names=_DRIVER_RUNTIME_REQUIRED_PROGRAM_NAMES,
     )
+    from nemo_rl.utils.strict_captured_replay_profiles import (
+        get_strict_captured_replay_profile,
+    )
+
+    registered_profile = get_strict_captured_replay_profile(
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    terminal_relative = PurePosixPath(registered_profile.scorer_terminal_index_path)
+    if (
+        registered_profile.call_index_schema != profile["call_index_schema"]
+        or terminal_relative.is_absolute()
+        or terminal_relative.parent != PurePosixPath("strict_gym_child_runtime")
+        or terminal_relative.name in {"", ".", ".."}
+    ):
+        raise StrictCapturedReplayError(
+            "registered scorer terminal differs from the authenticated profile"
+        )
 
     if not ray.is_initialized():
         raise StrictCapturedReplayError(
@@ -1028,32 +1101,50 @@ def run_profiled_replay_with_authenticated_resource_child(
                 derived_verifier_request=request,
             )
 
-        def independent_format_check(
+        def independent_scorer_check(
             rollout_index: int,
             request: Mapping[str, Any],
             response: Mapping[str, Any],
         ) -> None:
             if rollout_index != len(expected_calls):
                 raise StrictCapturedReplayError(
-                    "format-verifier calls are not in logical rollout order"
+                    "scorer calls are not in logical rollout order"
                 )
-            expectation = child_runtime.format_verification_call_expectation(
-                environment=expected_environment,
-                derived_verifier_request=request,
-                verifier_response=response,
-            )
-            if expectation.get("profile_id") != expected_profile_id:
-                raise StrictCapturedReplayError(
-                    "independent format expectation differs from selected profile"
+            if expected_environment == "reasoning_gym":
+                material = reasoning_gym_score_call_material(
+                    derived_verifier_request=request,
+                    verifier_response=response,
                 )
+                expectation = child_runtime.reasoning_score_call_expectation(
+                    task_name=material["task_name"],
+                    answer=material["answer"],
+                    entry=material["entry"],
+                    float_result=material["float_result"],
+                )
+            else:
+                expectation = child_runtime.format_verification_call_expectation(
+                    environment=expected_environment,
+                    derived_verifier_request=request,
+                    verifier_response=response,
+                )
+                if expectation.get("profile_id") != expected_profile_id:
+                    raise StrictCapturedReplayError(
+                        "independent format expectation differs from selected profile"
+                    )
             expected_calls.append(expectation)
 
-        def finalize_format_call_evidence() -> Mapping[str, Any]:
+        def finalize_scorer_call_evidence() -> Mapping[str, Any]:
             nonlocal run_helper_closed
-            terminal, digest = session.finalize_format_verification_calls(
-                expected_calls,
-                run_helper=run_helper,
-            )
+            if expected_environment == "reasoning_gym":
+                terminal, digest = session.finalize_score_calls(
+                    expected_calls,
+                    run_helper=run_helper,
+                )
+            else:
+                terminal, digest = session.finalize_format_verification_calls(
+                    expected_calls,
+                    run_helper=run_helper,
+                )
             run_helper_closed = True
             declared = _required_mapping(
                 _required_mapping(
@@ -1064,7 +1155,7 @@ def run_profiled_replay_with_authenticated_resource_child(
                 ).get("scorer_call_index"),
                 "artifacts.outputs.scorer_call_index",
             )
-            expected_path = session.receipt_root / "format-verification-call-index.json"
+            expected_path = session.receipt_root / terminal_relative.name
             if (
                 set(declared) != {"path", "schema", "framing", "mode"}
                 or declared.get("path") != str(expected_path)
@@ -1073,17 +1164,14 @@ def run_profiled_replay_with_authenticated_resource_child(
                 or declared.get("mode") != "0400"
             ):
                 raise StrictCapturedReplayError(
-                    "format call terminal path is not manifest-declared"
+                    "scorer-call terminal path is not manifest-declared"
                 )
-            if (
-                terminal.get("environment") != expected_environment
-                or terminal.get("profile_id") != expected_profile_id
-                or type(terminal.get("call_count")) is not int
-                or terminal.get("call_count") != 4
-            ):
-                raise StrictCapturedReplayError(
-                    "format call terminal does not close the selected K=4 profile"
-                )
+            _validate_scorer_terminal_identity(
+                terminal,
+                expected_environment=expected_environment,
+                expected_profile_id=expected_profile_id,
+                expected_schema=registered_profile.call_index_schema,
+            )
             return {
                 "path": str(expected_path),
                 "schema": profile["call_index_schema"],
@@ -1101,8 +1189,8 @@ def run_profiled_replay_with_authenticated_resource_child(
             source_main_ledger_document=source_main_ledger_document,
             transport_source=transport_source,
             post_verifier=post_verifier,
-            independent_format_check=independent_format_check,
-            finalize_format_call_evidence=finalize_format_call_evidence,
+            independent_scorer_check=independent_scorer_check,
+            finalize_scorer_call_evidence=finalize_scorer_call_evidence,
             expected_environment=expected_environment,
             expected_profile_id=expected_profile_id,
         )
@@ -1241,7 +1329,7 @@ def _run_authenticated_driver(authority: _BootstrapAuthority) -> None:
             )
         ray.init(ignore_reinit_error=False, include_dashboard=False)
         ray_started = True
-        parser_config = _build_format_resource_only_parser_config(
+        parser_config = _build_profiled_resource_only_parser_config(
             manifest=manifest,
             execution_source_root=authority.execution_source_root,
             ray_module=ray,
@@ -1309,7 +1397,7 @@ def _run_authenticated_driver(authority: _BootstrapAuthority) -> None:
             ray.shutdown()
 
 
-def _build_format_resource_only_parser_config(
+def _build_profiled_resource_only_parser_config(
     *,
     manifest: Mapping[str, Any],
     execution_source_root: Path,
@@ -1317,7 +1405,7 @@ def _build_format_resource_only_parser_config(
     expected_environment: str,
     expected_profile_id: str,
 ) -> Any:
-    """Reduce one authenticated format YAML to one resource and no agents."""
+    """Reduce one authenticated scorer YAML to one resource and no agents."""
     from nemo_gym import PARENT_DIR
     from nemo_gym.cli import GlobalConfigDictParserConfig
     from nemo_gym.global_config import (
@@ -1338,31 +1426,48 @@ def _build_format_resource_only_parser_config(
     contract = _required_mapping(manifest.get("replay_contract"), "replay_contract")
     scorer = _required_mapping(contract.get("gym_scorer"), "gym_scorer")
     launcher = _required_mapping(scorer.get("launcher"), "gym_scorer.launcher")
-    if (
-        launcher.get("log_wrapper") != "forbidden"
-        or "log_wrapper_template" in launcher
-        or launcher.get("resource_only_config") is not None
-        or launcher.get("config_path_name") != profile["resource_config_path_name"]
-    ):
-        raise StrictCapturedReplayEntrypointError(
-            "replay scorer must disable the Gym Bash/tee log wrapper"
-        )
+    runtime = _required_mapping(scorer.get("runtime"), "gym_scorer.runtime")
     resources = _required_mapping(scorer.get("resources"), "gym_scorer.resources")
     config_reference = _required_mapping(
         resources.get("config"),
         "gym_scorer.resources.config",
     )
+    selected_config = _required_mapping(
+        runtime.get("selected_resource_config"),
+        "gym_scorer.runtime.selected_resource_config",
+    )
     if (
         set(config_reference) != {"path", "sha256"}
         or dict(config_reference) != profile["resource_config"]
+        or set(selected_config) != {"path", "sha256"}
     ):
         raise StrictCapturedReplayEntrypointError(
-            "selected format Gym config differs from closed profile"
+            "scorer Gym config differs from the closed profile"
         )
-    relative = profile["resource_config"]["path"]
+    reasoning_gym = expected_environment == "reasoning_gym"
+    expected_selected_config = (
+        _REASONING_GYM_RESOURCE_ONLY_CONFIG
+        if reasoning_gym
+        else profile["resource_config"]
+    )
+    expected_launcher_config_name = profile["resource_config_path_name"]
+    expected_resource_only_config = (
+        _REASONING_GYM_RESOURCE_ONLY_CONFIG if reasoning_gym else None
+    )
+    if (
+        launcher.get("log_wrapper") != "forbidden"
+        or "log_wrapper_template" in launcher
+        or launcher.get("resource_only_config") != expected_resource_only_config
+        or launcher.get("config_path_name") != expected_launcher_config_name
+        or dict(selected_config) != expected_selected_config
+    ):
+        raise StrictCapturedReplayEntrypointError(
+            "replay scorer effective config/launcher policy differs"
+        )
+    relative = selected_config["path"]
     expected_digest = _digest(
-        profile["resource_config"]["sha256"],
-        "selected format Gym config SHA-256",
+        selected_config["sha256"],
+        "selected scorer Gym config SHA-256",
     )
     gym_root = execution_source_root / _GYM_SOURCE_RELATIVE
     imported_gym_root = Path(PARENT_DIR).resolve(strict=True)
@@ -1372,15 +1477,15 @@ def _build_format_resource_only_parser_config(
         )
     config_path = gym_root / relative
     if (
-        _stable_regular_sha256(config_path, name="selected format Gym config")
+        _stable_regular_sha256(config_path, name="selected scorer Gym config")
         != expected_digest
     ):
         raise StrictCapturedReplayEntrypointError(
-            "selected format Gym config differs from replay manifest"
+            "selected scorer Gym config differs from replay manifest"
         )
     if maybe_get_global_config_dict() is not None:
         raise StrictCapturedReplayEntrypointError(
-            "NeMo-Gym config was initialized before format-profile reduction"
+            "NeMo-Gym config was initialized before scorer-profile reduction"
         )
 
     context = ray_module.get_runtime_context()
@@ -1391,12 +1496,19 @@ def _build_format_resource_only_parser_config(
         )
     attempt_environment = manifest["execution_environment"]["attempt"]
     output_root = manifest["artifacts"]["outputs"]["directory"]["path"]
+    reduction = (
+        {}
+        if reasoning_gym
+        else {
+            profile["disabled_config_path_name"]: {
+                "_delete_key": "responses_api_agents"
+            }
+        }
+    )
     initial = DictConfig(
         {
             "config_paths": [str(config_path)],
-            profile["disabled_config_path_name"]: {
-                "_delete_key": "responses_api_agents",
-            },
+            **reduction,
             "default_host": "127.0.0.1",
             "head_server": {"host": "127.0.0.1", "port": 11000},
             "port_range_low": 5000,
@@ -1419,12 +1531,12 @@ def _build_format_resource_only_parser_config(
     resolved = get_global_config_dict(global_config_dict_parser_config=parser_config)
     if (
         _stable_regular_sha256(
-            config_path, name="post-parse selected format Gym config"
+            config_path, name="post-parse selected scorer Gym config"
         )
         != expected_digest
     ):
         raise StrictCapturedReplayEntrypointError(
-            "selected format Gym config changed while Gym parsed it"
+            "selected scorer Gym config changed while Gym parsed it"
         )
     if "nemo_gym_log_dir" in resolved:
         raise StrictCapturedReplayEntrypointError(
@@ -1439,17 +1551,18 @@ def _build_format_resource_only_parser_config(
         for name, value in resolved.items()
         if name not in NEMO_GYM_RESERVED_TOP_LEVEL_KEYS
     }
-    admitted_names = {
-        profile["resource_config_path_name"],
-        profile["disabled_config_path_name"],
-    }
+    admitted_names = {profile["resource_config_path_name"]}
+    if not reasoning_gym:
+        admitted_names.add(profile["disabled_config_path_name"])
     if set(nonreserved) != admitted_names:
         raise StrictCapturedReplayEntrypointError(
             "reduced Gym config top-level roster differs"
         )
-    disabled = nonreserved[profile["disabled_config_path_name"]]
+    disabled = nonreserved.get(profile["disabled_config_path_name"])
     resource = nonreserved[profile["resource_config_path_name"]]
-    if not isinstance(disabled, Mapping) or dict(disabled) != {}:
+    if not reasoning_gym and (
+        not isinstance(disabled, Mapping) or dict(disabled) != {}
+    ):
         raise StrictCapturedReplayEntrypointError(
             "selected simple-agent branch survived _delete_key reduction"
         )
@@ -1458,11 +1571,12 @@ def _build_format_resource_only_parser_config(
             "reduced Gym config contains a non-resource server type"
         )
     by_name = resource["resources_servers"]
+    expected_resource_name = "reasoning_gym" if reasoning_gym else "format_verification"
     if (
         not isinstance(by_name, Mapping)
-        or set(by_name) != {"format_verification"}
-        or not isinstance(by_name["format_verification"], Mapping)
-        or by_name["format_verification"].get("entrypoint") != "app.py"
+        or set(by_name) != {expected_resource_name}
+        or not isinstance(by_name[expected_resource_name], Mapping)
+        or by_name[expected_resource_name].get("entrypoint") != "app.py"
     ):
         raise StrictCapturedReplayEntrypointError(
             "reduced Gym config resource roster differs"
@@ -1609,7 +1723,7 @@ def _authenticate_before_repo_imports(
         or _PAIR_ID_RE.fullmatch(manifest["pair_id"]) is None
     ):
         raise StrictCapturedReplayEntrypointError(
-            "replay execution manifest is not the selected format-profile envelope"
+            "replay execution manifest is not the selected scorer-profile envelope"
         )
     if manifest.get("wandb") != _DISABLED_WANDB_POLICY:
         raise StrictCapturedReplayEntrypointError(
@@ -3107,9 +3221,7 @@ def _authenticate_nested_gym_source(
         "verifier_source": profile["resource_app"]["sha256"],
     }
     if set(pair_resources) != set(expected_resource_paths):
-        raise StrictCapturedReplayEntrypointError(
-            "Pair format-verifier resource keyset differs"
-        )
+        raise StrictCapturedReplayEntrypointError("Pair scorer resource keyset differs")
     for name, expected_path in expected_resource_paths.items():
         reference = _required_mapping(
             pair_resources.get(name), f"Pair Gym resource {name}"
@@ -3127,12 +3239,33 @@ def _authenticate_nested_gym_source(
             )
 
     launcher = _required_mapping(scorer.get("launcher"), "gym_scorer.launcher")
+    runtime = _required_mapping(scorer.get("runtime"), "gym_scorer.runtime")
+    selected_resource_config = _required_mapping(
+        runtime.get("selected_resource_config"),
+        "gym_scorer.runtime.selected_resource_config",
+    )
+    reasoning_gym = profile["environment"] == "reasoning_gym"
+    expected_effective_config = (
+        _REASONING_GYM_RESOURCE_ONLY_CONFIG
+        if reasoning_gym
+        else profile["resource_config"]
+    )
     if (
-        launcher.get("resource_only_config") is not None
+        launcher.get("resource_only_config")
+        != (_REASONING_GYM_RESOURCE_ONLY_CONFIG if reasoning_gym else None)
         or launcher.get("config_path_name") != profile["resource_config_path_name"]
+        or dict(selected_resource_config) != expected_effective_config
     ):
         raise StrictCapturedReplayEntrypointError(
-            "format replay launcher/config reduction contract differs"
+            "scorer replay launcher/config reduction contract differs"
+        )
+    effective_relative = f"{_GYM_SOURCE_RELATIVE}/{expected_effective_config['path']}"
+    if snapshot_manifest.get(effective_relative) != _digest(
+        expected_effective_config["sha256"],
+        "effective scorer Gym config SHA-256",
+    ):
+        raise StrictCapturedReplayEntrypointError(
+            "Pair ON snapshot effective scorer Gym config differs"
         )
 
 
