@@ -43,8 +43,9 @@ strict_replay_reject_startup_controls() {
 
 strict_replay_bind_executed_script() {
   local invoked="${BASH_SOURCE[0]}"
-  [[ "${invoked}" == /* && -f "${invoked}" && ! -L "${invoked}" ]] || \
-    strict_replay_die "replay wrapper must be invoked by absolute non-symlink path"
+  [[ "${invoked}" =~ ^/cm/local/apps/slurm/var/spool/job[0-9]+/slurm_script$ && \
+     -f "${invoked}" && ! -L "${invoked}" ]] || \
+    strict_replay_die "replay wrapper must be invoked from the HSG Slurmd spool"
   STRICT_REPLAY_EXECUTED_SCRIPT_PATH="${invoked}"
   export STRICT_REPLAY_EXECUTED_SCRIPT_PATH
 }
@@ -115,8 +116,8 @@ strict_replay_parse_cli() {
 
 strict_replay_main() {
   strict_replay_reject_startup_controls
-  strict_replay_bind_executed_script
   strict_replay_parse_cli "$@"
+  strict_replay_bind_executed_script
   strict_replay_require_env SLURM_JOB_ID
   strict_replay_bootstrap_runtime
   exec "${STRICT_REPLAY_PYTHON}" -I -S -B - \
@@ -139,14 +140,19 @@ strict_replay_main() {
 import hashlib
 import importlib
 import importlib.util
+import fcntl
 import json
 import math
 import os
 import posixpath
 import re
+import selectors
+import signal
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 import types
 from pathlib import Path
 from typing import Any, Optional
@@ -156,6 +162,16 @@ if sys.flags.no_site != 1:
 
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 JOB_ID_RE = re.compile(r"[1-9][0-9]*\Z")
+SLURMD_SPOOL_ROOT = Path("/cm/local/apps/slurm/var/spool")
+RETAINED_ENTRYPOINT_BOOTSTRAP = (
+    "import hashlib,sys;"
+    "p=sys.argv[1];d=sys.argv[2];r=sys.stdin.buffer.read(67108865);"
+    "len(r)<=67108864 or (_ for _ in ()).throw(SystemExit('entrypoint too large'));"
+    "hashlib.sha256(r).hexdigest()==d or (_ for _ in ()).throw(SystemExit('entrypoint digest differs'));"
+    "sys.argv=[p,*sys.argv[3:]];"
+    "g={'__name__':'__main__','__file__':p,'__package__':None,'__cached__':None};"
+    "exec(compile(r,p,'exec'),g,g)"
+)
 MAX_INT63 = (1 << 63) - 1
 SNAPSHOT_SHA_MANIFEST = "strict-pair-snapshot-manifest.sha256"
 REPLAY_MANIFEST_SCHEMA = "nemo-rl-strict-captured-replay-execution-manifest-v4"
@@ -255,7 +271,12 @@ def canonical_absolute_path(value: Any, label: str) -> Path:
 
 
 def _read_stable(path: Path, *, label: str, exact_mode: Optional[int], max_bytes: int, owner: str, allow_empty: bool = False) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         before = path.lstat()
     except OSError as error:
@@ -268,6 +289,14 @@ def _read_stable(path: Path, *, label: str, exact_mode: Optional[int], max_bytes
             fail(f"{label} is not one immutable regular file")
         if before.st_uid != os.geteuid():
             fail(f"{label} owner differs from EUID-owned evidence contract")
+    elif owner == "slurm_spool":
+        if (
+            before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or before.st_gid != 0
+            or mode != 0o700
+        ):
+            fail(f"{label} differs from the HSG Slurmd spool file contract")
     elif owner == "host_file":
         if before.st_uid not in {0, os.geteuid()}:
             fail(f"{label} owner differs from authenticated host-file policy")
@@ -364,6 +393,94 @@ def stable_authenticated_host_file_bytes(path: Path, *, label: str, expected_sha
     return raw
 
 
+def stable_slurm_spool_wrapper_bytes(path: Path, *, job_id: str) -> bytes:
+    # Post-start controller-to-compute copy attestation.  The authenticated Pair
+    # explicitly excludes malicious same-UID active mutation, which stock Slurm's
+    # EUID-owned mode-0700 spool script cannot prevent before Bash starts.
+    expected = SLURMD_SPOOL_ROOT / f"job{int(job_id, 10):05d}" / "slurm_script"
+    if path != expected:
+        fail("executed wrapper path differs from the authenticated HSG Slurmd spool path")
+    parent_before = path.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_before.st_mode)
+        or parent_before.st_uid != 0
+        or parent_before.st_gid != os.getgid()
+        or stat.S_IMODE(parent_before.st_mode) != 0o750
+        or parent_before.st_nlink != 2
+    ):
+        fail("executed wrapper parent differs from the HSG Slurmd spool directory contract")
+    raw = _read_stable(
+        path,
+        label="executed Slurmd wrapper",
+        exact_mode=0o700,
+        max_bytes=64 * 1024 * 1024,
+        owner="slurm_spool",
+    )
+    parent_after = path.parent.lstat()
+    fingerprint = lambda metadata: (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+    if fingerprint(parent_before) != fingerprint(parent_after):
+        fail("executed wrapper parent changed during stable read")
+    return raw
+
+
+def anonymous_immutable_input(payload: bytes, *, label: str) -> int:
+    if type(payload) is not bytes or not 1 <= len(payload) <= 64 * 1024 * 1024:
+        fail(f"{label} retained bytes violate size/type bounds")
+    if hasattr(os, "memfd_create") and hasattr(os, "MFD_ALLOW_SEALING"):
+        descriptor = os.memfd_create(
+            "nemo-rl-strict-replay-entrypoint",
+            flags=os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+        )
+        seal = True
+    else:
+        descriptor, candidate = tempfile.mkstemp(prefix="nemo-rl-strict-entrypoint-")
+        os.unlink(candidate)
+        seal = False
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                fail(f"{label} anonymous input write made no progress")
+            offset += written
+        os.fchmod(descriptor, 0o400)
+        os.fsync(descriptor)
+        if seal:
+            required_seals = (
+                fcntl.F_SEAL_SEAL
+                | fcntl.F_SEAL_SHRINK
+                | fcntl.F_SEAL_GROW
+                | fcntl.F_SEAL_WRITE
+            )
+            fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, required_seals)
+            if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & required_seals != required_seals:
+                fail(f"{label} anonymous input seals differ")
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 0
+            or metadata.st_size != len(payload)
+            or os.pread(descriptor, len(payload), 0) != payload
+        ):
+            fail(f"{label} anonymous input differs from authenticated bytes")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def stable_container_image_sha256(
     path: Path,
     *,
@@ -386,7 +503,12 @@ def stable_container_image_sha256(
     if effective_uid == 0 or effective_uid == expected_owner_uid:
         fail(f"{label} publisher must be foreign to the replay process")
     path = canonical_absolute_path(str(path), f"{label} path")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         before = os.lstat(path)
     except OSError as error:
@@ -866,6 +988,89 @@ def scheduler_env(client_environment: dict[str, Any]) -> dict[str, str]:
     return {"LC_ALL": "C", "SLURM_CONF": slurm_conf["path"]}
 
 
+def run_bounded_process(
+    argv: list[str],
+    *,
+    env: dict[str, str],
+    cwd: Path,
+    timeout_seconds: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    stdin_descriptor: Optional[int] = None,
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.Popen(
+        argv,
+        stdin=(subprocess.DEVNULL if stdin_descriptor is None else stdin_descriptor),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=str(cwd),
+        close_fds=True,
+        start_new_session=True,
+    )
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        process.wait()
+        fail("bounded wrapper process pipes were not created")
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    streams = {
+        process.stdout.fileno(): (process.stdout, stdout_limit, stdout_buffer),
+        process.stderr.fileno(): (process.stderr, stderr_limit, stderr_buffer),
+    }
+    selector = selectors.DefaultSelector()
+    for descriptor, (stream, _limit, _buffer) in streams.items():
+        os.set_blocking(descriptor, False)
+        selector.register(stream, selectors.EVENT_READ, descriptor)
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("wrapper subprocess exceeded its execution deadline")
+            events = selector.select(remaining)
+            if not events:
+                fail("wrapper subprocess exceeded its execution deadline")
+            for key, _mask in events:
+                descriptor = key.data
+                stream, limit, buffer = streams[descriptor]
+                chunk = os.read(descriptor, min(64 * 1024, limit + 1 - len(buffer)))
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffer.extend(chunk)
+                if len(buffer) > limit:
+                    fail("wrapper subprocess output exceeded its strict bound")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail("wrapper subprocess exceeded its execution deadline")
+        returncode = process.wait(timeout=remaining)
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+    return subprocess.CompletedProcess(
+        argv,
+        returncode,
+        stdout=bytes(stdout_buffer),
+        stderr=bytes(stderr_buffer),
+    )
+
+
 def run_scheduler_command(
     argv: list[str],
     *,
@@ -874,15 +1079,13 @@ def run_scheduler_command(
     label: str,
 ) -> subprocess.CompletedProcess[bytes]:
     verify_scheduler_client_environment(client_environment)
-    completed = subprocess.run(
+    completed = run_bounded_process(
         argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=30,
         env=env,
-        cwd=str(snapshot_root),
+        cwd=Path("/"),
+        timeout_seconds=30.0,
+        stdout_limit=64 * 1024 * 1024,
+        stderr_limit=64 * 1024,
     )
     if completed.returncode != 0:
         fail(f"{label} exited {completed.returncode}: {completed.stderr.decode('utf-8', 'replace')}")
@@ -985,18 +1188,35 @@ def run_driver(*, manifest: dict[str, Any], pair_manifest: dict[str, Any], pre_r
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
+    entrypoint_path = entrypoint_argv[0]
+    retained_tail = entrypoint_argv[1:]
+    retained_entrypoint_fd = anonymous_immutable_input(
+        runner_raw,
+        label="authenticated replay entrypoint",
+    )
     if sys.platform == "darwin":
-        argv = [str(host_python_path), "-I", "-B", *entrypoint_argv]
-        return subprocess.run(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=120,
-            cwd=str(snapshot_root),
-            env=driver_env,
-        )
+        argv = [
+            str(host_python_path),
+            "-I",
+            "-B",
+            "-c",
+            RETAINED_ENTRYPOINT_BOOTSTRAP,
+            entrypoint_path,
+            runner_sha256,
+            *retained_tail,
+        ]
+        try:
+            return run_bounded_process(
+                argv,
+                cwd=Path("/"),
+                env=driver_env,
+                timeout_seconds=120.0,
+                stdout_limit=64 * 1024 * 1024,
+                stderr_limit=64 * 1024 * 1024,
+                stdin_descriptor=retained_entrypoint_fd,
+            )
+        finally:
+            os.close(retained_entrypoint_fd)
     stable_tool_bytes(LINUX_SRUN_PATH, label="srun", expected_sha256=LINUX_SRUN_SHA256)
     container_python = manifest["runtime_tools"]["document"]["container"]["python"]["path"]
     container_reference = manifest["replay_contract"]["gym_scorer"]["container"]
@@ -1023,7 +1243,11 @@ def run_driver(*, manifest: dict[str, Any], pair_manifest: dict[str, Any], pre_r
         container_python,
         "-I",
         "-B",
-        *entrypoint_argv,
+        "-c",
+        RETAINED_ENTRYPOINT_BOOTSTRAP,
+        entrypoint_path,
+        runner_sha256,
+        *retained_tail,
     ]
     stable_container_image_sha256(
         container_image,
@@ -1033,16 +1257,18 @@ def run_driver(*, manifest: dict[str, Any], pair_manifest: dict[str, Any], pre_r
         expected_owner_gid=container_reference["owner_gid"],
     )
     verify_scheduler_client_environment(client_environment)
-    completed = subprocess.run(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=1800,
-        cwd=str(snapshot_root),
-        env=submission_env,
-    )
+    try:
+        completed = run_bounded_process(
+            argv,
+            cwd=Path("/"),
+            env=submission_env,
+            timeout_seconds=1800.0,
+            stdout_limit=64 * 1024 * 1024,
+            stderr_limit=64 * 1024 * 1024,
+            stdin_descriptor=retained_entrypoint_fd,
+        )
+    finally:
+        os.close(retained_entrypoint_fd)
     stable_container_image_sha256(
         container_image,
         label="authenticated replay container image after srun",
@@ -1064,14 +1290,13 @@ def observed_hardware() -> dict[str, Any]:
         label="authenticated nvidia-smi",
         expected_sha256=tool_sha,
     )
-    result = subprocess.run(
+    result = run_bounded_process(
         [str(tool_path), "--query-gpu=name,driver_version", "--format=csv,noheader"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=30,
         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        cwd=Path("/"),
+        timeout_seconds=30.0,
+        stdout_limit=1024 * 1024,
+        stderr_limit=64 * 1024,
     )
     if result.returncode != 0 or result.stderr not in {b"", None}:
         fail("nvidia-smi query failed")
@@ -1162,6 +1387,10 @@ expected_profile_id = sys.argv[11]
 if PROFILE_IDS.get(expected_environment) != expected_profile_id:
     fail("explicit environment/profile pair is not admitted")
 live_job_id = parse_job_id(sys.argv[12], label="SLURM_JOB_ID")
+executed_wrapper_raw = stable_slurm_spool_wrapper_bytes(
+    executed_script,
+    job_id=live_job_id,
+)
 sha_tool_path = canonical_absolute_path(sys.argv[13], "bootstrap sha256sum path")
 sha_tool_sha256 = sys.argv[14]
 host_python_path = canonical_absolute_path(sys.argv[15], "bootstrap Python path")
@@ -1244,11 +1473,12 @@ authenticated_programs = authenticate_program_closure(
     executable_name="job_wrapper",
 )
 wrapper_path, wrapper_sha256, wrapper_raw = authenticated_programs["job_wrapper"]
-if executed_script != wrapper_path:
-    fail("executed wrapper path differs from authenticated Pair ON wrapper")
-if hashlib.sha256(stable_evidence_bytes(executed_script, label="executed wrapper bytes", exact_mode=None)).hexdigest() != wrapper_sha256:
+if (
+    executed_wrapper_raw != wrapper_raw
+    or hashlib.sha256(executed_wrapper_raw).hexdigest() != wrapper_sha256
+):
     fail("executed wrapper bytes differ from authenticated Pair ON wrapper")
-runner_path, _, runner_raw = authenticated_programs["entrypoint"]
+runner_path, runner_sha256, runner_raw = authenticated_programs["entrypoint"]
 manifest_utility_path, _, manifest_utility_raw = authenticated_programs[
     "manifest_utility"
 ]
@@ -1352,6 +1582,7 @@ post_raw_path = queries_dir / "POST.scontrol.raw"
 post_query_path = queries_dir / "POST.scontrol-query.json"
 pre_receipt_path = receipts_dir / "PRE.json"
 exit_receipt_path = receipts_dir / "EXIT.json"
+final_receipt_path = receipts_dir / "FINAL.json"
 evidence_index_path = canonical_absolute_path(manifest["artifacts"]["outputs"]["evidence_index"]["path"], "replay evidence index path")
 output_root = canonical_absolute_path(manifest["artifacts"]["outputs"]["directory"]["path"], "replay output root")
 ensure_private_directory(queries_dir)
@@ -1363,6 +1594,7 @@ for path, label in (
     (post_query_path, "POST scheduler query"),
     (pre_receipt_path, "PRE receipt"),
     (exit_receipt_path, "EXIT receipt"),
+    (final_receipt_path, "FINAL receipt"),
     (evidence_index_path, "evidence index"),
     (
         canonical_absolute_path(
@@ -1598,7 +1830,11 @@ if {record["path"] for record in result_inventory_declaration["anchors"]} != set
     anchored_sha256
 ):
     fail("replay result inventory anchor set differs")
-result_inventory_path, result_inventory_sha = result_sealer.publish_sealed_result_v2(
+(
+    result_inventory_path,
+    result_inventory_sha,
+    verified_result,
+) = result_sealer.publish_sealed_result_v2_with_authority(
     result_root=str(output_root),
     anchored_sha256=anchored_sha256,
     expected_environment=expected_environment,
@@ -1606,6 +1842,34 @@ result_inventory_path, result_inventory_sha = result_sealer.publish_sealed_resul
 )
 if result_inventory_path != str(expected_result_inventory_path):
     fail("sealed result inventory path differs from manifest")
+final_document = evidence_utility.build_captured_replay_result_final_receipt_v2(
+    replay_execution_manifest=manifest,
+    authenticated_source=authenticated_source,
+    expected_environment=expected_environment,
+    expected_profile_id=expected_profile_id,
+    submission_receipt=submission_document,
+    pre_receipt=pre_document,
+    exit_receipt=exit_document,
+    evidence_index=evidence_index_document,
+    verified_result=verified_result,
+)
+published_final_path, final_receipt_sha = (
+    evidence_utility.publish_captured_replay_result_final_receipt_v2(
+        output=final_receipt_path,
+        document=final_document,
+        replay_execution_manifest=manifest,
+        authenticated_source=authenticated_source,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+        submission_receipt=submission_document,
+        pre_receipt=pre_document,
+        exit_receipt=exit_document,
+        evidence_index=evidence_index_document,
+        verified_result=verified_result,
+    )
+)
+if published_final_path != final_receipt_path:
+    fail("published FINAL receipt path differs from authenticated job receipt root")
 print(
     json.dumps(
         {
@@ -1617,6 +1881,8 @@ print(
             "evidence_index_sha256": evidence_index_sha,
             "result_inventory_path": result_inventory_path,
             "result_inventory_sha256": result_inventory_sha,
+            "final_receipt_path": str(published_final_path),
+            "final_receipt_sha256": final_receipt_sha,
         },
         sort_keys=True,
         separators=(",", ":"),

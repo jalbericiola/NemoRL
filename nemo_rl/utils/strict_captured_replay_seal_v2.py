@@ -98,12 +98,9 @@ RESULT_ANCHOR_ALLOWLIST = frozenset(
 
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _DIRECTORY_FLAGS = (
-    os.O_RDONLY
-    | getattr(os, "O_DIRECTORY", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
-    | getattr(os, "O_CLOEXEC", 0)
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 )
-_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 _MAX_FILE_BYTES = 256 * 1024 * 1024
 _MAX_INVENTORY_BYTES = 128 * 1024
 _MAX_RESULT_BYTES = 512 * 1024 * 1024
@@ -153,9 +150,7 @@ class VerifiedSealedResultV1:
             "_VerifiedSealedResultV1__inventory_sha256",
             inventory_sha256,
         )
-        object.__setattr__(
-            self, "_VerifiedSealedResultV1__inventory_raw", inventory_raw
-        )
+        object.__setattr__(self, "_VerifiedSealedResultV1__inventory_raw", inventory_raw)
         object.__setattr__(self, "_VerifiedSealedResultV1__files", files)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -191,9 +186,7 @@ class VerifiedSealedResultV2:
         files: tuple[tuple[str, bytes], ...],
     ) -> None:
         if _mint_token is not _VERIFIED_RESULT_V2_MINT_TOKEN:
-            _fail(
-                "verified profiled sealed-result authority may only be minted by verifier"
-            )
+            _fail("verified profiled sealed-result authority may only be minted by verifier")
         object.__setattr__(self, "_VerifiedSealedResultV2__mint_token", _mint_token)
         object.__setattr__(self, "_VerifiedSealedResultV2__result_root", result_root)
         object.__setattr__(
@@ -203,9 +196,7 @@ class VerifiedSealedResultV2:
         )
         object.__setattr__(self, "_VerifiedSealedResultV2__environment", environment)
         object.__setattr__(self, "_VerifiedSealedResultV2__profile_id", profile_id)
-        object.__setattr__(
-            self, "_VerifiedSealedResultV2__inventory_raw", inventory_raw
-        )
+        object.__setattr__(self, "_VerifiedSealedResultV2__inventory_raw", inventory_raw)
         object.__setattr__(self, "_VerifiedSealedResultV2__files", files)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -230,11 +221,7 @@ def _canonical_absolute(value: Any, *, name: str) -> str:
 
 
 def _digest(value: Any, *, name: str) -> str:
-    if (
-        type(value) is not str
-        or _DIGEST_RE.fullmatch(value) is None
-        or value == "0" * 64
-    ):
+    if type(value) is not str or _DIGEST_RE.fullmatch(value) is None or value == "0" * 64:
         _fail(f"{name} must be one nonzero lowercase SHA-256")
     return value
 
@@ -253,6 +240,15 @@ def _fingerprint(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+    )
+
+
 def _open_absolute_directory(path: str) -> int:
     canonical = _canonical_absolute(path, name="result root")
     descriptor = os.open("/", _DIRECTORY_FLAGS)
@@ -267,9 +263,7 @@ def _open_absolute_directory(path: str) -> int:
     return descriptor
 
 
-def _require_directory(
-    descriptor: int, *, name: str, exact_mode: int
-) -> os.stat_result:
+def _require_directory(descriptor: int, *, name: str, exact_mode: int) -> os.stat_result:
     metadata = os.fstat(descriptor)
     if (
         not stat.S_ISDIR(metadata.st_mode)
@@ -287,14 +281,7 @@ def _entry_names(descriptor: int) -> frozenset[str]:
             names = [entry.name for entry in entries]
     except OSError as error:
         _fail(f"cannot enumerate result directory: {error}")
-    if any(
-        type(name) is not str
-        or not name
-        or name in {".", ".."}
-        or "/" in name
-        or "\x00" in name
-        for name in names
-    ):
+    if any(type(name) is not str or not name or name in {".", ".."} or "/" in name or "\x00" in name for name in names):
         _fail("result directory contains an unsafe entry name")
     if len(names) != len(set(names)):
         _fail("result directory enumeration contains duplicate names")
@@ -336,8 +323,7 @@ def _read_regular_at(
         or not (0 if allow_empty else 1) <= before.st_size <= maximum
     ):
         _fail(
-            f"result file {relative} differs from the owned single-link "
-            f"mode-{exact_mode:04o} regular-file contract"
+            f"result file {relative} differs from the owned single-link " f"mode-{exact_mode:04o} regular-file contract"
         )
     try:
         descriptor = os.open(name, _READ_FLAGS, dir_fd=parent_fd)
@@ -364,12 +350,7 @@ def _read_regular_at(
         named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as error:
         _fail(f"cannot restat result file {relative}: {error}")
-    if not (
-        _fingerprint(before)
-        == _fingerprint(opened)
-        == _fingerprint(after)
-        == _fingerprint(named)
-    ):
+    if not (_fingerprint(before) == _fingerprint(opened) == _fingerprint(after) == _fingerprint(named)):
         _fail(f"result file {relative} changed during stable read")
     return b"".join(chunks), named
 
@@ -424,9 +405,7 @@ def _canonical_json(value: Any) -> bytes:
             sort_keys=True,
         ).encode("ascii")
     except (TypeError, ValueError, UnicodeError) as error:
-        raise StrictCapturedReplaySealError(
-            "result inventory is not finite canonical ASCII JSON"
-        ) from error
+        raise StrictCapturedReplaySealError("result inventory is not finite canonical ASCII JSON") from error
 
 
 def _reject_constant(value: str) -> Any:
@@ -444,9 +423,7 @@ def _reject_duplicate(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _reject_negative_zero(value: Any) -> None:
     if isinstance(value, float):
-        if not math.isfinite(value) or (
-            value == 0.0 and math.copysign(1.0, value) < 0.0
-        ):
+        if not math.isfinite(value) or (value == 0.0 and math.copysign(1.0, value) < 0.0):
             _fail("result inventory contains a non-finite or negative-zero number")
     elif type(value) is dict:
         for member in value.values():
@@ -464,9 +441,7 @@ def _load_inventory(raw: bytes) -> dict[str, Any]:
             parse_constant=_reject_constant,
         )
     except (UnicodeError, json.JSONDecodeError) as error:
-        raise StrictCapturedReplaySealError(
-            "result inventory is not strict ASCII JSON"
-        ) from error
+        raise StrictCapturedReplaySealError("result inventory is not strict ASCII JSON") from error
     if type(document) is not dict:
         _fail("result inventory root must be an exact object")
     _reject_negative_zero(document)
@@ -475,9 +450,7 @@ def _load_inventory(raw: bytes) -> dict[str, Any]:
     return document
 
 
-def _validate_result_document(
-    raw: bytes, *, relative: str, expected_schema: str
-) -> None:
+def _validate_result_document(raw: bytes, *, relative: str, expected_schema: str) -> None:
     document = _load_inventory(raw)
     if document.get("schema") != expected_schema:
         _fail(f"sealed result schema differs for {relative}")
@@ -496,14 +469,11 @@ def _validate_reaped_scorer_bytes(
             parse_constant=_reject_constant,
         )
     except (UnicodeError, json.JSONDecodeError) as error:
-        raise StrictCapturedReplaySealError(
-            "reasoning score-call index is not strict ASCII JSON"
-        ) from error
+        raise StrictCapturedReplaySealError("reasoning score-call index is not strict ASCII JSON") from error
     if type(document) is not dict or _canonical_json(document) != raw:
         _fail("reasoning score-call index is not canonical")
     if profile is not None and (
-        document.get("environment") != profile.environment
-        or document.get("profile_id") != profile.profile_id
+        document.get("environment") != profile.environment or document.get("profile_id") != profile.profile_id
     ):
         _fail("scorer call-index environment/profile identity differs")
     quiescence = document.get("quiescence")
@@ -526,9 +496,7 @@ def _validate_live_inventory(root_fd: int, *, directory_mode: int) -> None:
     }
     if _entry_names(root_fd) != frozenset(expected_root):
         _fail("result root has an extra, missing, or renamed entry")
-    child_fd = _open_child_directory(
-        root_fd, "strict_gym_child_runtime", mode=directory_mode
-    )
+    child_fd = _open_child_directory(root_fd, "strict_gym_child_runtime", mode=directory_mode)
     try:
         expected_child = {
             relative.split("/", 1)[1]
@@ -541,9 +509,7 @@ def _validate_live_inventory(root_fd: int, *, directory_mode: int) -> None:
         os.close(child_fd)
 
 
-def _validate_inventory_shape(
-    document: Mapping[str, Any], *, result_root: str
-) -> dict[str, dict[str, Any]]:
+def _validate_inventory_shape(document: Mapping[str, Any], *, result_root: str) -> dict[str, dict[str, Any]]:
     if type(document) is not dict or set(document) != {
         "schema",
         "hash_domain",
@@ -567,9 +533,7 @@ def _validate_inventory_shape(
     ):
         _fail("result inventory identity/self-exclusion differs")
     directories = document["directories"]
-    expected_directories = [
-        {"mode": "0555", "path": relative} for relative in RESULT_DIRECTORY_ALLOWLIST
-    ]
+    expected_directories = [{"mode": "0555", "path": relative} for relative in RESULT_DIRECTORY_ALLOWLIST]
     if directories != expected_directories:
         _fail("result inventory directory allowlist differs")
     files = document["files"]
@@ -617,26 +581,18 @@ def _validate_inventory_shape(
     publication = document["publication"]
     if (
         type(publication) is not dict
-        or set(publication)
-        != {"directories_mode", "files_mode", "nofollow_reverified", "order"}
+        or set(publication) != {"directories_mode", "files_mode", "nofollow_reverified", "order"}
         or publication.get("directories_mode") != "0555"
         or publication.get("files_mode") != "0400"
         or publication.get("nofollow_reverified") is not True
-        or publication.get("order")
-        != "inventory-then-bottom-up-directory-seal-then-rehash"
+        or publication.get("order") != "inventory-then-bottom-up-directory-seal-then-rehash"
     ):
         _fail("result inventory publication contract differs")
     return indexed
 
 
 def _write_inventory(root_fd: int, payload: bytes) -> None:
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(RESULT_INVENTORY_FILENAME, flags, 0o400, dir_fd=root_fd)
     except OSError as error:
@@ -655,9 +611,7 @@ def _write_inventory(root_fd: int, payload: bytes) -> None:
     os.fsync(root_fd)
 
 
-def publish_sealed_result(
-    *, result_root: str, anchored_sha256: Mapping[str, str]
-) -> tuple[str, str]:
+def publish_sealed_result(*, result_root: str, anchored_sha256: Mapping[str, str]) -> tuple[str, str]:
     """Publish the last artifact, seal bottom-up, and nofollow-reverify it all.
 
     ``anchored_sha256`` must carry the five terminal references already validated
@@ -665,14 +619,9 @@ def publish_sealed_result(
     document from becoming admitted during inventory publication.
     """
     canonical_root = _canonical_absolute(result_root, name="result root")
-    if type(anchored_sha256) is not dict or set(anchored_sha256) != set(
-        RESULT_ANCHOR_ALLOWLIST
-    ):
+    if type(anchored_sha256) is not dict or set(anchored_sha256) != set(RESULT_ANCHOR_ALLOWLIST):
         _fail("terminal result anchor keyset differs")
-    anchors = {
-        name: _digest(value, name=f"terminal anchor {name}")
-        for name, value in anchored_sha256.items()
-    }
+    anchors = {name: _digest(value, name=f"terminal anchor {name}") for name, value in anchored_sha256.items()}
     root_fd = _open_absolute_directory(canonical_root)
     try:
         _require_directory(root_fd, name="result root", exact_mode=0o700)
@@ -693,9 +642,7 @@ def publish_sealed_result(
         }
         if _entry_names(root_fd) != frozenset(expected_pre_root):
             _fail("result root has an extra, missing, or renamed pre-seal entry")
-        child_fd = _open_child_directory(
-            root_fd, "strict_gym_child_runtime", mode=0o700
-        )
+        child_fd = _open_child_directory(root_fd, "strict_gym_child_runtime", mode=0o700)
         try:
             expected_child = {
                 relative.split("/", 1)[1]
@@ -709,13 +656,9 @@ def publish_sealed_result(
 
         file_records: list[dict[str, Any]] = []
         total_file_bytes = 0
-        for relative, expected_schema in zip(
-            RESULT_FILE_ALLOWLIST, RESULT_FILE_SCHEMA_ALLOWLIST, strict=True
-        ):
+        for relative, expected_schema in zip(RESULT_FILE_ALLOWLIST, RESULT_FILE_SCHEMA_ALLOWLIST, strict=True):
             raw, metadata = _read_relative_file(root_fd, relative)
-            _validate_result_document(
-                raw, relative=relative, expected_schema=expected_schema
-            )
+            _validate_result_document(raw, relative=relative, expected_schema=expected_schema)
             if relative == "strict_gym_child_runtime/reasoning-score-call-index.json":
                 _validate_reaped_scorer_bytes(raw)
             actual_sha256 = hashlib.sha256(raw).hexdigest()
@@ -740,10 +683,7 @@ def publish_sealed_result(
                 "path": RESULT_INVENTORY_FILENAME,
                 "policy": "excluded-from-files-and-totals",
             },
-            "directories": [
-                {"mode": "0555", "path": relative}
-                for relative in RESULT_DIRECTORY_ALLOWLIST
-            ],
+            "directories": [{"mode": "0555", "path": relative} for relative in RESULT_DIRECTORY_ALLOWLIST],
             "files": file_records,
             "totals": {
                 "directory_count": len(RESULT_DIRECTORY_ALLOWLIST),
@@ -761,9 +701,7 @@ def publish_sealed_result(
         _write_inventory(root_fd, payload)
         inventory_sha256 = hashlib.sha256(payload).hexdigest()
 
-        child_fd = _open_child_directory(
-            root_fd, "strict_gym_child_runtime", mode=0o700
-        )
+        child_fd = _open_child_directory(root_fd, "strict_gym_child_runtime", mode=0o700)
         try:
             os.fchmod(child_fd, 0o555)
             os.fsync(child_fd)
@@ -786,14 +724,10 @@ def publish_sealed_result(
     return f"{canonical_root}/{RESULT_INVENTORY_FILENAME}", inventory_sha256
 
 
-def verify_sealed_result(
-    *, result_root: str, expected_inventory_sha256: str
-) -> VerifiedSealedResultV1:
+def verify_sealed_result(*, result_root: str, expected_inventory_sha256: str) -> VerifiedSealedResultV1:
     """Verify a sealed result and mint an in-process bytes-only authority."""
     canonical_root = _canonical_absolute(result_root, name="result root")
-    expected_sha256 = _digest(
-        expected_inventory_sha256, name="expected result inventory SHA-256"
-    )
+    expected_sha256 = _digest(expected_inventory_sha256, name="expected result inventory SHA-256")
     root_fd = _open_absolute_directory(canonical_root)
     try:
         _require_directory(root_fd, name="sealed result root", exact_mode=0o555)
@@ -812,9 +746,7 @@ def verify_sealed_result(
         indexed = _validate_inventory_shape(inventory, result_root=canonical_root)
         verified_files: list[tuple[str, bytes]] = []
         verified_file_bytes = 0
-        for relative, expected_schema in zip(
-            RESULT_FILE_ALLOWLIST, RESULT_FILE_SCHEMA_ALLOWLIST, strict=True
-        ):
+        for relative, expected_schema in zip(RESULT_FILE_ALLOWLIST, RESULT_FILE_SCHEMA_ALLOWLIST, strict=True):
             raw, metadata = (
                 _read_relative_file(
                     root_fd,
@@ -826,14 +758,9 @@ def verify_sealed_result(
                 else _read_nested_sealed(root_fd, relative)
             )
             record = indexed[relative]
-            if (
-                metadata.st_size != record["size"]
-                or hashlib.sha256(raw).hexdigest() != record["sha256"]
-            ):
+            if metadata.st_size != record["size"] or hashlib.sha256(raw).hexdigest() != record["sha256"]:
                 _fail(f"sealed result file differs from inventory: {relative}")
-            _validate_result_document(
-                raw, relative=relative, expected_schema=expected_schema
-            )
+            _validate_result_document(raw, relative=relative, expected_schema=expected_schema)
             if relative == "strict_gym_child_runtime/reasoning-score-call-index.json":
                 _validate_reaped_scorer_bytes(raw)
             verified_file_bytes += len(raw)
@@ -867,22 +794,14 @@ def consume_verified_sealed_result(
     caller-supplied mapping or tuple that merely resembles the result is rejected.
     The capability is intentionally process-local and cannot be pickled.
     """
-    canonical_root = _canonical_absolute(
-        expected_result_root, name="expected result root"
-    )
-    expected_sha256 = _digest(
-        expected_inventory_sha256, name="expected result inventory SHA-256"
-    )
+    canonical_root = _canonical_absolute(expected_result_root, name="expected result root")
+    expected_sha256 = _digest(expected_inventory_sha256, name="expected result inventory SHA-256")
     if type(value) is not VerifiedSealedResultV1:
         _fail("sealed-result consumer requires exact verifier-minted authority")
     token = object.__getattribute__(value, "_VerifiedSealedResultV1__mint_token")
     result_root = object.__getattribute__(value, "_VerifiedSealedResultV1__result_root")
-    inventory_sha256 = object.__getattribute__(
-        value, "_VerifiedSealedResultV1__inventory_sha256"
-    )
-    inventory_raw = object.__getattribute__(
-        value, "_VerifiedSealedResultV1__inventory_raw"
-    )
+    inventory_sha256 = object.__getattribute__(value, "_VerifiedSealedResultV1__inventory_sha256")
+    inventory_raw = object.__getattribute__(value, "_VerifiedSealedResultV1__inventory_raw")
     files = object.__getattribute__(value, "_VerifiedSealedResultV1__files")
     if (
         token is not _VERIFIED_RESULT_MINT_TOKEN
@@ -917,9 +836,7 @@ def consume_verified_sealed_result(
             or hashlib.sha256(item[1]).hexdigest() != indexed[relative]["sha256"]
         ):
             _fail(f"verified sealed-result payload differs for {relative}")
-        _validate_result_document(
-            item[1], relative=relative, expected_schema=expected_schema
-        )
+        _validate_result_document(item[1], relative=relative, expected_schema=expected_schema)
         consumed_bytes += len(item[1])
         if consumed_bytes > _MAX_RESULT_BYTES:
             _fail("verified sealed-result payload exceeds aggregate byte limit")
@@ -998,11 +915,91 @@ def _validate_live_inventory_v2(
     )
     try:
         if _entry_names(child_fd) != _profile_child_entries(profile):
-            _fail(
-                "profiled strict Gym result directory has an extra, missing, or renamed entry"
-            )
+            _fail("profiled strict Gym result directory has an extra, missing, or renamed entry")
     finally:
         os.close(child_fd)
+
+
+def _validate_pinned_live_inventory_v2(
+    root_fd: int,
+    child_fd: int,
+    *,
+    profile: StrictCapturedReplayProfile,
+) -> None:
+    """Validate the closed tree through already-pinned directory descriptors."""
+    if _entry_names(root_fd) != _profile_root_entries(profile, include_inventory=True):
+        _fail("profiled result root has an extra, missing, or renamed entry")
+    try:
+        named_child = os.stat(
+            "strict_gym_child_runtime",
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        _fail(f"cannot restat profiled strict Gym result directory: {error}")
+    pinned_child = _require_directory(
+        child_fd,
+        name="profiled strict Gym result directory",
+        exact_mode=0o555,
+    )
+    if _fingerprint(named_child) != _fingerprint(pinned_child):
+        _fail("profiled strict Gym result directory changed canonical name")
+    if _entry_names(child_fd) != _profile_child_entries(profile):
+        _fail("profiled strict Gym result directory has an extra, missing, or renamed entry")
+
+
+def _pinned_profile_member_location_v2(
+    root_fd: int,
+    child_fd: int,
+    relative: str,
+) -> tuple[int, str]:
+    components = relative.split("/")
+    if len(components) == 1 and components[0] not in {"", ".", ".."}:
+        parent_fd = root_fd
+        filename = components[0]
+    elif len(components) == 2 and components[0] == "strict_gym_child_runtime" and components[1] not in {"", ".", ".."}:
+        parent_fd = child_fd
+        filename = components[1]
+    else:
+        _fail(f"profiled sealed result path is outside the exact allowlist: {relative}")
+    return parent_fd, filename
+
+
+def _read_pinned_profile_member_v2(
+    root_fd: int,
+    child_fd: int,
+    relative: str,
+) -> tuple[bytes, os.stat_result]:
+    """Stable-read one admitted member without resolving a directory name again."""
+    parent_fd, filename = _pinned_profile_member_location_v2(
+        root_fd,
+        child_fd,
+        relative,
+    )
+    return _read_regular_at(
+        parent_fd,
+        filename,
+        relative=relative,
+        exact_mode=0o400,
+        maximum=_MAX_FILE_BYTES,
+    )
+
+
+def _stat_pinned_profile_member_v2(
+    root_fd: int,
+    child_fd: int,
+    relative: str,
+) -> os.stat_result:
+    """Nofollow-stat one admitted name through the pinned directory tree."""
+    parent_fd, filename = _pinned_profile_member_location_v2(
+        root_fd,
+        child_fd,
+        relative,
+    )
+    try:
+        return os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        _fail(f"cannot terminally restat sealed profiled result file {relative}: {error}")
 
 
 def _validate_inventory_shape_v2(
@@ -1038,9 +1035,7 @@ def _validate_inventory_shape_v2(
     ):
         _fail("profiled result inventory identity/self-exclusion differs")
     directories = document["directories"]
-    expected_directories = [
-        {"mode": "0555", "path": relative} for relative in profile.result_directories
-    ]
+    expected_directories = [{"mode": "0555", "path": relative} for relative in profile.result_directories]
     if directories != expected_directories:
         _fail("profiled result inventory directory allowlist differs")
     files = document["files"]
@@ -1091,26 +1086,18 @@ def _validate_inventory_shape_v2(
     publication = document["publication"]
     if (
         type(publication) is not dict
-        or set(publication)
-        != {"directories_mode", "files_mode", "nofollow_reverified", "order"}
+        or set(publication) != {"directories_mode", "files_mode", "nofollow_reverified", "order"}
         or publication.get("directories_mode") != "0555"
         or publication.get("files_mode") != "0400"
         or publication.get("nofollow_reverified") is not True
-        or publication.get("order")
-        != "inventory-then-bottom-up-directory-seal-then-rehash"
+        or publication.get("order") != "inventory-then-bottom-up-directory-seal-then-rehash"
     ):
         _fail("profiled result inventory publication contract differs")
     return indexed
 
 
 def _write_inventory_v2(root_fd: int, payload: bytes) -> None:
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(
             RESULT_INVENTORY_V2_FILENAME,
@@ -1134,41 +1121,32 @@ def _write_inventory_v2(root_fd: int, payload: bytes) -> None:
     os.fsync(root_fd)
 
 
-def publish_sealed_result_v2(
+def publish_sealed_result_v2_with_authority(
     *,
     result_root: str,
     anchored_sha256: Mapping[str, str],
     expected_environment: str,
     expected_profile_id: str,
-) -> tuple[str, str]:
-    """Publish and verify one caller-selected result-inventory-v2 profile."""
+) -> tuple[str, str, VerifiedSealedResultV2]:
+    """Publish once and return the verifier-retained terminal authority."""
     profile = _strict_captured_replay_profile(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
     )
     canonical_root = _canonical_absolute(result_root, name="result root")
-    if type(anchored_sha256) is not dict or set(anchored_sha256) != set(
-        profile.result_anchor_paths
-    ):
+    if type(anchored_sha256) is not dict or set(anchored_sha256) != set(profile.result_anchor_paths):
         _fail("profiled terminal result anchor keyset differs")
-    anchors = {
-        name: _digest(value, name=f"profiled terminal anchor {name}")
-        for name, value in anchored_sha256.items()
-    }
+    anchors = {name: _digest(value, name=f"profiled terminal anchor {name}") for name, value in anchored_sha256.items()}
     root_fd = _open_absolute_directory(canonical_root)
     try:
         _require_directory(root_fd, name="profiled result root", exact_mode=0o700)
         if RESULT_INVENTORY_V2_FILENAME in _entry_names(root_fd):
-            _fail(
-                "profiled result inventory must be absent before terminal publication"
-            )
+            _fail("profiled result inventory must be absent before terminal publication")
         if _entry_names(root_fd) != _profile_root_entries(
             profile,
             include_inventory=False,
         ):
-            _fail(
-                "profiled result root has an extra, missing, or renamed pre-seal entry"
-            )
+            _fail("profiled result root has an extra, missing, or renamed pre-seal entry")
         child_fd = _open_child_directory(
             root_fd,
             "strict_gym_child_runtime",
@@ -1176,9 +1154,7 @@ def publish_sealed_result_v2(
         )
         try:
             if _entry_names(child_fd) != _profile_child_entries(profile):
-                _fail(
-                    "profiled strict Gym pre-seal inventory differs from exact allowlist"
-                )
+                _fail("profiled strict Gym pre-seal inventory differs from exact allowlist")
         finally:
             os.close(child_fd)
 
@@ -1221,10 +1197,7 @@ def publish_sealed_result_v2(
                 "path": RESULT_INVENTORY_V2_FILENAME,
                 "policy": "excluded-from-files-and-totals",
             },
-            "directories": [
-                {"mode": "0555", "path": relative}
-                for relative in profile.result_directories
-            ],
+            "directories": [{"mode": "0555", "path": relative} for relative in profile.result_directories],
             "files": file_records,
             "totals": {
                 "directory_count": len(profile.result_directories),
@@ -1270,7 +1243,28 @@ def publish_sealed_result_v2(
         expected_environment=profile.environment,
         expected_profile_id=profile.profile_id,
     )
-    return f"{canonical_root}/{RESULT_INVENTORY_V2_FILENAME}", inventory_sha256
+    return (
+        f"{canonical_root}/{RESULT_INVENTORY_V2_FILENAME}",
+        inventory_sha256,
+        verified,
+    )
+
+
+def publish_sealed_result_v2(
+    *,
+    result_root: str,
+    anchored_sha256: Mapping[str, str],
+    expected_environment: str,
+    expected_profile_id: str,
+) -> tuple[str, str]:
+    """Compatibility API that publishes and verifies one profiled result."""
+    inventory_path, inventory_sha256, _ = publish_sealed_result_v2_with_authority(
+        result_root=result_root,
+        anchored_sha256=anchored_sha256,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    return inventory_path, inventory_sha256
 
 
 def verify_sealed_result_v2(
@@ -1292,71 +1286,191 @@ def verify_sealed_result_v2(
     )
     root_fd = _open_absolute_directory(canonical_root)
     try:
-        _require_directory(
-            root_fd, name="sealed profiled result root", exact_mode=0o555
-        )
-        _validate_live_inventory_v2(
+        root_initial = _require_directory(root_fd, name="sealed profiled result root", exact_mode=0o555)
+        child_fd = _open_child_directory(
             root_fd,
-            profile=profile,
-            directory_mode=0o555,
+            "strict_gym_child_runtime",
+            mode=0o555,
         )
-        inventory_raw, _ = _read_regular_at(
-            root_fd,
-            RESULT_INVENTORY_V2_FILENAME,
-            relative=RESULT_INVENTORY_V2_FILENAME,
-            exact_mode=0o400,
-            maximum=_MAX_INVENTORY_BYTES,
-        )
-        actual_inventory_sha256 = hashlib.sha256(inventory_raw).hexdigest()
-        if actual_inventory_sha256 != expected_sha256:
-            _fail("profiled result inventory differs from caller-carried SHA-256")
-        inventory = _load_inventory(inventory_raw)
-        indexed = _validate_inventory_shape_v2(
-            inventory,
-            result_root=canonical_root,
-            profile=profile,
-        )
-        verified_files: list[tuple[str, bytes]] = []
-        verified_file_bytes = 0
-        for relative, expected_schema in zip(
-            profile.result_files,
-            profile.result_file_schemas,
-            strict=True,
-        ):
-            raw, metadata = (
-                _read_relative_file(root_fd, relative)
-                if "/" not in relative
-                else _read_nested_sealed(root_fd, relative)
+        try:
+            child_initial = _require_directory(
+                child_fd,
+                name="sealed profiled strict Gym result directory",
+                exact_mode=0o555,
             )
-            record = indexed[relative]
-            if (
-                metadata.st_size != record["size"]
-                or hashlib.sha256(raw).hexdigest() != record["sha256"]
+            _validate_pinned_live_inventory_v2(
+                root_fd,
+                child_fd,
+                profile=profile,
+            )
+            inventory_raw, inventory_metadata = _read_regular_at(
+                root_fd,
+                RESULT_INVENTORY_V2_FILENAME,
+                relative=RESULT_INVENTORY_V2_FILENAME,
+                exact_mode=0o400,
+                maximum=_MAX_INVENTORY_BYTES,
+            )
+            actual_inventory_sha256 = hashlib.sha256(inventory_raw).hexdigest()
+            if actual_inventory_sha256 != expected_sha256:
+                _fail("profiled result inventory differs from caller-carried SHA-256")
+            inventory = _load_inventory(inventory_raw)
+            indexed = _validate_inventory_shape_v2(
+                inventory,
+                result_root=canonical_root,
+                profile=profile,
+            )
+            verified_files: list[tuple[str, bytes]] = []
+            verified_metadata: list[os.stat_result] = []
+            verified_file_bytes = 0
+            for relative, expected_schema in zip(
+                profile.result_files,
+                profile.result_file_schemas,
+                strict=True,
             ):
-                _fail(f"sealed profiled result file differs from inventory: {relative}")
-            _validate_result_document(
-                raw,
-                relative=relative,
-                expected_schema=expected_schema,
+                raw, metadata = _read_pinned_profile_member_v2(
+                    root_fd,
+                    child_fd,
+                    relative,
+                )
+                record = indexed[relative]
+                if metadata.st_size != record["size"] or hashlib.sha256(raw).hexdigest() != record["sha256"]:
+                    _fail(f"sealed profiled result file differs from inventory: {relative}")
+                _validate_result_document(
+                    raw,
+                    relative=relative,
+                    expected_schema=expected_schema,
+                )
+                if relative == profile.scorer_terminal_index_path:
+                    _validate_reaped_scorer_bytes(raw, profile=profile)
+                verified_file_bytes += len(raw)
+                if verified_file_bytes > _MAX_RESULT_BYTES:
+                    _fail("sealed profiled result exceeds aggregate byte limit")
+                verified_files.append((relative, raw))
+                verified_metadata.append(metadata)
+            if verified_file_bytes != inventory["totals"]["file_bytes"]:
+                _fail("sealed profiled result aggregate byte count differs")
+
+            # A second complete stable-read closes the gap between validating a
+            # member and minting authority from its retained first-pass bytes.
+            second_inventory_raw, second_inventory_metadata = _read_regular_at(
+                root_fd,
+                RESULT_INVENTORY_V2_FILENAME,
+                relative=RESULT_INVENTORY_V2_FILENAME,
+                exact_mode=0o400,
+                maximum=_MAX_INVENTORY_BYTES,
             )
-            if relative == profile.scorer_terminal_index_path:
-                _validate_reaped_scorer_bytes(raw, profile=profile)
-            verified_file_bytes += len(raw)
-            if verified_file_bytes > _MAX_RESULT_BYTES:
-                _fail("sealed profiled result exceeds aggregate byte limit")
-            verified_files.append((relative, raw))
-        if verified_file_bytes != inventory["totals"]["file_bytes"]:
-            _fail("sealed profiled result aggregate byte count differs")
-        _validate_live_inventory_v2(
-            root_fd,
-            profile=profile,
-            directory_mode=0o555,
-        )
-        _require_directory(
-            root_fd,
-            name="sealed profiled result root",
-            exact_mode=0o555,
-        )
+            if (
+                second_inventory_raw != inventory_raw
+                or hashlib.sha256(second_inventory_raw).hexdigest() != actual_inventory_sha256
+                or _fingerprint(second_inventory_metadata) != _fingerprint(inventory_metadata)
+            ):
+                _fail("profiled result inventory changed between verification reads")
+            second_file_bytes = 0
+            second_file_metadata: list[os.stat_result] = []
+            for (relative, retained_raw), retained_metadata in zip(
+                verified_files,
+                verified_metadata,
+                strict=True,
+            ):
+                second_raw, reread_metadata = _read_pinned_profile_member_v2(
+                    root_fd,
+                    child_fd,
+                    relative,
+                )
+                record = indexed[relative]
+                second_sha256 = hashlib.sha256(second_raw).hexdigest()
+                if (
+                    second_raw != retained_raw
+                    or second_sha256 != record["sha256"]
+                    or _fingerprint(reread_metadata) != _fingerprint(retained_metadata)
+                ):
+                    _fail("sealed profiled result file changed between verification " f"reads: {relative}")
+                second_file_bytes += len(second_raw)
+                if second_file_bytes > _MAX_RESULT_BYTES:
+                    _fail("sealed profiled result exceeds aggregate byte limit")
+                second_file_metadata.append(reread_metadata)
+            if second_file_bytes != inventory["totals"]["file_bytes"]:
+                _fail("sealed profiled result aggregate byte count differs")
+
+            # Catch mutation of an earlier second-pass item while later items
+            # were being read.  Named nofollow fingerprints must still identify
+            # the exact stable-read inodes and metadata through the pinned tree.
+            try:
+                terminal_inventory_metadata = os.stat(
+                    RESULT_INVENTORY_V2_FILENAME,
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                _fail(f"cannot terminally restat profiled result inventory: {error}")
+            if _fingerprint(terminal_inventory_metadata) != _fingerprint(second_inventory_metadata):
+                _fail("profiled result inventory changed after its second stable read")
+            for relative, expected_metadata in zip(
+                profile.result_files,
+                second_file_metadata,
+                strict=True,
+            ):
+                terminal_metadata = _stat_pinned_profile_member_v2(
+                    root_fd,
+                    child_fd,
+                    relative,
+                )
+                if _fingerprint(terminal_metadata) != _fingerprint(expected_metadata):
+                    _fail("sealed profiled result file changed after its second stable " f"read: {relative}")
+
+            _validate_pinned_live_inventory_v2(
+                root_fd,
+                child_fd,
+                profile=profile,
+            )
+            root_after = _require_directory(
+                root_fd,
+                name="sealed profiled result root",
+                exact_mode=0o555,
+            )
+            child_after = _require_directory(
+                child_fd,
+                name="sealed profiled strict Gym result directory",
+                exact_mode=0o555,
+            )
+            fresh_root_fd = _open_absolute_directory(canonical_root)
+            try:
+                fresh_root = _require_directory(
+                    fresh_root_fd,
+                    name="fresh sealed profiled result root",
+                    exact_mode=0o555,
+                )
+                fresh_child_fd = _open_child_directory(
+                    fresh_root_fd,
+                    "strict_gym_child_runtime",
+                    mode=0o555,
+                )
+                try:
+                    fresh_child = _require_directory(
+                        fresh_child_fd,
+                        name="fresh sealed profiled strict Gym result directory",
+                        exact_mode=0o555,
+                    )
+                finally:
+                    os.close(fresh_child_fd)
+            finally:
+                os.close(fresh_root_fd)
+            if not (
+                _directory_identity(root_initial) == _directory_identity(root_after) == _directory_identity(fresh_root)
+            ):
+                _fail("sealed profiled result root changed canonical path during " "verification")
+            if not (
+                _directory_identity(child_initial)
+                == _directory_identity(child_after)
+                == _directory_identity(fresh_child)
+            ):
+                _fail("sealed profiled strict Gym result directory changed canonical " "path during verification")
+            if _fingerprint(root_initial) != _fingerprint(root_after) or _fingerprint(child_initial) != _fingerprint(
+                child_after
+            ):
+                _fail("sealed profiled result directory metadata changed during verification")
+        finally:
+            os.close(child_fd)
     finally:
         os.close(root_fd)
     return VerifiedSealedResultV2(
@@ -1370,15 +1484,15 @@ def verify_sealed_result_v2(
     )
 
 
-def consume_verified_sealed_result_v2(
+def _validated_sealed_result_snapshot_v2(
     value: Any,
     *,
     expected_result_root: str,
     expected_inventory_sha256: str,
     expected_environment: str,
     expected_profile_id: str,
-) -> tuple[tuple[str, bytes], ...]:
-    """Return inert bytes only for a matching verifier-minted V2 authority."""
+) -> dict[str, Any]:
+    """Revalidate retained V2 authority and return one fresh built-in snapshot."""
     profile = _strict_captured_replay_profile(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
@@ -1392,9 +1506,7 @@ def consume_verified_sealed_result_v2(
         name="expected profiled result inventory SHA-256",
     )
     if type(value) is not VerifiedSealedResultV2:
-        _fail(
-            "profiled sealed-result consumer requires exact V2 verifier-minted authority"
-        )
+        _fail("profiled sealed-result consumer requires exact V2 verifier-minted authority")
     token = object.__getattribute__(value, "_VerifiedSealedResultV2__mint_token")
     result_root = object.__getattribute__(value, "_VerifiedSealedResultV2__result_root")
     inventory_sha256 = object.__getattribute__(
@@ -1462,13 +1574,87 @@ def consume_verified_sealed_result_v2(
         )
         consumed_bytes += len(item[1])
         if consumed_bytes > _MAX_RESULT_BYTES:
-            _fail(
-                "verified profiled sealed-result payload exceeds aggregate byte limit"
-            )
-        consumed.append((relative, item[1]))
+            _fail("verified profiled sealed-result payload exceeds aggregate byte limit")
+        consumed.append((relative, memoryview(item[1]).tobytes()))
     if consumed_bytes != inventory["totals"]["file_bytes"]:
         _fail("verified profiled sealed-result aggregate byte count differs")
-    return tuple(consumed)
+    return {
+        "environment": environment,
+        "profile_id": profile_id,
+        "result_root": result_root,
+        "inventory": {
+            "path": f"{result_root}/{RESULT_INVENTORY_V2_FILENAME}",
+            "schema": RESULT_INVENTORY_V2_SCHEMA,
+            "sha256": inventory_sha256,
+            "raw": memoryview(inventory_raw).tobytes(),
+        },
+        "members": tuple(consumed),
+    }
+
+
+def consume_verified_sealed_result_v2(
+    value: Any,
+    *,
+    expected_result_root: str,
+    expected_inventory_sha256: str,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> tuple[tuple[str, bytes], ...]:
+    """Return inert bytes only for a matching verifier-minted V2 authority."""
+    snapshot = _validated_sealed_result_snapshot_v2(
+        value,
+        expected_result_root=expected_result_root,
+        expected_inventory_sha256=expected_inventory_sha256,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+    return snapshot["members"]
+
+
+def snapshot_verified_sealed_result_v2(value: Any) -> dict[str, Any]:
+    """Return retained inventory/member bytes without reopening any result path.
+
+    The exact verifier-minted authority is fully revalidated from its retained
+    immutable values.  The returned graph contains only fresh built-in
+    containers and byte strings, so callers receive no filesystem authority.
+    """
+    if type(value) is not VerifiedSealedResultV2:
+        _fail("profiled sealed-result snapshot requires exact V2 verifier-minted authority")
+    try:
+        token = object.__getattribute__(
+            value,
+            "_VerifiedSealedResultV2__mint_token",
+        )
+    except AttributeError:
+        _fail("profiled sealed-result snapshot authority token differs")
+    if token is not _VERIFIED_RESULT_V2_MINT_TOKEN:
+        _fail("profiled sealed-result snapshot authority token differs")
+    try:
+        result_root = object.__getattribute__(
+            value,
+            "_VerifiedSealedResultV2__result_root",
+        )
+        inventory_sha256 = object.__getattribute__(
+            value,
+            "_VerifiedSealedResultV2__inventory_sha256",
+        )
+        environment = object.__getattribute__(
+            value,
+            "_VerifiedSealedResultV2__environment",
+        )
+        profile_id = object.__getattribute__(
+            value,
+            "_VerifiedSealedResultV2__profile_id",
+        )
+    except AttributeError:
+        _fail("profiled sealed-result snapshot authority payload is incomplete")
+    return _validated_sealed_result_snapshot_v2(
+        value,
+        expected_result_root=result_root,
+        expected_inventory_sha256=inventory_sha256,
+        expected_environment=environment,
+        expected_profile_id=profile_id,
+    )
 
 
 __all__ = [
@@ -1489,6 +1675,8 @@ __all__ = [
     "consume_verified_sealed_result_v2",
     "publish_sealed_result",
     "publish_sealed_result_v2",
+    "publish_sealed_result_v2_with_authority",
+    "snapshot_verified_sealed_result_v2",
     "verify_sealed_result",
     "verify_sealed_result_v2",
 ]

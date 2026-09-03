@@ -81,10 +81,7 @@ STRICT_RESULTS_DIRECTORY_NAME = "strict_gym_child_runtime"
 _SCORER_NO_SITE_PTH_FILES = {
     "__editable__.nemo_gym-0.5.0rc0.pth": {
         "kind": "symlink",
-        "link_target": (
-            "/root/.cache/uv/archive-v0/6y4mmc6Y7xD0Sgua/"
-            "__editable__.nemo_gym-0.5.0rc0.pth"
-        ),
+        "link_target": ("/root/.cache/uv/archive-v0/6y4mmc6Y7xD0Sgua/" "__editable__.nemo_gym-0.5.0rc0.pth"),
         "size": 93,
         "sha256": "debb90ea383877803a356178d2fab9daafa3a1b86cae9845808f6cd99e1acd18",
     },
@@ -132,18 +129,10 @@ _PRE_PYTHON_INJECTION_ENV_PREFIXES = (
 )
 
 _GYM_SOURCE_PINS = {
-    "nemo_gym/__init__.py": (
-        "a7d495b7057874ea7c6ea849623d789a1d2939c7a1aac47c0aeabaf849490188"
-    ),
-    "nemo_gym/global_config.py": (
-        "5e8e7457e6c3b9ae2cc5b124fb3b42f1920ba6c17707519da7b1d560e0a1ea70"
-    ),
-    "nemo_gym/cli/setup_command.py": (
-        "6e976fe8491e8ddc9770dc553f93ef46a5545760cf9f3ce5396369c0e9945a71"
-    ),
-    "nemo_gym/cli/env.py": (
-        "e6f468072e6b6627624dbc9270f60ec792ff0fa2aed681f9ce338b714880188a"
-    ),
+    "nemo_gym/__init__.py": ("a7d495b7057874ea7c6ea849623d789a1d2939c7a1aac47c0aeabaf849490188"),
+    "nemo_gym/global_config.py": ("5e8e7457e6c3b9ae2cc5b124fb3b42f1920ba6c17707519da7b1d560e0a1ea70"),
+    "nemo_gym/cli/setup_command.py": ("6e976fe8491e8ddc9770dc553f93ef46a5545760cf9f3ce5396369c0e9945a71"),
+    "nemo_gym/cli/env.py": ("e6f468072e6b6627624dbc9270f60ec792ff0fa2aed681f9ce338b714880188a"),
 }
 
 _SIMPLE_AGENT = {
@@ -153,9 +142,7 @@ _SIMPLE_AGENT = {
     "component_relative": "responses_api_agents/simple_agent",
     "entrypoint": "app.py",
     "source_relative": "responses_api_agents/simple_agent/app.py",
-    "source_sha256": (
-        "ea8179439c54962fdd48de3b0f64caed61049848a7801f1a63d0c1d0fd0ab97a"
-    ),
+    "source_sha256": ("ea8179439c54962fdd48de3b0f64caed61049848a7801f1a63d0c1d0fd0ab97a"),
     "distribution_versions": {
         "nemo-gym": "0.5.0rc0",
         "openai": "2.6.1",
@@ -175,19 +162,11 @@ _RESOURCE_TARGETS = {
         "component_relative": "resources_servers/reasoning_gym",
         "entrypoint": "app.py",
         "source_relative": "resources_servers/reasoning_gym/app.py",
-        "source_sha256": (
-            "3a35c5d27392dae05499ceefac04e9c32ad963b51a54d77bb470ee59b1fe3127"
-        ),
-        "config_relative": (
-            "resources_servers/reasoning_gym/configs/reasoning_gym.yaml"
-        ),
-        "config_sha256": (
-            "bdbb459a4a920bc47cf84b1d7dc30aeaa9be35cf0dfac09c77879e45b62a52ab"
-        ),
+        "source_sha256": ("3a35c5d27392dae05499ceefac04e9c32ad963b51a54d77bb470ee59b1fe3127"),
+        "config_relative": ("resources_servers/reasoning_gym/configs/reasoning_gym.yaml"),
+        "config_sha256": ("bdbb459a4a920bc47cf84b1d7dc30aeaa9be35cf0dfac09c77879e45b62a52ab"),
         "requirements_relative": "resources_servers/reasoning_gym/requirements.txt",
-        "requirements_sha256": (
-            "b00b45db433d797d8a5c5c5602f24ab94d9d5620d83b4bef21fbee851287d411"
-        ),
+        "requirements_sha256": ("b00b45db433d797d8a5c5c5602f24ab94d9d5620d83b4bef21fbee851287d411"),
         "distribution_versions": {
             "nemo-gym": "0.5.0rc0",
             "openai": "2.6.1",
@@ -206,31 +185,19 @@ _RESOURCE_TARGETS = {
         },
         "scorer": {
             "module": "reasoning_gym.logic.knights_knaves",
-            "callable": (
-                "reasoning_gym.logic.knights_knaves.KnightsKnavesDataset.score_answer"
-            ),
+            "callable": ("reasoning_gym.logic.knights_knaves.KnightsKnavesDataset.score_answer"),
             "origin_relative_to_purelib": ("reasoning_gym/logic/knights_knaves.py"),
-            "sha256": (
-                "8837a3c6dfc72bb40db168b82ad6b3da45a08a4000a006fc306368b77b622705"
-            ),
+            "sha256": ("8837a3c6dfc72bb40db168b82ad6b3da45a08a4000a006fc306368b77b622705"),
             "resolver_module": "reasoning_gym.factory",
             "resolver_origin_relative_to_purelib": "reasoning_gym/factory.py",
-            "resolver_sha256": (
-                "fc651cc93205fafab926526a7d2c7a88c9dfa569af6e895135a1db48765e75bf"
-            ),
+            "resolver_sha256": ("fc651cc93205fafab926526a7d2c7a88c9dfa569af6e895135a1db48765e75bf"),
             "module_origin_relative_to_purelib": "reasoning_gym/__init__.py",
-            "module_sha256": (
-                "ce1e4c7b2d0f61ea2021395ffb228cb3bdf4a5db21cae2e72882afb4cc4b64c6"
-            ),
+            "module_sha256": ("ce1e4c7b2d0f61ea2021395ffb228cb3bdf4a5db21cae2e72882afb4cc4b64c6"),
             "package_tree_hash_domain": "sha256-canonical-package-files-v1",
-            "package_tree_sha256": (
-                "17c69662d248b5fc6017f128a152579e209d7dda31a94edb8b9141737917442c"
-            ),
+            "package_tree_sha256": ("17c69662d248b5fc6017f128a152579e209d7dda31a94edb8b9141737917442c"),
             "package_file_count": 200,
             "package_total_bytes": 17871220,
-            "wheel_sha256": (
-                "7f17a3eddb13c015d7d4a755ed576a061df889faf9468bcc2cca334ebe9e0435"
-            ),
+            "wheel_sha256": ("7f17a3eddb13c015d7d4a755ed576a061df889faf9468bcc2cca334ebe9e0435"),
         },
     },
     "citation": {
@@ -241,21 +208,11 @@ _RESOURCE_TARGETS = {
         "component_relative": "resources_servers/format_verification",
         "entrypoint": "app.py",
         "source_relative": "resources_servers/format_verification/app.py",
-        "source_sha256": (
-            "6e0a4bd8eae96b073598f12b68805772644a0c60e5a5ef61f09ad12ea8761f36"
-        ),
-        "config_relative": (
-            "resources_servers/format_verification/configs/citation_format.yaml"
-        ),
-        "config_sha256": (
-            "da549a29c31219d8eeb14ea23f888c05479578c61619f684387efd97fadb0796"
-        ),
-        "requirements_relative": (
-            "resources_servers/format_verification/requirements.txt"
-        ),
-        "requirements_sha256": (
-            "18e0d5e99020599c4d033912b39d4569276b1b9278db73469ea9708742cfaa7d"
-        ),
+        "source_sha256": ("6e0a4bd8eae96b073598f12b68805772644a0c60e5a5ef61f09ad12ea8761f36"),
+        "config_relative": ("resources_servers/format_verification/configs/citation_format.yaml"),
+        "config_sha256": ("da549a29c31219d8eeb14ea23f888c05479578c61619f684387efd97fadb0796"),
+        "requirements_relative": ("resources_servers/format_verification/requirements.txt"),
+        "requirements_sha256": ("18e0d5e99020599c4d033912b39d4569276b1b9278db73469ea9708742cfaa7d"),
         "distribution_versions": {
             "nemo-gym": "0.5.0rc0",
             "openai": "2.6.1",
@@ -273,21 +230,11 @@ _RESOURCE_TARGETS = {
         "component_relative": "resources_servers/format_verification",
         "entrypoint": "app.py",
         "source_relative": "resources_servers/format_verification/app.py",
-        "source_sha256": (
-            "6e0a4bd8eae96b073598f12b68805772644a0c60e5a5ef61f09ad12ea8761f36"
-        ),
-        "config_relative": (
-            "resources_servers/format_verification/configs/freeform_formatting.yaml"
-        ),
-        "config_sha256": (
-            "92a38a70b922f9dcd837a7336c8ce5b13588cb3c1a85d05270486601d18ba6aa"
-        ),
-        "requirements_relative": (
-            "resources_servers/format_verification/requirements.txt"
-        ),
-        "requirements_sha256": (
-            "18e0d5e99020599c4d033912b39d4569276b1b9278db73469ea9708742cfaa7d"
-        ),
+        "source_sha256": ("6e0a4bd8eae96b073598f12b68805772644a0c60e5a5ef61f09ad12ea8761f36"),
+        "config_relative": ("resources_servers/format_verification/configs/freeform_formatting.yaml"),
+        "config_sha256": ("92a38a70b922f9dcd837a7336c8ce5b13588cb3c1a85d05270486601d18ba6aa"),
+        "requirements_relative": ("resources_servers/format_verification/requirements.txt"),
+        "requirements_sha256": ("18e0d5e99020599c4d033912b39d4569276b1b9278db73469ea9708742cfaa7d"),
         "distribution_versions": {
             "nemo-gym": "0.5.0rc0",
             "openai": "2.6.1",
@@ -321,15 +268,9 @@ _FORMAT_PROFILES = {
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _PAIR_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _JOB_ID_RE = re.compile(r"[1-9][0-9]{0,31}\Z")
-_READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 _DIR_FLAGS = _READ_FLAGS | getattr(os, "O_DIRECTORY", 0)
-_CREATE_FLAGS = (
-    os.O_WRONLY
-    | os.O_CREAT
-    | os.O_EXCL
-    | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
-)
+_CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
 def _object_pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -357,13 +298,10 @@ def _exact_json_equal(left: Any, right: Any) -> bool:
     if type(left) is not type(right):
         return False
     if type(left) is dict:
-        return set(left) == set(right) and all(
-            _exact_json_equal(left[key], right[key]) for key in left
-        )
+        return set(left) == set(right) and all(_exact_json_equal(left[key], right[key]) for key in left)
     if type(left) is list:
         return len(left) == len(right) and all(
-            _exact_json_equal(left_item, right_item)
-            for left_item, right_item in zip(left, right, strict=True)
+            _exact_json_equal(left_item, right_item) for left_item, right_item in zip(left, right, strict=True)
         )
     return bool(left == right)
 
@@ -400,21 +338,36 @@ def _read_all(fd: int, *, maximum: int = 1 << 20) -> bytes:
 
 
 def _sha256_regular_file(path: Path) -> str:
-    if path.is_symlink():
-        raise ValueError(f"strict Gym source must not be a symlink: {path}")
+    pre_named = path.lstat()
+    if not stat.S_ISREG(pre_named.st_mode) or pre_named.st_nlink != 1:
+        raise ValueError(f"strict Gym source must be one regular inode: {path}")
     fd = os.open(path, _READ_FLAGS)
     try:
         before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        if (
+            _stat_fingerprint(pre_named) != _stat_fingerprint(before)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+        ):
             raise ValueError(f"strict Gym source must be one regular inode: {path}")
         digest = hashlib.sha256()
-        while chunk := os.read(fd, 1024 * 1024):
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ValueError(f"strict Gym source truncated while read: {path}")
             digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise ValueError(f"strict Gym source grew while read: {path}")
         after = os.fstat(fd)
         path_info = path.lstat()
-        if _stat_fingerprint(before) != _stat_fingerprint(after) or _stat_fingerprint(
-            after
-        ) != _stat_fingerprint(path_info):
+        if not (
+            _stat_fingerprint(pre_named)
+            == _stat_fingerprint(before)
+            == _stat_fingerprint(after)
+            == _stat_fingerprint(path_info)
+        ):
             raise ValueError(f"strict Gym source changed while it was read: {path}")
         return digest.hexdigest()
     finally:
@@ -426,31 +379,19 @@ def _package_tree_identity(package_root: Path) -> tuple[Path, str, int, int]:
     resolved_root = package_root.resolve(strict=True)
     entries: list[dict[str, Any]] = []
     total_bytes = 0
-    for directory, directory_names, file_names in os.walk(
-        resolved_root, followlinks=False
-    ):
-        if "__pycache__" in directory_names or any(
-            name.endswith(".pyc") for name in file_names
-        ):
-            raise ValueError(
-                "reasoning-gym package contains executable unpinned bytecode"
-            )
+    for directory, directory_names, file_names in os.walk(resolved_root, followlinks=False):
+        if "__pycache__" in directory_names or any(name.endswith(".pyc") for name in file_names):
+            raise ValueError("reasoning-gym package contains executable unpinned bytecode")
         directory_names.sort()
         file_names.sort()
         base = Path(directory)
         for name in directory_names:
             if (base / name).is_symlink():
-                raise ValueError(
-                    "reasoning-gym package contains a nested directory symlink"
-                )
+                raise ValueError("reasoning-gym package contains a nested directory symlink")
         for name in file_names:
             path = base / name
             info = path.lstat()
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_nlink != 1
-                or info.st_uid != os.geteuid()
-            ):
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
                 raise ValueError("reasoning-gym package contains an untrusted inode")
             relative = path.relative_to(resolved_root).as_posix()
             entries.append(
@@ -477,16 +418,23 @@ def _require_exact_keys(value: Any, keys: set[str], *, name: str) -> Mapping[str
     return value
 
 
-def _load_canonical_document(
-    path: Path, *, expected_mode: int = 0o400
-) -> tuple[dict[str, Any], bytes]:
-    if path.is_symlink():
+def _load_canonical_document(path: Path, *, expected_mode: int = 0o400) -> tuple[dict[str, Any], bytes]:
+    pre_named = path.lstat()
+    if stat.S_ISLNK(pre_named.st_mode):
         raise ValueError(f"strict Gym child artifact is a symlink: {path}")
+    if (
+        not stat.S_ISREG(pre_named.st_mode)
+        or stat.S_IMODE(pre_named.st_mode) != expected_mode
+        or pre_named.st_uid != os.geteuid()
+        or pre_named.st_nlink != 1
+    ):
+        raise ValueError(f"strict Gym child artifact inode is invalid: {path}")
     fd = os.open(path, _READ_FLAGS)
     try:
         before = os.fstat(fd)
         if (
-            not stat.S_ISREG(before.st_mode)
+            _stat_fingerprint(pre_named) != _stat_fingerprint(before)
+            or not stat.S_ISREG(before.st_mode)
             or stat.S_IMODE(before.st_mode) != expected_mode
             or before.st_uid != os.geteuid()
             or before.st_nlink != 1
@@ -495,32 +443,43 @@ def _load_canonical_document(
         payload = _read_all(fd)
         after = os.fstat(fd)
         path_info = path.lstat()
-        if _stat_fingerprint(before) != _stat_fingerprint(after) or _stat_fingerprint(
-            after
-        ) != _stat_fingerprint(path_info):
+        if not (
+            _stat_fingerprint(pre_named)
+            == _stat_fingerprint(before)
+            == _stat_fingerprint(after)
+            == _stat_fingerprint(path_info)
+        ):
             raise ValueError(f"strict Gym child artifact changed while read: {path}")
     finally:
         os.close(fd)
+    return _load_canonical_payload(
+        payload,
+        name=f"strict Gym child artifact {path}",
+    )
+
+
+def _load_canonical_payload(
+    payload: bytes,
+    *,
+    name: str,
+) -> tuple[dict[str, Any], bytes]:
+    """Decode one already-owned canonical child-artifact payload without I/O."""
+    if type(payload) is not bytes or not 1 <= len(payload) <= 1 << 20:
+        raise ValueError(f"{name} payload type or size is invalid")
     try:
         value = json.loads(
             payload.decode("ascii"),
             object_pairs_hook=_object_pairs_no_duplicates,
-            parse_constant=lambda item: (_ for _ in ()).throw(
-                ValueError(f"invalid JSON constant {item!r}")
-            ),
+            parse_constant=lambda item: (_ for _ in ()).throw(ValueError(f"invalid JSON constant {item!r}")),
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-        raise ValueError(
-            f"strict Gym child artifact is not strict JSON: {path}"
-        ) from error
+        raise ValueError(f"{name} is not strict JSON") from error
     if not isinstance(value, dict) or canonical_ascii_json(value) != payload:
-        raise ValueError(f"strict Gym child artifact is not canonical JSON: {path}")
+        raise ValueError(f"{name} is not canonical JSON")
     return value, payload
 
 
-def _publish_document(
-    root_fd: int, filename: str, document: Mapping[str, Any]
-) -> tuple[str, str]:
+def _publish_document(root_fd: int, filename: str, document: Mapping[str, Any]) -> tuple[str, str]:
     if not filename or filename in {".", ".."} or "/" in filename:
         raise ValueError("strict Gym child artifact filename is invalid")
     payload = canonical_ascii_json(document)
@@ -542,9 +501,7 @@ def _publish_document(
             or info.st_nlink != 1
             or info.st_size != len(payload)
         ):
-            raise RuntimeError(
-                "strict Gym child artifact publication validation failed"
-            )
+            raise RuntimeError("strict Gym child artifact publication validation failed")
     finally:
         os.close(fd)
     os.fsync(root_fd)
@@ -558,11 +515,7 @@ def _require_private_canonical_directory(path: Path, *, name: str) -> Path:
     if resolved != path:
         raise ValueError(f"{name} must be lexical-canonical")
     info = path.stat()
-    if (
-        not stat.S_ISDIR(info.st_mode)
-        or stat.S_IMODE(info.st_mode) != 0o700
-        or info.st_uid != os.geteuid()
-    ):
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.geteuid():
         raise ValueError(f"{name} must be an owned mode-0700 directory")
     return resolved
 
@@ -573,10 +526,7 @@ def _require_sealed_bootstrap_root() -> tuple[Path, str]:
         raise ValueError("strict Gym child bootstrap root is not canonical")
     entries = sorted(item.name for item in root.iterdir())
     if entries != ["sitecustomize.py"]:
-        raise ValueError(
-            "strict Gym child bootstrap root must contain only sitecustomize.py; "
-            f"found {entries!r}"
-        )
+        raise ValueError("strict Gym child bootstrap root must contain only sitecustomize.py; " f"found {entries!r}")
     root_info = root.stat()
     source = root / "sitecustomize.py"
     source_info = source.lstat()
@@ -598,35 +548,25 @@ def _require_sealed_bootstrap_root() -> tuple[Path, str]:
     return root, _sha256_regular_file(source)
 
 
-def _target_matrix(
-    environment: str, gym_root: Path, *, scope: str = "main"
-) -> list[dict[str, Any]]:
+def _target_matrix(environment: str, gym_root: Path, *, scope: str = "main") -> list[dict[str, Any]]:
     if environment not in _RESOURCE_TARGETS:
         raise ValueError("strict Gym environment is not admitted")
     if scope not in {"main", "scorer-only"}:
         raise ValueError("strict Gym child attestation scope is not admitted")
     resource = dict(_RESOURCE_TARGETS[environment])
     if scope == "scorer-only" and environment == "reasoning_gym":
-        resource["config_relative"] = (
-            "resources_servers/reasoning_gym/configs/resources_only.yaml"
-        )
-        resource["config_sha256"] = (
-            "e11a3084f050e4c24101550f63efe71ac6c10f3bc125489ba7293cd81778de68"
-        )
+        resource["config_relative"] = "resources_servers/reasoning_gym/configs/resources_only.yaml"
+        resource["config_sha256"] = "e11a3084f050e4c24101550f63efe71ac6c10f3bc125489ba7293cd81778de68"
     agent = dict(_SIMPLE_AGENT)
     agent.update(
         {
             "config_path": _AGENT_CONFIG_PATHS[environment],
             "config_relative": resource["config_relative"],
             "config_sha256": resource["config_sha256"],
-            "requirements_relative": (
-                "responses_api_agents/simple_agent/requirements.txt"
-            ),
+            "requirements_relative": ("responses_api_agents/simple_agent/requirements.txt"),
             # Runtime metadata is the effective pin for this skip-venv path;
             # retain the exact requirements bytes as source provenance too.
-            "requirements_sha256": (
-                "18e0d5e99020599c4d033912b39d4569276b1b9278db73469ea9708742cfaa7d"
-            ),
+            "requirements_sha256": ("18e0d5e99020599c4d033912b39d4569276b1b9278db73469ea9708742cfaa7d"),
             "resource_config_path": resource["config_path"],
         }
     )
@@ -637,12 +577,7 @@ def _target_matrix(
     for template in templates:
         target = dict(template)
         component_dir = gym_root / target["component_relative"]
-        venv = (
-            STRICT_GYM_VENV_ROOT
-            / target["server_type"]
-            / target["server_name"]
-            / ".venv"
-        )
+        venv = STRICT_GYM_VENV_ROOT / target["server_type"] / target["server_name"] / ".venv"
         target["component_dir"] = str(component_dir)
         target["source_path"] = str(gym_root / target["source_relative"])
         target["config_path_source"] = str(gym_root / target["config_relative"])
@@ -666,12 +601,8 @@ def _validate_purelib_pth_inventory(purelib: Path, *, scope: str) -> None:
         raise ValueError("selected Gym scorer-only purelib identity differs")
     if not pth_files:
         return
-    if scope != "scorer-only" or [item.name for item in pth_files] != list(
-        _SCORER_NO_SITE_PTH_FILES
-    ):
-        raise ValueError(
-            "selected Gym child venv has untrusted pre-sitecustomize .pth code"
-        )
+    if scope != "scorer-only" or [item.name for item in pth_files] != list(_SCORER_NO_SITE_PTH_FILES):
+        raise ValueError("selected Gym child venv has untrusted pre-sitecustomize .pth code")
     for pth_file in pth_files:
         identity = _SCORER_NO_SITE_PTH_FILES[pth_file.name]
         before_link = pth_file.lstat()
@@ -722,26 +653,16 @@ def _validate_purelib_pth_inventory(purelib: Path, *, scope: str) -> None:
             or before_target.st_nlink != 1
             or before_target.st_size != identity["size"]
             or _sha256_regular_file(resolved_target) != identity["sha256"]
-            or _stat_fingerprint(resolved_target.lstat())
-            != _stat_fingerprint(before_target)
+            or _stat_fingerprint(resolved_target.lstat()) != _stat_fingerprint(before_target)
             or _stat_fingerprint(pth_file.lstat()) != _stat_fingerprint(before_link)
             or os.readlink(pth_file) != link_target
         ):
             raise ValueError("selected Gym scorer-only venv .pth identity differs")
 
 
-def _validate_pinned_gym_root(
-    gym_root: Path, targets: list[dict[str, Any]], *, scope: str
-) -> None:
-    if (
-        gym_root != STRICT_GYM_ROOT
-        or gym_root.is_symlink()
-        or gym_root.resolve(strict=True) != gym_root
-    ):
-        raise ValueError(
-            "strict Gym root must be the authenticated deployment mount "
-            f"{STRICT_GYM_ROOT}"
-        )
+def _validate_pinned_gym_root(gym_root: Path, targets: list[dict[str, Any]], *, scope: str) -> None:
+    if gym_root != STRICT_GYM_ROOT or gym_root.is_symlink() or gym_root.resolve(strict=True) != gym_root:
+        raise ValueError("strict Gym root must be the authenticated deployment mount " f"{STRICT_GYM_ROOT}")
     for relative, expected in _GYM_SOURCE_PINS.items():
         actual = _sha256_regular_file(gym_root / relative)
         if actual != expected:
@@ -752,25 +673,17 @@ def _validate_pinned_gym_root(
     from omegaconf import DictConfig
 
     if Path(PARENT_DIR).resolve(strict=True) != gym_root:
-        raise ValueError(
-            "imported nemo_gym.PARENT_DIR is not the authenticated Gym root"
-        )
+        raise ValueError("imported nemo_gym.PARENT_DIR is not the authenticated Gym root")
     probe_config = DictConfig({"uv_venv_dir": str(STRICT_GYM_VENV_ROOT)})
     for target in targets:
         component = Path(target["component_dir"])
         if component.is_symlink() or component.resolve(strict=True) != component:
-            raise ValueError(
-                "selected Gym component is not below the authenticated root"
-            )
+            raise ValueError("selected Gym component is not below the authenticated root")
         try:
             component.relative_to(gym_root)
         except ValueError as error:
-            raise ValueError(
-                "selected Gym component escaped the authenticated root"
-            ) from error
-        if (component / "sitecustomize.py").exists() or (
-            component / "sitecustomize"
-        ).exists():
+            raise ValueError("selected Gym component escaped the authenticated root") from error
+        if (component / "sitecustomize.py").exists() or (component / "sitecustomize").exists():
             raise ValueError("selected Gym component shadows strict sitecustomize")
         for path_key, digest_key in (
             ("source_path", "source_sha256"),
@@ -781,14 +694,10 @@ def _validate_pinned_gym_root(
                 raise ValueError(f"selected Gym target differs: {target[path_key]}")
         derived_venv = Path(get_venv_path(component, probe_config))
         if derived_venv != Path(target["venv"]):
-            raise ValueError(
-                "pinned Gym get_venv_path selected an unexpected child venv"
-            )
+            raise ValueError("pinned Gym get_venv_path selected an unexpected child venv")
         interpreter = Path(target["interpreter"])
         resolved_interpreter = interpreter.resolve(strict=True)
-        if not stat.S_ISREG(resolved_interpreter.stat().st_mode) or not os.access(
-            interpreter, os.X_OK
-        ):
+        if not stat.S_ISREG(resolved_interpreter.stat().st_mode) or not os.access(interpreter, os.X_OK):
             raise ValueError("selected Gym child interpreter is not executable")
         purelib = Path(target["venv"]) / "lib" / "python3.13" / "site-packages"
         if purelib.resolve(strict=True) != purelib:
@@ -796,15 +705,9 @@ def _validate_pinned_gym_root(
         _validate_purelib_pth_inventory(purelib, scope=scope)
 
 
-def _strict_environment_value(
-    name: str, *, pattern: re.Pattern[str] | None = None
-) -> str:
+def _strict_environment_value(name: str, *, pattern: re.Pattern[str] | None = None) -> str:
     value = os.environ.get(name)
-    if (
-        not isinstance(value, str)
-        or not value
-        or (pattern is not None and pattern.fullmatch(value) is None)
-    ):
+    if not isinstance(value, str) or not value or (pattern is not None and pattern.fullmatch(value) is None):
         raise ValueError(f"strict Gym child runtime requires valid {name}")
     return value
 
@@ -886,9 +789,7 @@ def _proc_status_tgid(path: Path) -> int:
     payload = path.read_bytes()
     if len(payload) > 1 << 20:
         raise ValueError("strict Gym child proc status is too large")
-    values = [
-        line.split()[1] for line in payload.splitlines() if line.startswith(b"Tgid:")
-    ]
+    values = [line.split()[1] for line in payload.splitlines() if line.startswith(b"Tgid:")]
     if len(values) != 1:
         raise ValueError("strict Gym child proc status has no exact TGID")
     try:
@@ -900,9 +801,7 @@ def _proc_status_tgid(path: Path) -> int:
     return tgid
 
 
-def _process_descendant_identities(
-    pid: int, *, proc_root: Path = Path("/proc")
-) -> list[tuple[int, int]]:
+def _process_descendant_identities(pid: int, *, proc_root: Path = Path("/proc")) -> list[tuple[int, int]]:
     """Return child identities found across every task in each process."""
     pending = [pid]
     seen = {pid}
@@ -915,9 +814,7 @@ def _process_descendant_identities(
             entries = list(task_root.iterdir())
             if len(entries) > 4096:
                 raise ValueError("strict Gym child process has too many tasks")
-            if any(
-                not item.name.isascii() or not item.name.isdecimal() for item in entries
-            ):
+            if any(not item.name.isascii() or not item.name.isdecimal() for item in entries):
                 raise ValueError("strict Gym child task directory is malformed")
             return sorted(int(item.name) for item in entries)
 
@@ -935,9 +832,7 @@ def _process_descendant_identities(
             try:
                 children.update(int(item) for item in payload.split())
             except ValueError as error:
-                raise ValueError(
-                    "strict Gym child process-tree record is malformed"
-                ) from error
+                raise ValueError("strict Gym child process-tree record is malformed") from error
         if task_ids() != tasks_before:
             raise RuntimeError("strict Gym child task set changed during inspection")
         for child in sorted(children):
@@ -947,9 +842,7 @@ def _process_descendant_identities(
                 raise RuntimeError("strict Gym child descendant TGID differs")
             observed_parent, start_ticks = _process_stat(child, proc_root=proc_root)
             if observed_parent != parent or start_ticks <= 0:
-                raise RuntimeError(
-                    "strict Gym child process tree changed during inspection"
-                )
+                raise RuntimeError("strict Gym child process tree changed during inspection")
             seen.add(child)
             pending.append(child)
             descendants.append((child, start_ticks))
@@ -985,11 +878,7 @@ def _listening_socket_inodes(pid: int, host: str, port: int) -> list[int]:
                 inode = int(fields[9])
             except (IndexError, ValueError):
                 continue
-            if (
-                local_address == expected_address
-                and local_port == port
-                and inode in owned
-            ):
+            if local_address == expected_address and local_port == port and inode in owned:
                 listeners.add(inode)
     return sorted(listeners)
 
@@ -1006,10 +895,7 @@ def _linux_pidfd_syscall_number(name: str) -> int:
     architecture = os.uname().machine
     numbers = _LINUX_PIDFD_SYSCALL_NUMBERS.get(architecture)
     if numbers is None or name not in numbers:
-        raise RuntimeError(
-            "strict Gym child quiescence has no pinned pidfd syscall ABI for "
-            f"{architecture!r}"
-        )
+        raise RuntimeError("strict Gym child quiescence has no pinned pidfd syscall ABI for " f"{architecture!r}")
     return numbers[name]
 
 
@@ -1074,12 +960,7 @@ def _terminate_authenticated_process(
     kill_timeout_ms: int = 5_000,
 ) -> str:
     """Stop the exact authenticated Linux process without a PID-reuse race."""
-    if (
-        type(pid) is not int
-        or pid <= 1
-        or type(start_ticks) is not int
-        or start_ticks <= 0
-    ):
+    if type(pid) is not int or pid <= 1 or type(start_ticks) is not int or start_ticks <= 0:
         raise ValueError("strict Gym child process identity is invalid")
     if type(interrupt_timeout_ms) is not int or interrupt_timeout_ms <= 0:
         raise ValueError("strict Gym child interrupt timeout is invalid")
@@ -1114,9 +995,7 @@ def _terminate_authenticated_process(
             raise RuntimeError("strict Gym child PID changed during termination")
         _pidfd_send_signal(pidfd, signal.SIGKILL)
         if not poller.poll(kill_timeout_ms):
-            raise RuntimeError(
-                "strict Gym child did not exit after authenticated SIGKILL"
-            )
+            raise RuntimeError("strict Gym child did not exit after authenticated SIGKILL")
         return "SIGKILL"
     finally:
         os.close(pidfd)
@@ -1146,18 +1025,13 @@ def _validate_receipt(
         "scorer",
     }
     receipt = _require_exact_keys(document, keys, name="strict child receipt")
-    if (
-        receipt["schema"] != STRICT_GYM_CHILD_RECEIPT_SCHEMA
-        or receipt["hash_domain"] != STRICT_GYM_CHILD_HASH_DOMAIN
-    ):
+    if receipt["schema"] != STRICT_GYM_CHILD_RECEIPT_SCHEMA or receipt["hash_domain"] != STRICT_GYM_CHILD_HASH_DOMAIN:
         raise ValueError("strict Gym child receipt schema mismatch")
     for name in ("environment", "pair_id", "job_id"):
         if receipt[name] != spec[name]:
             raise ValueError(f"strict Gym child receipt {name} mismatch")
     expected_stage = (
-        "isolated-runner-pre-entrypoint"
-        if spec["scope"] == "scorer-only"
-        else "sitecustomize-pre-entrypoint"
+        "isolated-runner-pre-entrypoint" if spec["scope"] == "scorer-only" else "sitecustomize-pre-entrypoint"
     )
     if receipt["stage"] != expected_stage:
         raise ValueError("strict Gym child receipt stage mismatch")
@@ -1216,9 +1090,7 @@ def _validate_receipt(
         raise ValueError("strict Gym child server port is outside the pinned range")
     if server["host"] != "127.0.0.1":
         raise ValueError("strict Gym child server host is not pinned loopback")
-    if server["num_workers"] is not None and (
-        type(server["num_workers"]) is not int or server["num_workers"] != 1
-    ):
+    if server["num_workers"] is not None and (type(server["num_workers"]) is not int or server["num_workers"] != 1):
         raise ValueError("strict Gym child attestation requires one uvicorn process")
 
     process = _require_exact_keys(
@@ -1262,10 +1134,7 @@ def _validate_receipt(
         or process["boot_id"] != _boot_id()
     ):
         raise ValueError("strict Gym child boot identity is invalid")
-    if (
-        type(process["hostname"]) is not str
-        or process["hostname"] != socket.gethostname()
-    ):
+    if type(process["hostname"]) is not str or process["hostname"] != socket.gethostname():
         raise ValueError("strict Gym child hostname differs from the attestor")
     current_ppid, current_start_ticks = _process_stat(pid)
     if current_start_ticks != process["start_ticks"]:
@@ -1285,17 +1154,13 @@ def _validate_receipt(
     if process["cwd"] != target["component_dir"]:
         raise ValueError("strict Gym child cwd is not the authenticated component")
     if process["sys_executable"] != target["interpreter"]:
-        raise ValueError(
-            "strict Gym child interpreter differs from pinned get_venv_path"
-        )
+        raise ValueError("strict Gym child interpreter differs from pinned get_venv_path")
     if process["sys_prefix"] != target["venv"]:
         raise ValueError("strict Gym child sys.prefix differs from selected venv")
     if process["sys_base_prefix"] == process["sys_prefix"]:
         raise ValueError("strict Gym child did not execute in a venv")
     if spec["scope"] == "scorer-only":
-        bootstrap_path = str(
-            Path(spec["bootstrap"]["root"]) / spec["bootstrap"]["filename"]
-        )
+        bootstrap_path = str(Path(spec["bootstrap"]["root"]) / spec["bootstrap"]["filename"])
         expected_sys_argv = [bootstrap_path, target["source_path"]]
         expected_proc_argv = [
             target["interpreter"],
@@ -1308,20 +1173,13 @@ def _validate_receipt(
     else:
         expected_sys_argv = [target["entrypoint"]]
         expected_proc_argv = ["python", target["entrypoint"]]
-    if (
-        process["sys_argv"] != expected_sys_argv
-        or process["proc_argv"] != expected_proc_argv
-    ):
-        raise ValueError(
-            "strict Gym child entrypoint argv differs from pinned RunHelper"
-        )
+    if process["sys_argv"] != expected_sys_argv or process["proc_argv"] != expected_proc_argv:
+        raise ValueError("strict Gym child entrypoint argv differs from pinned RunHelper")
     if _process_descendant_identities(pid):
         raise ValueError("strict Gym child unexpectedly owns descendant processes")
 
     if receipt["distribution_versions"] != target["distribution_versions"]:
-        raise ValueError(
-            "strict Gym child distribution metadata differs from pinned runtime"
-        )
+        raise ValueError("strict Gym child distribution metadata differs from pinned runtime")
     if receipt["module_versions"] != target["module_versions"]:
         raise ValueError("strict Gym child module versions differ from pinned runtime")
     expected_scorer = target["scorer"]
@@ -1350,31 +1208,21 @@ def _validate_receipt(
                 raise ValueError(f"strict Gym child scorer {name} mismatch")
         purelib = Path(target["venv"]) / "lib" / "python3.13" / "site-packages"
         package_root = purelib / "reasoning_gym"
-        resolved_package, tree_sha256, file_count, total_bytes = _package_tree_identity(
-            package_root
-        )
-        expected_module_origin = (
-            purelib / expected_scorer["module_origin_relative_to_purelib"]
-        )
-        expected_resolver_origin = (
-            purelib / expected_scorer["resolver_origin_relative_to_purelib"]
-        )
+        resolved_package, tree_sha256, file_count, total_bytes = _package_tree_identity(package_root)
+        expected_module_origin = purelib / expected_scorer["module_origin_relative_to_purelib"]
+        expected_resolver_origin = purelib / expected_scorer["resolver_origin_relative_to_purelib"]
         expected_origin = purelib / expected_scorer["origin_relative_to_purelib"]
         if (
             scorer["package_root"] != str(package_root)
             or scorer["package_resolved_root"] != str(resolved_package)
             or scorer["module_origin"] != str(expected_module_origin)
-            or scorer["module_resolved_origin"]
-            != str(expected_module_origin.resolve(strict=True))
+            or scorer["module_resolved_origin"] != str(expected_module_origin.resolve(strict=True))
             or scorer["resolver_origin"] != str(expected_resolver_origin)
-            or scorer["resolver_resolved_origin"]
-            != str(expected_resolver_origin.resolve(strict=True))
+            or scorer["resolver_resolved_origin"] != str(expected_resolver_origin.resolve(strict=True))
             or scorer["origin"] != str(expected_origin)
             or scorer["resolved_origin"] != str(expected_origin.resolve(strict=True))
-            or _sha256_regular_file(expected_module_origin)
-            != expected_scorer["module_sha256"]
-            or _sha256_regular_file(expected_resolver_origin)
-            != expected_scorer["resolver_sha256"]
+            or _sha256_regular_file(expected_module_origin) != expected_scorer["module_sha256"]
+            or _sha256_regular_file(expected_resolver_origin) != expected_scorer["resolver_sha256"]
             or _sha256_regular_file(expected_origin) != expected_scorer["sha256"]
             or (tree_sha256, file_count, total_bytes)
             != (
@@ -1383,9 +1231,7 @@ def _validate_receipt(
                 expected_scorer["package_total_bytes"],
             )
         ):
-            raise ValueError(
-                "strict Gym child scorer package origins/tree differ from pinned runtime"
-            )
+            raise ValueError("strict Gym child scorer package origins/tree differ from pinned runtime")
 
     listener_inodes = _listening_socket_inodes(pid, server["host"], server["port"])
     if not listener_inodes:
@@ -1414,9 +1260,7 @@ def reasoning_score_call_expectation(
         or not 0.0 <= float_result <= 1.0
         or (float_result == 0.0 and math.copysign(1.0, float_result) < 0.0)
     ):
-        raise ValueError(
-            "strict reasoning replay reward must be a finite float in [0,1]"
-        )
+        raise ValueError("strict reasoning replay reward must be a finite float in [0,1]")
     return {
         "task_name": task_name,
         "answer_sha256": _sha256_bytes(canonical_ascii_json(answer)),
@@ -1461,9 +1305,7 @@ def _validate_score_call(
         or call["sequence"] != sequence
     ):
         raise ValueError(f"reasoning score call {sequence} identity mismatch")
-    call_process = _require_exact_keys(
-        call["process"], {"pid", "start_ticks"}, name="reasoning score process"
-    )
+    call_process = _require_exact_keys(call["process"], {"pid", "start_ticks"}, name="reasoning score process")
     if (
         type(call_process["pid"]) is not int
         or type(call_process["start_ticks"]) is not int
@@ -1498,9 +1340,7 @@ def _validate_score_call(
         or (result == 0.0 and math.copysign(1.0, result) < 0.0)
         or outcome != {"kind": "returned", "float_result": expected["float_result"]}
     ):
-        raise ValueError(
-            f"reasoning score call {sequence} did not return the expected reward"
-        )
+        raise ValueError(f"reasoning score call {sequence} did not return the expected reward")
 
 
 def _require_exact_format_json(value: Any, *, name: str) -> None:
@@ -1569,9 +1409,7 @@ def _format_result(
         spurious: list[str] = []
         for pattern in patterns:
             spurious.extend(
-                match.group(0)
-                for match in re.finditer(pattern, text)
-                if match.group(0) not in expected_set
+                match.group(0) for match in re.finditer(pattern, text) if match.group(0) not in expected_set
             )
         details = {
             "expected": list(expected),
@@ -1597,11 +1435,7 @@ def _format_result(
         ):
             raise TypeError("freeform verifier regex/minimum differs")
         compiled = [re.compile(pattern) for pattern in patterns]
-        matching_lines = sum(
-            1
-            for line in text.split("\n")
-            if any(regex.search(line) for regex in compiled)
-        )
+        matching_lines = sum(1 for line in text.split("\n") if any(regex.search(line) for regex in compiled))
         details = {
             "matching_lines": matching_lines,
             "min_matches": minimum,
@@ -1632,8 +1466,7 @@ def format_verification_call_expectation(
     _require_exact_format_json(derived_verifier_request, name="format verifier request")
     _require_exact_format_json(verifier_response, name="format verifier response")
     request = {
-        name: deepcopy(derived_verifier_request[name])
-        for name in ("responses_create_params", "response", "verifier")
+        name: deepcopy(derived_verifier_request[name]) for name in ("responses_create_params", "response", "verifier")
     }
     response = deepcopy(verifier_response)
     expected_response_keys = {
@@ -1713,9 +1546,7 @@ def _validate_format_call(
         or call["method"] != expected["method"]
     ):
         raise ValueError(f"format verification call {sequence} identity mismatch")
-    call_process = _require_exact_keys(
-        call["process"], {"pid", "start_ticks"}, name="format verification process"
-    )
+    call_process = _require_exact_keys(call["process"], {"pid", "start_ticks"}, name="format verification process")
     if not _exact_json_equal(
         call_process,
         {"pid": process["pid"], "start_ticks": process["start_ticks"]},
@@ -1726,10 +1557,7 @@ def _validate_format_call(
         {"request_sha256", "verifier_sha256", "response_text_sha256"},
         name="format verification input",
     )
-    expected_input = {
-        name: expected[name]
-        for name in ("request_sha256", "verifier_sha256", "response_text_sha256")
-    }
+    expected_input = {name: expected[name] for name in ("request_sha256", "verifier_sha256", "response_text_sha256")}
     if not _exact_json_equal(call_input, expected_input):
         raise ValueError(f"format verification call {sequence} input mismatch")
     outcome = _require_exact_keys(
@@ -1746,10 +1574,7 @@ def _validate_format_call(
     if (
         type(outcome["float_result"]) is not float
         or outcome["float_result"] not in (0.0, 1.0)
-        or (
-            outcome["float_result"] == 0.0
-            and math.copysign(1.0, outcome["float_result"]) < 0.0
-        )
+        or (outcome["float_result"] == 0.0 and math.copysign(1.0, outcome["float_result"]) < 0.0)
         or not _exact_json_equal(outcome, expected_outcome)
     ):
         raise ValueError(f"format verification call {sequence} outcome mismatch")
@@ -1767,12 +1592,8 @@ class StrictGymChildRuntimeSession:
     bootstrap_root: Path
     bootstrap_sha256: str
     spec: dict[str, Any]
-    _started_index: dict[str, Any] | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
-    _started_index_sha256: str | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
+    _started_index: dict[str, Any] | None = field(default=None, init=False, repr=False, compare=False)
+    _started_index_sha256: str | None = field(default=None, init=False, repr=False, compare=False)
     _score_finalized: bool = field(default=False, init=False, repr=False, compare=False)
 
     @contextmanager
@@ -1782,9 +1603,7 @@ class StrictGymChildRuntimeSession:
             import ray
 
             if not ray.is_initialized():
-                raise RuntimeError(
-                    "scorer-only Gym launch requires Ray initialized before hook injection"
-                )
+                raise RuntimeError("scorer-only Gym launch requires Ray initialized before hook injection")
 
             # The pinned RunHelper normally renders a Bash command that sources
             # a persistent venv activation script and then invokes bare
@@ -1812,23 +1631,17 @@ class StrictGymChildRuntimeSession:
             sentinel = "NRL_STRICT_DIRECT_SCORER_LAUNCH_V1"
             setup_state: dict[str, Any] = {}
 
-            def strict_setup_env_command(
-                dir_path: Path, global_config_dict: Any, prefix: str
-            ) -> str:
+            def strict_setup_env_command(dir_path: Path, global_config_dict: Any, prefix: str) -> str:
                 if setup_state:
-                    raise RuntimeError(
-                        "strict scorer setup was rendered more than once"
-                    )
+                    raise RuntimeError("strict scorer setup was rendered more than once")
                 if (
                     Path(dir_path).resolve(strict=True) != component
                     or prefix != target["config_path"]
                     or global_config_dict.get("skip_venv_if_present") is not True
                     or global_config_dict.get("dry_run") is not False
                     or "nemo_gym_log_dir" in global_config_dict
-                    or Path(global_config_dict.get("uv_venv_dir", ""))
-                    != STRICT_GYM_VENV_ROOT
-                    or Path(setup_command.get_venv_path(dir_path, global_config_dict))
-                    != Path(target["venv"])
+                    or Path(global_config_dict.get("uv_venv_dir", "")) != STRICT_GYM_VENV_ROOT
+                    or Path(setup_command.get_venv_path(dir_path, global_config_dict)) != Path(target["venv"])
                 ):
                     raise RuntimeError("strict scorer RunHelper setup differs")
                 setup_state.update(
@@ -1851,9 +1664,7 @@ class StrictGymChildRuntimeSession:
                 stderr_target: Any = None,
             ) -> subprocess.Popen[bytes]:
                 if setup_state.get("process_started") is not None:
-                    raise RuntimeError(
-                        "strict scorer process was launched more than once"
-                    )
+                    raise RuntimeError("strict scorer process was launched more than once")
                 if set(setup_state) != {"config", "config_path", "yaml"}:
                     raise RuntimeError("strict scorer setup was not authenticated")
                 escaped_yaml = shlex.quote(setup_state["yaml"])
@@ -1929,9 +1740,7 @@ class StrictGymChildRuntimeSession:
                 gym_env.setup_env_command = original_setup
                 gym_env.run_command = original_run
                 if replacement_changed and not primary_failure:
-                    raise RuntimeError(
-                        "strict scorer launch functions changed during RunHelper.start"
-                    )
+                    raise RuntimeError("strict scorer launch functions changed during RunHelper.start")
             if setup_state.get("process_started") is None:
                 raise RuntimeError("strict scorer RunHelper launched no process")
             return
@@ -1953,17 +1762,12 @@ class StrictGymChildRuntimeSession:
         scrubbed_names = {
             name
             for name in os.environ
-            if name in _PRE_PYTHON_INJECTION_ENV_NAMES
-            or name.startswith(_PRE_PYTHON_INJECTION_ENV_PREFIXES)
+            if name in _PRE_PYTHON_INJECTION_ENV_NAMES or name.startswith(_PRE_PYTHON_INJECTION_ENV_PREFIXES)
         }
-        previous = {
-            name: os.environ.get(name) for name in scrubbed_names | set(controlled)
-        }
+        previous = {name: os.environ.get(name) for name in scrubbed_names | set(controlled)}
         for name in (_SPEC_ENV, _SPEC_SHA_ENV, _BOOTSTRAP_ENV, _BOOTSTRAP_SHA_ENV):
             if previous[name] not in (None, ""):
-                raise RuntimeError(
-                    f"strict Gym child control variable was pre-set: {name}"
-                )
+                raise RuntimeError(f"strict Gym child control variable was pre-set: {name}")
         try:
             for name in scrubbed_names:
                 os.environ.pop(name, None)
@@ -1991,9 +1795,7 @@ class StrictGymChildRuntimeSession:
         instances = getattr(run_helper, "_server_instance_display_configs", None)
         processes = getattr(run_helper, "_processes", None)
         if not isinstance(instances, list) or not isinstance(processes, dict):
-            raise RuntimeError(
-                "strict Gym child attestation requires RunHelper metadata"
-            )
+            raise RuntimeError("strict Gym child attestation requires RunHelper metadata")
 
         expected_files = {"spec.json"}
         records: list[dict[str, Any]] = []
@@ -2011,28 +1813,18 @@ class StrictGymChildRuntimeSession:
                     f"{target['role']} instance; found {len(matches)}"
                 )
             instance = matches[0]
-            if Path(getattr(instance, "dir_path", "")).resolve(strict=True) != Path(
-                target["component_dir"]
-            ):
-                raise RuntimeError(
-                    "RunHelper selected a shadow Gym component directory"
-                )
+            if Path(getattr(instance, "dir_path", "")).resolve(strict=True) != Path(target["component_dir"]):
+                raise RuntimeError("RunHelper selected a shadow Gym component directory")
             process = processes.get(target["config_path"])
             wrapper_pid = getattr(process, "pid", None)
-            if (
-                process is None
-                or type(wrapper_pid) is not int
-                or process.poll() is not None
-            ):
+            if process is None or type(wrapper_pid) is not int or process.poll() is not None:
                 raise RuntimeError("selected RunHelper wrapper process is not live")
             if getattr(instance, "pid", None) != wrapper_pid:
                 raise RuntimeError("RunHelper process table and display PID differ")
 
             filename = target["receipt_filename"]
             expected_files.add(filename)
-            receipt, receipt_payload = _load_canonical_document(
-                self.receipt_root / filename
-            )
+            receipt, receipt_payload = _load_canonical_document(self.receipt_root / filename)
             observation = _validate_receipt(
                 receipt,
                 spec=self.spec,
@@ -2056,8 +1848,7 @@ class StrictGymChildRuntimeSession:
         actual_files = {item.name for item in self.receipt_root.iterdir()}
         if actual_files != expected_files:
             raise RuntimeError(
-                "strict Gym child receipt root has an unexpected inventory: "
-                f"{sorted(actual_files)!r}"
+                "strict Gym child receipt root has an unexpected inventory: " f"{sorted(actual_files)!r}"
             )
         index = {
             "schema": STRICT_GYM_CHILD_INDEX_SCHEMA,
@@ -2098,9 +1889,7 @@ class StrictGymChildRuntimeSession:
         authenticated replay driver.
         """
         if self.scope != "scorer-only" or self.environment != "reasoning_gym":
-            raise RuntimeError(
-                "score-call finalization is only valid for scorer-only reasoning replay"
-            )
+            raise RuntimeError("score-call finalization is only valid for scorer-only reasoning replay")
         if self._score_finalized:
             raise RuntimeError("strict reasoning score calls were already finalized")
         if isinstance(expected_calls, (str, bytes)) or len(expected_calls) != 4:
@@ -2115,10 +1904,7 @@ class StrictGymChildRuntimeSession:
             if expected["task_name"] != "knights_knaves":
                 raise ValueError("expected reasoning task differs from pinned scorer")
             for name in ("answer_sha256", "entry_sha256"):
-                if (
-                    type(expected[name]) is not str
-                    or _SHA256_RE.fullmatch(expected[name]) is None
-                ):
+                if type(expected[name]) is not str or _SHA256_RE.fullmatch(expected[name]) is None:
                     raise ValueError(f"expected reasoning score {name} is invalid")
             reward = expected["float_result"]
             if (
@@ -2127,16 +1913,12 @@ class StrictGymChildRuntimeSession:
                 or not 0.0 <= reward <= 1.0
                 or (reward == 0.0 and math.copysign(1.0, reward) < 0.0)
             ):
-                raise ValueError(
-                    "expected reasoning reward must be finite float in [0,1]"
-                )
+                raise ValueError("expected reasoning reward must be finite float in [0,1]")
             normalized.append(dict(expected))
 
         spec, spec_payload = _load_canonical_document(self.spec_path)
         if spec != self.spec or _sha256_bytes(spec_payload) != self.spec_sha256:
-            raise RuntimeError(
-                "strict Gym child spec changed before score finalization"
-            )
+            raise RuntimeError("strict Gym child spec changed before score finalization")
         child_index_path = self.receipt_root / "index.json"
         child_index, child_index_payload = _load_canonical_document(child_index_path)
         if (
@@ -2145,9 +1927,7 @@ class StrictGymChildRuntimeSession:
             or child_index != self._started_index
             or _sha256_bytes(child_index_payload) != self._started_index_sha256
         ):
-            raise RuntimeError(
-                "strict Gym child index differs from the retained startup attestation"
-            )
+            raise RuntimeError("strict Gym child index differs from the retained startup attestation")
         _require_exact_keys(
             child_index,
             {
@@ -2231,14 +2011,9 @@ class StrictGymChildRuntimeSession:
             or not 5000 <= observation["port"] <= 5999
             or not isinstance(observation["listener_socket_inodes"], list)
             or not observation["listener_socket_inodes"]
-            or any(
-                type(item) is not int or item <= 0
-                for item in observation["listener_socket_inodes"]
-            )
+            or any(type(item) is not int or item <= 0 for item in observation["listener_socket_inodes"])
         ):
-            raise ValueError(
-                "strict reasoning child-index observation types are invalid"
-            )
+            raise ValueError("strict reasoning child-index observation types are invalid")
         server = resource.get("server")
         if not isinstance(server, dict):
             raise ValueError("strict reasoning resource server receipt is invalid")
@@ -2257,15 +2032,12 @@ class StrictGymChildRuntimeSession:
         wrapper_pid = getattr(wrapper_process, "pid", None)
         if (
             len(matches) != 1
-            or Path(getattr(matches[0], "dir_path", "")).resolve(strict=True)
-            != Path(target["component_dir"])
+            or Path(getattr(matches[0], "dir_path", "")).resolve(strict=True) != Path(target["component_dir"])
             or type(wrapper_pid) is not int
             or wrapper_pid != observation["wrapper_pid"]
             or wrapper_process.poll() is not None
         ):
-            raise RuntimeError(
-                "score finalization RunHelper differs from startup attestation"
-            )
+            raise RuntimeError("score finalization RunHelper differs from startup attestation")
         revalidated_observation = _validate_receipt(
             resource,
             spec=spec,
@@ -2303,17 +2075,11 @@ class StrictGymChildRuntimeSession:
             or current_ppid != process["ppid"]
             or process["boot_id"] != _boot_id()
             or process["hostname"] != socket.gethostname()
-            or not _process_is_descendant(
-                process["pid"], observation.get("wrapper_pid", -1)
-            )
+            or not _process_is_descendant(process["pid"], observation.get("wrapper_pid", -1))
             or _process_descendant_identities(process["pid"])
-            or not _listening_socket_inodes(
-                process["pid"], observation.get("host", ""), observation.get("port", -1)
-            )
+            or not _listening_socket_inodes(process["pid"], observation.get("host", ""), observation.get("port", -1))
         ):
-            raise RuntimeError(
-                "strict reasoning scorer process is not the attested live resource"
-            )
+            raise RuntimeError("strict reasoning scorer process is not the attested live resource")
 
         expected_inventory = {
             "spec.json",
@@ -2395,9 +2161,7 @@ class StrictGymChildRuntimeSession:
                     "schema": STRICT_GYM_SCORE_CALL_SCHEMA,
                 },
             ):
-                raise ValueError(
-                    f"strict reasoning score closed call ref {sequence} differs"
-                )
+                raise ValueError(f"strict reasoning score closed call ref {sequence} differs")
             call_payloads.append(payload)
             records.append(
                 {
@@ -2421,34 +2185,21 @@ class StrictGymChildRuntimeSession:
         # resource through a pidfd first: RunHelper owns only its Bash wrapper
         # and, when logging is enabled, that wrapper may head a tee pipeline.
         # Then reap the wrapper and re-read all evidence offline.
-        child_termination_signal = _terminate_authenticated_process(
-            process["pid"], process["start_ticks"]
-        )
+        child_termination_signal = _terminate_authenticated_process(process["pid"], process["start_ticks"])
         run_helper.shutdown()
         wrapper_returncode = wrapper_process.poll()
-        if (
-            type(wrapper_returncode) is not int
-            or getattr(run_helper, "_processes", None) != {}
-        ):
-            raise RuntimeError(
-                "strict reasoning RunHelper did not reap its resource wrapper"
-            )
+        if type(wrapper_returncode) is not int or getattr(run_helper, "_processes", None) != {}:
+            raise RuntimeError("strict reasoning RunHelper did not reap its resource wrapper")
         try:
             _, post_shutdown_start = _process_stat(process["pid"])
         except (FileNotFoundError, ProcessLookupError):
             post_shutdown_start = None
         if post_shutdown_start == process["start_ticks"]:
-            raise RuntimeError(
-                "strict reasoning scorer child remained live after shutdown"
-            )
+            raise RuntimeError("strict reasoning scorer child remained live after shutdown")
 
         offline_spec, offline_spec_payload = _load_canonical_document(self.spec_path)
-        offline_index, offline_index_payload = _load_canonical_document(
-            child_index_path
-        )
-        offline_resource, offline_resource_payload = _load_canonical_document(
-            resource_path
-        )
+        offline_index, offline_index_payload = _load_canonical_document(child_index_path)
+        offline_resource, offline_resource_payload = _load_canonical_document(resource_path)
         offline_closed, offline_closed_payload = _load_canonical_document(closed_path)
         if (
             offline_spec != spec
@@ -2460,21 +2211,15 @@ class StrictGymChildRuntimeSession:
             or offline_closed != closed
             or offline_closed_payload != closed_payload
         ):
-            raise RuntimeError(
-                "strict reasoning evidence changed across scorer shutdown"
-            )
+            raise RuntimeError("strict reasoning evidence changed across scorer shutdown")
         for sequence, original_payload in enumerate(call_payloads, start=1):
             _, offline_payload = _load_canonical_document(
                 self.receipt_root / f"reasoning-score-call-{sequence:08d}.json"
             )
             if offline_payload != original_payload:
-                raise RuntimeError(
-                    "strict reasoning call evidence changed across scorer shutdown"
-                )
+                raise RuntimeError("strict reasoning call evidence changed across scorer shutdown")
         if {item.name for item in self.receipt_root.iterdir()} != expected_inventory:
-            raise RuntimeError(
-                "strict reasoning score-call inventory changed across scorer shutdown"
-            )
+            raise RuntimeError("strict reasoning score-call inventory changed across scorer shutdown")
 
         terminal = {
             "schema": STRICT_GYM_SCORE_CALL_INDEX_SCHEMA,
@@ -2516,9 +2261,7 @@ class StrictGymChildRuntimeSession:
         }
         root_fd = os.open(self.receipt_root, _DIR_FLAGS)
         try:
-            _, digest = _publish_document(
-                root_fd, "reasoning-score-call-index.json", terminal
-            )
+            _, digest = _publish_document(root_fd, "reasoning-score-call-index.json", terminal)
         finally:
             os.close(root_fd)
         final_inventory = {item.name for item in self.receipt_root.iterdir()}
@@ -2545,15 +2288,11 @@ class StrictGymChildRuntimeSession:
         """Close an exact K=4 citation/freeform verifier stream and reap it."""
         profile = _FORMAT_PROFILES.get(self.environment)
         if self.scope != "scorer-only" or profile is None:
-            raise RuntimeError(
-                "format-call finalization requires a scorer-only format replay"
-            )
+            raise RuntimeError("format-call finalization requires a scorer-only format replay")
         if self._score_finalized:
             raise RuntimeError("strict format verifier calls were already finalized")
         if isinstance(expected_calls, (str, bytes)) or len(expected_calls) != 4:
-            raise ValueError(
-                "strict format verification finalization requires exact K=4"
-            )
+            raise ValueError("strict format verification finalization requires exact K=4")
         normalized: list[dict[str, Any]] = []
         expected_keys = {
             "profile_id",
@@ -2590,14 +2329,9 @@ class StrictGymChildRuntimeSession:
                 )
                 or type(expected["float_result"]) is not float
                 or expected["float_result"] not in (0.0, 1.0)
-                or (
-                    expected["float_result"] == 0.0
-                    and math.copysign(1.0, expected["float_result"]) < 0.0
-                )
+                or (expected["float_result"] == 0.0 and math.copysign(1.0, expected["float_result"]) < 0.0)
             ):
-                raise ValueError(
-                    f"expected format verification call {sequence} differs"
-                )
+                raise ValueError(f"expected format verification call {sequence} differs")
             normalized.append(expected)
 
         spec, spec_payload = _load_canonical_document(self.spec_path)
@@ -2617,11 +2351,7 @@ class StrictGymChildRuntimeSession:
         ):
             raise RuntimeError("strict Gym child index changed before finalization")
         children = child_index.get("children")
-        if (
-            not isinstance(children, list)
-            or len(children) != 1
-            or children[0].get("role") != "resource"
-        ):
+        if not isinstance(children, list) or len(children) != 1 or children[0].get("role") != "resource":
             raise ValueError("strict format child index target differs")
         child = children[0]
         target = spec["targets"][0]
@@ -2642,8 +2372,7 @@ class StrictGymChildRuntimeSession:
         wrapper_pid = getattr(wrapper_process, "pid", None)
         if (
             len(matches) != 1
-            or Path(getattr(matches[0], "dir_path", "")).resolve(strict=True)
-            != Path(target["component_dir"])
+            or Path(getattr(matches[0], "dir_path", "")).resolve(strict=True) != Path(target["component_dir"])
             or type(wrapper_pid) is not int
             or wrapper_process.poll() is not None
         ):
@@ -2668,9 +2397,7 @@ class StrictGymChildRuntimeSession:
             or process["hostname"] != socket.gethostname()
             or not _process_is_descendant(process["pid"], wrapper_pid)
             or _process_descendant_identities(process["pid"])
-            or not _listening_socket_inodes(
-                process["pid"], observation["host"], observation["port"]
-            )
+            or not _listening_socket_inodes(process["pid"], observation["host"], observation["port"])
         ):
             raise RuntimeError("strict format verifier is not the attested process")
 
@@ -2679,9 +2406,7 @@ class StrictGymChildRuntimeSession:
             "resource.json",
             "index.json",
             "format-verification-closed.json",
-        } | {
-            f"format-verification-call-{sequence:08d}.json" for sequence in range(1, 5)
-        }
+        } | {f"format-verification-call-{sequence:08d}.json" for sequence in range(1, 5)}
         if {item.name for item in self.receipt_root.iterdir()} != expected_inventory:
             raise RuntimeError("strict format verification inventory differs")
         closed_path = self.receipt_root / "format-verification-closed.json"
@@ -2738,12 +2463,8 @@ class StrictGymChildRuntimeSession:
                 "sha256": _sha256_bytes(payload),
                 "schema": STRICT_GYM_FORMAT_CALL_SCHEMA,
             }
-            if not _exact_json_equal(
-                closed_record["calls"][sequence - 1], expected_ref
-            ):
-                raise ValueError(
-                    f"strict format verification closed ref {sequence} differs"
-                )
+            if not _exact_json_equal(closed_record["calls"][sequence - 1], expected_ref):
+                raise ValueError(f"strict format verification closed ref {sequence} differs")
             call_payloads.append(payload)
             records.append(
                 {
@@ -2767,15 +2488,10 @@ class StrictGymChildRuntimeSession:
                 }
             )
 
-        child_signal = _terminate_authenticated_process(
-            process["pid"], process["start_ticks"]
-        )
+        child_signal = _terminate_authenticated_process(process["pid"], process["start_ticks"])
         run_helper.shutdown()
         wrapper_returncode = wrapper_process.poll()
-        if (
-            type(wrapper_returncode) is not int
-            or getattr(run_helper, "_processes", None) != {}
-        ):
+        if type(wrapper_returncode) is not int or getattr(run_helper, "_processes", None) != {}:
             raise RuntimeError("strict format RunHelper did not reap its wrapper")
         try:
             _, post_shutdown_start = _process_stat(process["pid"])
@@ -2794,9 +2510,7 @@ class StrictGymChildRuntimeSession:
         for filename, payload in offline.items():
             _, reread = _load_canonical_document(self.receipt_root / filename)
             if reread != payload:
-                raise RuntimeError(
-                    f"strict format evidence changed across shutdown: {filename}"
-                )
+                raise RuntimeError(f"strict format evidence changed across shutdown: {filename}")
         if {item.name for item in self.receipt_root.iterdir()} != expected_inventory:
             raise RuntimeError("strict format inventory changed across shutdown")
 
@@ -2876,25 +2590,13 @@ def load_finalized_reasoning_score_call_index(
     paths and references are exact, and the complete graph is stable-read a
     second time before returning.
     """
-    if (
-        type(expected_sha256) is not str
-        or _SHA256_RE.fullmatch(expected_sha256) is None
-        or expected_sha256 == "0" * 64
-    ):
+    if type(expected_sha256) is not str or _SHA256_RE.fullmatch(expected_sha256) is None or expected_sha256 == "0" * 64:
         raise ValueError("expected score-call index SHA256 is invalid")
-    if (
-        type(expected_pair_id) is not str
-        or _PAIR_ID_RE.fullmatch(expected_pair_id) is None
-    ):
+    if type(expected_pair_id) is not str or _PAIR_ID_RE.fullmatch(expected_pair_id) is None:
         raise ValueError("expected score-call pair ID is invalid")
-    if (
-        type(expected_job_id) is not str
-        or _JOB_ID_RE.fullmatch(expected_job_id) is None
-    ):
+    if type(expected_job_id) is not str or _JOB_ID_RE.fullmatch(expected_job_id) is None:
         raise ValueError("expected score-call job ID is invalid")
-    root = _require_private_canonical_directory(
-        Path(expected_receipt_root), name="finalized score-call receipt root"
-    )
+    root = _require_private_canonical_directory(Path(expected_receipt_root), name="finalized score-call receipt root")
     terminal_path = root / "reasoning-score-call-index.json"
     if not isinstance(path, Path) or path != terminal_path:
         raise ValueError("score-call index path is not the exact expected path")
@@ -2918,9 +2620,7 @@ def load_finalized_reasoning_score_call_index(
     if _sha256_bytes(payloads[terminal_path.name]) != expected_sha256:
         raise ValueError("score-call index differs from caller-carried SHA256")
 
-    def exact_ref(
-        value: Any, *, filename: str, schema: str, name: str
-    ) -> Mapping[str, Any]:
+    def exact_ref(value: Any, *, filename: str, schema: str, name: str) -> Mapping[str, Any]:
         ref = _require_exact_keys(value, {"path", "sha256", "schema"}, name=name)
         expected = {
             "path": str(root / filename),
@@ -2955,12 +2655,8 @@ def load_finalized_reasoning_score_call_index(
         "venv_root": str(STRICT_GYM_VENV_ROOT),
         "sources": dict(_GYM_SOURCE_PINS),
     }
-    expected_targets = _target_matrix(
-        "reasoning_gym", STRICT_GYM_ROOT, scope="scorer-only"
-    )
-    bootstrap = _require_exact_keys(
-        spec["bootstrap"], {"root", "filename", "sha256"}, name="score-call bootstrap"
-    )
+    expected_targets = _target_matrix("reasoning_gym", STRICT_GYM_ROOT, scope="scorer-only")
+    bootstrap = _require_exact_keys(spec["bootstrap"], {"root", "filename", "sha256"}, name="score-call bootstrap")
     bootstrap_root = bootstrap.get("root")
     sealed_bootstrap_root, sealed_bootstrap_sha256 = _require_sealed_bootstrap_root()
     if (
@@ -3097,9 +2793,7 @@ def load_finalized_reasoning_score_call_index(
         "venv",
         "interpreter",
     }
-    target_record = _require_exact_keys(
-        resource["target"], target_record_keys, name="score-call resource target"
-    )
+    target_record = _require_exact_keys(resource["target"], target_record_keys, name="score-call resource target")
     server = _require_exact_keys(
         resource["server"],
         {
@@ -3151,12 +2845,8 @@ def load_finalized_reasoning_score_call_index(
         or resource["job_id"] != expected_job_id
         or resource["stage"] != "isolated-runner-pre-entrypoint"
         or resource["spec_sha256"] != spec_sha256
-        or not _exact_json_equal(
-            target_record, {name: target[name] for name in target_record_keys}
-        )
-        or not _exact_json_equal(
-            resource["distribution_versions"], target["distribution_versions"]
-        )
+        or not _exact_json_equal(target_record, {name: target[name] for name in target_record_keys})
+        or not _exact_json_equal(resource["distribution_versions"], target["distribution_versions"])
         or not _exact_json_equal(resource["module_versions"], target["module_versions"])
         or server["config_path"] != target["config_path"]
         or server["server_type"] != target["server_type"]
@@ -3166,8 +2856,7 @@ def load_finalized_reasoning_score_call_index(
         or type(server["port"]) is not int
         or server["port"] != observation["port"]
         or (
-            server["num_workers"] is not None
-            and (type(server["num_workers"]) is not int or server["num_workers"] != 1)
+            server["num_workers"] is not None and (type(server["num_workers"]) is not int or server["num_workers"] != 1)
         )
         or type(process["pid"]) is not int
         or process["pid"] != observation["pid"]
@@ -3185,8 +2874,7 @@ def load_finalized_reasoning_score_call_index(
         or type(process["sys_base_prefix"]) is not str
         or not Path(process["sys_base_prefix"]).is_absolute()
         or ".." in Path(process["sys_base_prefix"]).parts
-        or Path(process["sys_base_prefix"]).resolve(strict=True)
-        != Path(process["sys_base_prefix"])
+        or Path(process["sys_base_prefix"]).resolve(strict=True) != Path(process["sys_base_prefix"])
         or process["sys_base_prefix"] == process["sys_prefix"]
         or type(process["proc_exe"]) is not str
         or not process["proc_exe"].startswith("/")
@@ -3218,39 +2906,22 @@ def load_finalized_reasoning_score_call_index(
         set(expected_scorer) | dynamic_scorer_keys,
         name="finalized score-call scorer",
     )
-    if any(
-        not _exact_json_equal(scorer[name], value)
-        for name, value in expected_scorer.items()
-    ):
+    if any(not _exact_json_equal(scorer[name], value) for name, value in expected_scorer.items()):
         raise ValueError("finalized score-call scorer static identity differs")
     purelib = Path(target["venv"]) / "lib/python3.13/site-packages"
     expected_scorer_paths = {
         "package_root": str(purelib / "reasoning_gym"),
-        "module_origin": str(
-            purelib / expected_scorer["module_origin_relative_to_purelib"]
-        ),
-        "resolver_origin": str(
-            purelib / expected_scorer["resolver_origin_relative_to_purelib"]
-        ),
+        "module_origin": str(purelib / expected_scorer["module_origin_relative_to_purelib"]),
+        "resolver_origin": str(purelib / expected_scorer["resolver_origin_relative_to_purelib"]),
         "origin": str(purelib / expected_scorer["origin_relative_to_purelib"]),
     }
     expected_resolved_scorer_paths = {
-        "package_resolved_root": str(
-            Path(expected_scorer_paths["package_root"]).resolve(strict=True)
-        ),
-        "module_resolved_origin": str(
-            Path(expected_scorer_paths["module_origin"]).resolve(strict=True)
-        ),
-        "resolver_resolved_origin": str(
-            Path(expected_scorer_paths["resolver_origin"]).resolve(strict=True)
-        ),
-        "resolved_origin": str(
-            Path(expected_scorer_paths["origin"]).resolve(strict=True)
-        ),
+        "package_resolved_root": str(Path(expected_scorer_paths["package_root"]).resolve(strict=True)),
+        "module_resolved_origin": str(Path(expected_scorer_paths["module_origin"]).resolve(strict=True)),
+        "resolver_resolved_origin": str(Path(expected_scorer_paths["resolver_origin"]).resolve(strict=True)),
+        "resolved_origin": str(Path(expected_scorer_paths["origin"]).resolve(strict=True)),
     }
-    if any(
-        scorer[name] != value for name, value in expected_scorer_paths.items()
-    ) or any(
+    if any(scorer[name] != value for name, value in expected_scorer_paths.items()) or any(
         scorer[name] != value for name, value in expected_resolved_scorer_paths.items()
     ):
         raise ValueError("finalized score-call scorer paths differ")
@@ -3270,9 +2941,7 @@ def load_finalized_reasoning_score_call_index(
         },
         name="finalized score-call closed receipt",
     )
-    closed_process = _require_exact_keys(
-        closed["process"], {"pid", "start_ticks"}, name="score-call closed process"
-    )
+    closed_process = _require_exact_keys(closed["process"], {"pid", "start_ticks"}, name="score-call closed process")
     if (
         closed["schema"] != STRICT_GYM_SCORE_CLOSED_SCHEMA
         or closed["hash_domain"] != STRICT_GYM_CHILD_HASH_DOMAIN
@@ -3434,10 +3103,7 @@ def load_finalized_reasoning_score_call_index(
         or type(child_signal) is not str
         or child_signal not in {"SIGINT", "SIGTERM", "SIGKILL"}
         or type(quiescence["wrapper_returncode"]) is not int
-        or (
-            child_signal == "SIGKILL"
-            and quiescence["wrapper_returncode"] != -signal.SIGKILL
-        )
+        or (child_signal == "SIGKILL" and quiescence["wrapper_returncode"] != -signal.SIGKILL)
         or quiescence["original_process_reaped"] is not True
     ):
         raise ValueError("finalized score-call quiescence differs")
@@ -3446,45 +3112,40 @@ def load_finalized_reasoning_score_call_index(
         raise RuntimeError("finalized score-call inventory changed during validation")
     for filename in sorted(filenames):
         second_document, second_payload = _load_canonical_document(root / filename)
-        if (
-            second_document != documents[filename]
-            or second_payload != payloads[filename]
-        ):
+        if second_document != documents[filename] or second_payload != payloads[filename]:
             raise RuntimeError(f"finalized score-call artifact changed: {filename}")
     root_after = root.lstat()
     if (
         _stat_fingerprint(root_before) != _stat_fingerprint(root_after)
         or {item.name for item in root.iterdir()} != filenames
     ):
-        raise RuntimeError(
-            "finalized score-call receipt root changed during validation"
-        )
+        raise RuntimeError("finalized score-call receipt root changed during validation")
     return dict(terminal), expected_sha256
 
 
-def load_finalized_format_verification_call_index(
-    path: Path,
+def validate_finalized_format_verification_call_index_payloads(
+    payload_roster: tuple[tuple[str, bytes], ...],
     *,
     expected_sha256: str,
     expected_receipt_root: Path,
+    expected_bootstrap_root: Path,
+    expected_bootstrap_sha256: str,
     expected_pair_id: str,
     expected_job_id: str,
     expected_environment: str,
     expected_profile_id: str,
 ) -> tuple[dict[str, Any], str]:
-    """Strictly reload one stopped K=4 format-verifier evidence graph."""
+    """Validate one owned K=4 format-verifier payload graph without I/O.
+
+    ``payload_roster`` uses result-relative names so it can be projected
+    directly from the verified sealed-result capability.  The receipt root is
+    lexical authority only; filesystem ownership and quiescence are established
+    by the caller before it snapshots these bytes.
+    """
     profile = _FORMAT_PROFILES.get(expected_environment)
-    if (
-        profile is None
-        or type(expected_profile_id) is not str
-        or expected_profile_id != profile["profile_id"]
-    ):
+    if profile is None or type(expected_profile_id) is not str or expected_profile_id != profile["profile_id"]:
         raise ValueError("expected format environment/profile pair is not admitted")
-    if (
-        type(expected_sha256) is not str
-        or _SHA256_RE.fullmatch(expected_sha256) is None
-        or expected_sha256 == "0" * 64
-    ):
+    if type(expected_sha256) is not str or _SHA256_RE.fullmatch(expected_sha256) is None or expected_sha256 == "0" * 64:
         raise ValueError("expected format call-index SHA256 is invalid")
     if (
         type(expected_pair_id) is not str
@@ -3493,34 +3154,59 @@ def load_finalized_format_verification_call_index(
         or _JOB_ID_RE.fullmatch(expected_job_id) is None
     ):
         raise ValueError("expected format call-index identity is invalid")
-    root = _require_private_canonical_directory(
-        Path(expected_receipt_root), name="finalized format receipt root"
+    if not isinstance(expected_receipt_root, Path):
+        raise ValueError("finalized format receipt root must be one pathlib.Path")
+    root = expected_receipt_root
+    if not root.is_absolute() or ".." in root.parts or str(root) == "/":
+        raise ValueError("finalized format receipt root must be lexical-canonical")
+    if not isinstance(expected_bootstrap_root, Path):
+        raise ValueError("expected format bootstrap root must be one pathlib.Path")
+    if (
+        not expected_bootstrap_root.is_absolute()
+        or ".." in expected_bootstrap_root.parts
+        or str(expected_bootstrap_root) == "/"
+        or type(expected_bootstrap_sha256) is not str
+        or _SHA256_RE.fullmatch(expected_bootstrap_sha256) is None
+        or expected_bootstrap_sha256 == "0" * 64
+    ):
+        raise ValueError("expected format bootstrap identity is invalid")
+    prefix = "strict_gym_child_runtime/"
+    relative_names = (
+        f"{prefix}index.json",
+        *(f"{prefix}format-verification-call-{sequence:08d}.json" for sequence in range(1, 5)),
+        f"{prefix}format-verification-call-index.json",
+        f"{prefix}format-verification-closed.json",
+        f"{prefix}resource.json",
+        f"{prefix}spec.json",
     )
-    terminal_path = root / "format-verification-call-index.json"
-    if not isinstance(path, Path) or path != terminal_path:
-        raise ValueError("format call-index path is not the exact expected path")
-    filenames = {
-        "spec.json",
-        "resource.json",
-        "index.json",
-        "format-verification-closed.json",
-        "format-verification-call-index.json",
-    } | {f"format-verification-call-{sequence:08d}.json" for sequence in range(1, 5)}
-    root_before = root.lstat()
-    if {item.name for item in root.iterdir()} != filenames:
-        raise ValueError("finalized format receipt inventory differs")
+    if (
+        type(payload_roster) is not tuple
+        or len(payload_roster) != len(relative_names)
+        or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or item[0] != relative
+            or type(item[1]) is not bytes
+            for item, relative in zip(payload_roster, relative_names, strict=True)
+        )
+    ):
+        raise ValueError("finalized format payload roster differs")
     documents: dict[str, dict[str, Any]] = {}
     payloads: dict[str, bytes] = {}
-    for filename in sorted(filenames):
-        document, payload = _load_canonical_document(root / filename)
+    for relative, payload in payload_roster:
+        filename = relative.removeprefix(prefix)
+        document, payload = _load_canonical_payload(
+            payload,
+            name=f"finalized format payload {relative}",
+        )
         documents[filename] = document
         payloads[filename] = payload
-    if _sha256_bytes(payloads[terminal_path.name]) != expected_sha256:
+    terminal_filename = "format-verification-call-index.json"
+    if _sha256_bytes(payloads[terminal_filename]) != expected_sha256:
         raise ValueError("format call index differs from caller-carried SHA256")
 
-    def exact_ref(
-        value: Any, *, filename: str, schema: str, name: str
-    ) -> Mapping[str, Any]:
+    def exact_ref(value: Any, *, filename: str, schema: str, name: str) -> Mapping[str, Any]:
         reference = _require_exact_keys(value, {"path", "sha256", "schema"}, name=name)
         expected = {
             "path": str(root / filename),
@@ -3555,15 +3241,12 @@ def load_finalized_format_verification_call_index(
         "venv_root": str(STRICT_GYM_VENV_ROOT),
         "sources": dict(_GYM_SOURCE_PINS),
     }
-    expected_targets = _target_matrix(
-        expected_environment, STRICT_GYM_ROOT, scope="scorer-only"
-    )
+    expected_targets = _target_matrix(expected_environment, STRICT_GYM_ROOT, scope="scorer-only")
     bootstrap = _require_exact_keys(
         spec["bootstrap"],
         {"root", "filename", "sha256"},
         name="finalized format bootstrap",
     )
-    sealed_bootstrap_root, sealed_bootstrap_sha256 = _require_sealed_bootstrap_root()
     if (
         spec["schema"] != STRICT_GYM_CHILD_SPEC_SCHEMA
         or spec["hash_domain"] != STRICT_GYM_CHILD_HASH_DOMAIN
@@ -3575,9 +3258,9 @@ def load_finalized_format_verification_call_index(
         or spec["results_dir"] != str(root.parent)
         or spec["receipt_root"] != str(root)
         or not _exact_json_equal(spec["targets"], expected_targets)
-        or bootstrap["root"] != str(sealed_bootstrap_root)
+        or bootstrap["root"] != str(expected_bootstrap_root)
         or bootstrap["filename"] != "sitecustomize.py"
-        or bootstrap["sha256"] != sealed_bootstrap_sha256
+        or bootstrap["sha256"] != expected_bootstrap_sha256
     ):
         raise ValueError("finalized format spec differs")
     spec_sha256 = _sha256_bytes(payloads["spec.json"])
@@ -3695,9 +3378,7 @@ def load_finalized_format_verification_call_index(
         "venv",
         "interpreter",
     }
-    target_record = _require_exact_keys(
-        resource["target"], target_keys, name="finalized format resource target"
-    )
+    target_record = _require_exact_keys(resource["target"], target_keys, name="finalized format resource target")
     server = _require_exact_keys(
         resource["server"],
         {
@@ -3731,6 +3412,24 @@ def load_finalized_format_verification_call_index(
         },
         name="finalized format resource process",
     )
+    sys_base_prefix = process["sys_base_prefix"]
+    proc_exe = process["proc_exe"]
+    if type(sys_base_prefix) is not str or type(proc_exe) is not str:
+        raise ValueError("finalized format resource process paths differ")
+    sys_base_prefix_path = Path(sys_base_prefix)
+    proc_exe_path = Path(proc_exe)
+    for value, path in (
+        (sys_base_prefix, sys_base_prefix_path),
+        (proc_exe, proc_exe_path),
+    ):
+        if (
+            not value
+            or "\x00" in value
+            or not path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts[1:])
+            or str(path) != value
+        ):
+            raise ValueError("finalized format resource process paths differ")
     bootstrap_source = str(Path(bootstrap["root"]) / "sitecustomize.py")
     if (
         resource["schema"] != STRICT_GYM_CHILD_RECEIPT_SCHEMA
@@ -3740,12 +3439,8 @@ def load_finalized_format_verification_call_index(
         or resource["job_id"] != expected_job_id
         or resource["stage"] != "isolated-runner-pre-entrypoint"
         or resource["spec_sha256"] != spec_sha256
-        or not _exact_json_equal(
-            target_record, {name: target[name] for name in target_keys}
-        )
-        or not _exact_json_equal(
-            resource["distribution_versions"], target["distribution_versions"]
-        )
+        or not _exact_json_equal(target_record, {name: target[name] for name in target_keys})
+        or not _exact_json_equal(resource["distribution_versions"], target["distribution_versions"])
         or not _exact_json_equal(resource["module_versions"], target["module_versions"])
         or resource["scorer"] is not None
         or server["config_path"] != target["config_path"]
@@ -3755,8 +3450,7 @@ def load_finalized_format_verification_call_index(
         or server["host"] != observation["host"]
         or server["port"] != observation["port"]
         or (
-            server["num_workers"] is not None
-            and (type(server["num_workers"]) is not int or server["num_workers"] != 1)
+            server["num_workers"] is not None and (type(server["num_workers"]) is not int or server["num_workers"] != 1)
         )
         or type(process["pid"]) is not int
         or process["pid"] != observation["pid"]
@@ -3771,6 +3465,8 @@ def load_finalized_format_verification_call_index(
         or process["cwd"] != target["component_dir"]
         or process["sys_executable"] != target["interpreter"]
         or process["sys_prefix"] != target["venv"]
+        or sys_base_prefix == process["sys_prefix"]
+        or sys_base_prefix == target["venv"]
         or process["sys_argv"] != [bootstrap_source, target["source_path"]]
         or process["proc_argv"]
         != [
@@ -3828,7 +3524,7 @@ def load_finalized_format_verification_call_index(
         raise ValueError("finalized format closed receipt differs")
 
     terminal = _require_exact_keys(
-        documents[terminal_path.name],
+        documents[terminal_filename],
         {
             "schema",
             "hash_domain",
@@ -3917,10 +3613,7 @@ def load_finalized_format_verification_call_index(
             or outcome["kind"] != "returned"
             or type(outcome["float_result"]) is not float
             or outcome["float_result"] not in (0.0, 1.0)
-            or (
-                outcome["float_result"] == 0.0
-                and math.copysign(1.0, outcome["float_result"]) < 0.0
-            )
+            or (outcome["float_result"] == 0.0 and math.copysign(1.0, outcome["float_result"]) < 0.0)
             or any(
                 type(combined[name]) is not str
                 or _SHA256_RE.fullmatch(combined[name]) is None
@@ -3981,21 +3674,94 @@ def load_finalized_format_verification_call_index(
         or quiescence["wrapper_pid"] != process["pid"]
         or child_signal not in {"SIGINT", "SIGTERM", "SIGKILL"}
         or type(quiescence["wrapper_returncode"]) is not int
-        or (
-            child_signal == "SIGKILL"
-            and quiescence["wrapper_returncode"] != -signal.SIGKILL
-        )
+        or (child_signal == "SIGKILL" and quiescence["wrapper_returncode"] != -signal.SIGKILL)
         or quiescence["original_process_reaped"] is not True
     ):
         raise ValueError("finalized format quiescence differs")
+    return dict(terminal), expected_sha256
+
+
+def load_finalized_format_verification_call_index(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_receipt_root: Path,
+    expected_pair_id: str,
+    expected_job_id: str,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> tuple[dict[str, Any], str]:
+    """Strictly snapshot and validate one stopped K=4 format-verifier graph."""
+    profile = _FORMAT_PROFILES.get(expected_environment)
+    if profile is None or type(expected_profile_id) is not str or expected_profile_id != profile["profile_id"]:
+        raise ValueError("expected format environment/profile pair is not admitted")
+    if type(expected_sha256) is not str or _SHA256_RE.fullmatch(expected_sha256) is None or expected_sha256 == "0" * 64:
+        raise ValueError("expected format call-index SHA256 is invalid")
+    if (
+        type(expected_pair_id) is not str
+        or _PAIR_ID_RE.fullmatch(expected_pair_id) is None
+        or type(expected_job_id) is not str
+        or _JOB_ID_RE.fullmatch(expected_job_id) is None
+    ):
+        raise ValueError("expected format call-index identity is invalid")
+    root = _require_private_canonical_directory(Path(expected_receipt_root), name="finalized format receipt root")
+    terminal_path = root / "format-verification-call-index.json"
+    if not isinstance(path, Path) or path != terminal_path:
+        raise ValueError("format call-index path is not the exact expected path")
+    filenames = {
+        "spec.json",
+        "resource.json",
+        "index.json",
+        "format-verification-closed.json",
+        "format-verification-call-index.json",
+    } | {f"format-verification-call-{sequence:08d}.json" for sequence in range(1, 5)}
+    root_before = root.lstat()
+    if {item.name for item in root.iterdir()} != filenames:
+        raise ValueError("finalized format receipt inventory differs")
+    relative_names = (
+        "index.json",
+        *(f"format-verification-call-{sequence:08d}.json" for sequence in range(1, 5)),
+        "format-verification-call-index.json",
+        "format-verification-closed.json",
+        "resource.json",
+        "spec.json",
+    )
+    documents: dict[str, dict[str, Any]] = {}
+    payloads: dict[str, bytes] = {}
+    for filename in relative_names:
+        document, payload = _load_canonical_document(root / filename)
+        documents[filename] = document
+        payloads[filename] = payload
+
+    # Retain the path loader's external bootstrap-byte authentication.  The
+    # pure payload validator checks the closed graph; callers that already own
+    # bytes close this bootstrap reference to their authenticated manifest.
+    sealed_bootstrap_root, sealed_bootstrap_sha256 = _require_sealed_bootstrap_root()
+    bootstrap = documents["spec.json"].get("bootstrap")
+    if (
+        type(bootstrap) is not dict
+        or bootstrap.get("root") != str(sealed_bootstrap_root)
+        or bootstrap.get("sha256") != sealed_bootstrap_sha256
+    ):
+        raise ValueError("finalized format spec differs")
+
+    admitted = validate_finalized_format_verification_call_index_payloads(
+        tuple((f"strict_gym_child_runtime/{filename}", payloads[filename]) for filename in relative_names),
+        expected_sha256=expected_sha256,
+        expected_receipt_root=root,
+        expected_bootstrap_root=sealed_bootstrap_root,
+        expected_bootstrap_sha256=sealed_bootstrap_sha256,
+        expected_pair_id=expected_pair_id,
+        expected_job_id=expected_job_id,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+
     if {item.name for item in root.iterdir()} != filenames:
         raise RuntimeError("finalized format inventory changed during validation")
-    for filename in sorted(filenames):
+    for filename in relative_names:
         second_document, second_payload = _load_canonical_document(root / filename)
-        if (
-            second_document != documents[filename]
-            or second_payload != payloads[filename]
-        ):
+        if second_document != documents[filename] or second_payload != payloads[filename]:
             raise RuntimeError(f"finalized format artifact changed: {filename}")
     root_after = root.lstat()
     if (
@@ -4003,12 +3769,10 @@ def load_finalized_format_verification_call_index(
         or {item.name for item in root.iterdir()} != filenames
     ):
         raise RuntimeError("finalized format receipt root changed during validation")
-    return dict(terminal), expected_sha256
+    return admitted
 
 
-def prepare_strict_gym_child_runtime(
-    *, scope: str = "main"
-) -> StrictGymChildRuntimeSession:
+def prepare_strict_gym_child_runtime(*, scope: str = "main") -> StrictGymChildRuntimeSession:
     """Create the exclusive pre-launch spec for one strict Gym actor."""
     if scope not in {"main", "scorer-only"}:
         raise ValueError("strict Gym child attestation scope is not admitted")
@@ -4017,18 +3781,13 @@ def prepare_strict_gym_child_runtime(
         raise ValueError("STRICT_PAIR_ENVIRONMENT is not admitted")
     pair_id = _strict_environment_value("PAIR_ID", pattern=_PAIR_ID_RE)
     job_id = _strict_environment_value("STRICT_PAIR_BOUND_JOB_ID", pattern=_JOB_ID_RE)
-    if (
-        _strict_environment_value("EXPECTED_GYM_GITLINK_COMMIT")
-        != STRICT_GYM_GIT_COMMIT
-    ):
+    if _strict_environment_value("EXPECTED_GYM_GITLINK_COMMIT") != STRICT_GYM_GIT_COMMIT:
         raise ValueError("EXPECTED_GYM_GITLINK_COMMIT differs from pinned Gym")
     if _strict_environment_value("EXPECTED_GYM_TREE") != STRICT_GYM_TREE:
         raise ValueError("EXPECTED_GYM_TREE differs from pinned Gym")
 
     raw_results = _strict_environment_value("RESULTS_DIR")
-    results_dir = _require_private_canonical_directory(
-        Path(raw_results), name="RESULTS_DIR"
-    )
+    results_dir = _require_private_canonical_directory(Path(raw_results), name="RESULTS_DIR")
     bootstrap_root, bootstrap_sha256 = _require_sealed_bootstrap_root()
     targets = _target_matrix(environment, STRICT_GYM_ROOT, scope=scope)
     _validate_pinned_gym_root(STRICT_GYM_ROOT, targets, scope=scope)
@@ -4038,9 +3797,7 @@ def prepare_strict_gym_child_runtime(
         try:
             os.mkdir(STRICT_RESULTS_DIRECTORY_NAME, 0o700, dir_fd=results_fd)
         except FileExistsError as error:
-            raise RuntimeError(
-                "strict Gym child receipt root already exists"
-            ) from error
+            raise RuntimeError("strict Gym child receipt root already exists") from error
         os.fsync(results_fd)
     finally:
         os.close(results_fd)

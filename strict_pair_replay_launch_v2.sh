@@ -36,8 +36,13 @@ strict_replay_reject_startup_controls() {
 
 strict_replay_bind_executed_script() {
   local invoked="${BASH_SOURCE[0]}"
-  [[ "${invoked}" == /* && -f "${invoked}" && ! -L "${invoked}" ]] || \
-    strict_replay_die "replay launcher must be invoked by absolute non-symlink path"
+  if [[ "${invoked}" =~ ^/(proc/self|dev)/fd/[1-9][0-9]*$ ]]; then
+    [[ -f "${invoked}" && -r "${invoked}" ]] || \
+      strict_replay_die "retained replay launcher descriptor is unavailable"
+  else
+    [[ "${invoked}" == /* && -f "${invoked}" && ! -L "${invoked}" ]] || \
+      strict_replay_die "replay launcher must be invoked by absolute non-symlink path"
+  fi
   STRICT_REPLAY_EXECUTED_SCRIPT_PATH="${invoked}"
   export STRICT_REPLAY_EXECUTED_SCRIPT_PATH
 }
@@ -130,14 +135,18 @@ strict_replay_main() {
 import hashlib
 import importlib
 import importlib.util
+import fcntl
 import json
 import math
 import os
 import posixpath
 import re
+import selectors
+import signal
 import stat
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any, Optional
@@ -147,6 +156,7 @@ if sys.flags.no_site != 1:
 
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 JOB_ID_RE = re.compile(r"[1-9][0-9]*\Z")
+EXECUTED_SCRIPT_FD_RE = re.compile(r"/(?:proc/self|dev)/fd/([1-9][0-9]*)\Z")
 MAX_INT63 = (1 << 63) - 1
 SNAPSHOT_SHA_MANIFEST = "strict-pair-snapshot-manifest.sha256"
 REPLAY_MANIFEST_SCHEMA = "nemo-rl-strict-captured-replay-execution-manifest-v4"
@@ -271,7 +281,12 @@ def canonical_absolute_path(value: Any, label: str) -> Path:
 
 
 def _read_stable(path: Path, *, label: str, exact_mode: Optional[int], max_bytes: int, owner: str, allow_empty: bool = False) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         before = path.lstat()
     except OSError as error:
@@ -378,6 +393,125 @@ def stable_authenticated_host_file_bytes(path: Path, *, label: str, expected_sha
     if hashlib.sha256(raw).hexdigest() != expected_sha256:
         fail(f"{label} digest differs from authenticated authority")
     return raw
+
+
+def stable_executed_launcher_bytes(reference: str) -> tuple[Optional[Path], bytes]:
+    """Retain execution authority when the coordinator invokes an inherited FD."""
+    if type(reference) is not str:
+        fail("executed launcher reference is not a string")
+    matched = EXECUTED_SCRIPT_FD_RE.fullmatch(reference)
+    if matched is None:
+        path = canonical_absolute_path(reference, "executed launcher path")
+        return path, stable_evidence_bytes(
+            path,
+            label="executed launcher bytes",
+            exact_mode=None,
+        )
+    descriptor = int(matched.group(1), 10)
+    try:
+        before = os.fstat(descriptor)
+    except OSError as error:
+        fail(f"cannot stat retained executed launcher descriptor: {error}")
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_IMODE(before.st_mode) != 0o555
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 0
+        or not 1 <= before.st_size <= 64 * 1024 * 1024
+    ):
+        fail("retained executed launcher descriptor violates the immutable file contract")
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < before.st_size:
+        try:
+            chunk = os.pread(descriptor, min(before.st_size - offset, 1 << 20), offset)
+        except OSError as error:
+            fail(f"cannot read retained executed launcher descriptor: {error}")
+        if not chunk:
+            fail("retained executed launcher descriptor truncated while reading")
+        chunks.append(chunk)
+        offset += len(chunk)
+    if os.pread(descriptor, 1, before.st_size):
+        fail("retained executed launcher descriptor grew while reading")
+    after = os.fstat(descriptor)
+    fingerprint = lambda metadata: (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+    if fingerprint(before) != fingerprint(after):
+        fail("retained executed launcher descriptor changed while reading")
+    if reference.startswith("/proc/self/fd/"):
+        required_seals = (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+        )
+        if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & required_seals != required_seals:
+            fail("retained executed launcher descriptor is not sealed")
+    elif sys.platform != "darwin":
+        fail("unsealed retained launcher descriptors are admitted only for Darwin tests")
+    os.close(descriptor)
+    return None, b"".join(chunks)
+
+
+def sealed_memfd(payload: bytes, *, label: str) -> int:
+    """Return one immutable inherited FD whose bytes are already authenticated."""
+    if type(payload) is not bytes or not 1 <= len(payload) <= 64 * 1024 * 1024:
+        fail(f"{label} retained bytes violate size/type bounds")
+    required = (
+        "memfd_create",
+        "MFD_CLOEXEC",
+        "MFD_ALLOW_SEALING",
+    )
+    if any(not hasattr(os, name) for name in required):
+        fail("platform lacks sealed memfd support required for scheduler submission")
+    seal_names = ("F_ADD_SEALS", "F_GET_SEALS", "F_SEAL_SEAL", "F_SEAL_SHRINK", "F_SEAL_GROW", "F_SEAL_WRITE")
+    if any(not hasattr(fcntl, name) for name in seal_names):
+        fail("platform lacks file seals required for scheduler submission")
+    descriptor = os.memfd_create(
+        "nemo-rl-strict-replay",
+        flags=os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                fail(f"{label} memfd write made no progress")
+            offset += written
+        os.fchmod(descriptor, 0o400)
+        os.fsync(descriptor)
+        required_seals = (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+        )
+        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, required_seals)
+        actual_seals = fcntl.fcntl(descriptor, fcntl.F_GET_SEALS)
+        metadata = os.fstat(descriptor)
+        if (
+            actual_seals & required_seals != required_seals
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+            or metadata.st_size != len(payload)
+            or hashlib.sha256(os.pread(descriptor, len(payload), 0)).digest()
+            != hashlib.sha256(payload).digest()
+        ):
+            fail(f"{label} sealed memfd differs from authenticated bytes")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def canonical_document(path: Path, *, label: str, trailing_lf: bool, expected_sha256: str) -> dict[str, Any]:
@@ -845,6 +979,8 @@ def build_submission_argv(
     expected_profile_id: str,
     snapshot_root: Path,
     comment: str,
+    slurm_export_fd: int,
+    job_wrapper_fd: int,
 ) -> list[str]:
     pair = pair_manifest
     slurm = pair["campaign"]["slurm"]
@@ -852,7 +988,14 @@ def build_submission_argv(
         manifest["execution_environment"]["attempt"]["operational"]["slurm"],
         "operational Slurm root",
     )
-    wrapper_relative = manifest["replay_contract"]["program"]["job_wrapper"]["path"]
+    if (
+        type(slurm_export_fd) is not int
+        or type(job_wrapper_fd) is not int
+        or slurm_export_fd < 3
+        or job_wrapper_fd < 3
+        or slurm_export_fd == job_wrapper_fd
+    ):
+        fail("scheduler retained descriptor identities differ")
     return [
         "--parsable",
         "--hold",
@@ -871,8 +1014,8 @@ def build_submission_argv(
         f"--error={slurm_root}/slurm-%j.err",
         f"--qos={slurm['qos']}",
         f"--comment={comment}",
-        f"--export-file={manifest['slurm_export_boundary']['path']}",
-        str(snapshot_root / wrapper_relative),
+        f"--export-file={slurm_export_fd}",
+        f"/proc/self/fd/{job_wrapper_fd}",
         "--pair-manifest",
         str(pair_manifest_path),
         "--pair-manifest-sha256",
@@ -912,28 +1055,116 @@ def scheduler_env(client_environment: dict[str, Any]) -> dict[str, str]:
     return {"LC_ALL": "C", "SLURM_CONF": slurm_conf["path"]}
 
 
+def run_bounded_process(
+    argv: list[str],
+    *,
+    env: dict[str, str],
+    cwd: Path,
+    timeout_seconds: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=str(cwd),
+        close_fds=True,
+        pass_fds=pass_fds,
+        start_new_session=True,
+    )
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        process.wait()
+        fail("bounded scheduler process pipes were not created")
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    streams = {
+        process.stdout.fileno(): (process.stdout, stdout_limit, stdout_buffer),
+        process.stderr.fileno(): (process.stderr, stderr_limit, stderr_buffer),
+    }
+    selector = selectors.DefaultSelector()
+    for descriptor, (stream, _limit, _buffer) in streams.items():
+        os.set_blocking(descriptor, False)
+        selector.register(stream, selectors.EVENT_READ, descriptor)
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("scheduler process exceeded its execution deadline")
+            events = selector.select(remaining)
+            if not events:
+                fail("scheduler process exceeded its execution deadline")
+            for key, _mask in events:
+                descriptor = key.data
+                stream, limit, buffer = streams[descriptor]
+                chunk = os.read(descriptor, min(64 * 1024, limit + 1 - len(buffer)))
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffer.extend(chunk)
+                if len(buffer) > limit:
+                    fail("scheduler process output exceeded its strict bound")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail("scheduler process exceeded its execution deadline")
+        returncode = process.wait(timeout=remaining)
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+    return subprocess.CompletedProcess(
+        argv,
+        returncode,
+        stdout=bytes(stdout_buffer),
+        stderr=bytes(stderr_buffer),
+    )
+
+
 def run_scheduler_command(
     argv: list[str],
     *,
     env: dict[str, str],
     client_environment: dict[str, Any],
     label: str,
+    pass_fds: tuple[int, ...] = (),
+    require_success: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
+    if type(pass_fds) is not tuple or any(type(fd) is not int or fd < 3 for fd in pass_fds):
+        fail(f"{label} inherited descriptor tuple differs")
     verify_scheduler_client_environment(client_environment)
-    completed = subprocess.run(
+    completed = run_bounded_process(
         argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=30,
         env=env,
-        cwd=str(snapshot_root),
+        cwd=Path("/"),
+        timeout_seconds=30.0,
+        stdout_limit=64 * 1024 * 1024,
+        stderr_limit=64 * 1024,
+        pass_fds=pass_fds,
     )
-    if completed.returncode != 0:
-        fail(f"{label} exited {completed.returncode}: {completed.stderr.decode('utf-8', 'replace')}")
-    if completed.stderr not in {b"", None}:
-        fail(f"{label} wrote stderr")
+    if require_success:
+        if completed.returncode != 0:
+            fail(f"{label} exited {completed.returncode}: {completed.stderr.decode('utf-8', 'replace')}")
+        if completed.stderr not in {b"", None}:
+            fail(f"{label} wrote stderr")
     return completed
 
 
@@ -1032,15 +1263,13 @@ def cleanup_authenticated_candidate(
     }
     try:
         verify_scheduler_client_environment(client_environment)
-        pre_completed = subprocess.run(
+        pre_completed = run_bounded_process(
             [host_tools["scontrol"]["path"], "show", "job", "--json", candidate_job_id],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=30,
             env=submission_env,
-            cwd=str(snapshot_root),
+            cwd=Path("/"),
+            timeout_seconds=30.0,
+            stdout_limit=64 * 1024 * 1024,
+            stderr_limit=64 * 1024,
         )
         report["pre_cancel_query"] = persist_scontrol_query(
             "CLEANUP_PRE", pre_completed, "CLEANUP"
@@ -1056,15 +1285,13 @@ def cleanup_authenticated_candidate(
             report["status"] = "cleanup-identity-mismatch"
         else:
             verify_scheduler_client_environment(client_environment)
-            cancel_completed = subprocess.run(
+            cancel_completed = run_bounded_process(
                 [host_tools["scancel"]["path"], candidate_job_id],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=30,
                 env=submission_env,
-                cwd=str(snapshot_root),
+                cwd=Path("/"),
+                timeout_seconds=30.0,
+                stdout_limit=64 * 1024,
+                stderr_limit=64 * 1024,
             )
             report["cancellation"] = persist_process_result(
                 "CLEANUP_CANCEL", cancel_completed
@@ -1073,15 +1300,13 @@ def cleanup_authenticated_candidate(
                 report["status"] = "cleanup-cancel-unconfirmed"
             else:
                 verify_scheduler_client_environment(client_environment)
-                post_completed = subprocess.run(
+                post_completed = run_bounded_process(
                     [host_tools["scontrol"]["path"], "show", "job", "--json", candidate_job_id],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                    timeout=30,
                     env=submission_env,
-                    cwd=str(snapshot_root),
+                    cwd=Path("/"),
+                    timeout_seconds=30.0,
+                    stdout_limit=64 * 1024 * 1024,
+                    stderr_limit=64 * 1024,
                 )
                 report["post_cancel_query"] = persist_scontrol_query(
                     "CLEANUP_POST", post_completed, "ROLLBACK"
@@ -1207,7 +1432,7 @@ def persist_unknown_candidate_report(
 
 if len(sys.argv) != 16:
     fail("bootstrap argument count differs from the V2 contract")
-executed_script = canonical_absolute_path(sys.argv[1], "executed launcher path")
+executed_script, executed_launcher_raw = stable_executed_launcher_bytes(sys.argv[1])
 pair_manifest_path = canonical_absolute_path(sys.argv[2], "Pair manifest path")
 pair_manifest_sha256 = sys.argv[3]
 pair_submission_receipt_path = canonical_absolute_path(
@@ -1308,9 +1533,13 @@ authenticated_programs = authenticate_program_closure(
 launcher_path, launcher_sha256, launcher_raw = authenticated_programs[
     "submission_launcher"
 ]
-if executed_script != launcher_path:
+wrapper_path, wrapper_sha256, wrapper_raw = authenticated_programs["job_wrapper"]
+if executed_script is not None and executed_script != launcher_path:
     fail("executed launcher path differs from authenticated Pair ON launcher")
-if hashlib.sha256(stable_evidence_bytes(executed_script, label="executed launcher bytes", exact_mode=None)).hexdigest() != launcher_sha256:
+if (
+    executed_launcher_raw != launcher_raw
+    or hashlib.sha256(executed_launcher_raw).hexdigest() != launcher_sha256
+):
     fail("executed launcher bytes differ from authenticated Pair ON launcher")
 runner_path, runner_sha256, runner_raw = authenticated_programs["entrypoint"]
 manifest_utility_path, _, manifest_utility_raw = authenticated_programs[
@@ -1423,32 +1652,84 @@ comment = manifest["scheduler_submission"]["identity"]["comment_template"].forma
     submission_nonce=manifest["scheduler_submission"]["nonce"],
     replay_manifest_sha256=manifest_sha256,
 )
-sbatch_argv = build_submission_argv(
-    manifest=manifest,
-    pair_manifest_path=pair_manifest_path,
-    pair_manifest_sha256=pair_manifest_sha256,
-    pair_submission_receipt_path=pair_submission_receipt_path,
-    pair_submission_receipt_sha256=pair_submission_receipt_sha256,
-    trusted_off_exit_receipt_path=trusted_off_exit_receipt_path,
-    trusted_off_exit_receipt_sha256=trusted_off_exit_receipt_sha256,
-    manifest_path=manifest_path,
-    manifest_sha256=manifest_sha256,
-    expected_environment=expected_environment,
-    expected_profile_id=expected_profile_id,
-    snapshot_root=snapshot_root,
-    comment=comment,
+slurm_export_path = canonical_absolute_path(
+    manifest["slurm_export_boundary"]["path"],
+    "replay Slurm export path",
 )
+slurm_export_raw = stable_evidence_bytes(
+    slurm_export_path,
+    label="replay Slurm export",
+    exact_mode=0o400,
+    max_bytes=1024 * 1024,
+)
+if hashlib.sha256(slurm_export_raw).hexdigest() != manifest["slurm_export_boundary"]["sha256"]:
+    fail("replay Slurm export bytes differ from authenticated manifest")
+job_wrapper_fd = sealed_memfd(wrapper_raw, label="authenticated job wrapper")
+try:
+    slurm_export_fd = sealed_memfd(slurm_export_raw, label="authenticated Slurm export")
+except BaseException:
+    os.close(job_wrapper_fd)
+    raise
+try:
+    sbatch_argv = build_submission_argv(
+        manifest=manifest,
+        pair_manifest_path=pair_manifest_path,
+        pair_manifest_sha256=pair_manifest_sha256,
+        pair_submission_receipt_path=pair_submission_receipt_path,
+        pair_submission_receipt_sha256=pair_submission_receipt_sha256,
+        trusted_off_exit_receipt_path=trusted_off_exit_receipt_path,
+        trusted_off_exit_receipt_sha256=trusted_off_exit_receipt_sha256,
+        manifest_path=manifest_path,
+        manifest_sha256=manifest_sha256,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+        snapshot_root=snapshot_root,
+        comment=comment,
+        slurm_export_fd=slurm_export_fd,
+        job_wrapper_fd=job_wrapper_fd,
+    )
+except BaseException:
+    os.close(slurm_export_fd)
+    os.close(job_wrapper_fd)
+    raise
 submission_env = scheduler_env(client_environment)
 candidate_job_id: Optional[str] = None
 completed: Optional[subprocess.CompletedProcess[bytes]] = None
 try:
-    completed = run_scheduler_command(
-        [host_tools["sbatch"]["path"], *sbatch_argv],
+    try:
+        completed = run_scheduler_command(
+            [host_tools["sbatch"]["path"], *sbatch_argv],
+            env=submission_env,
+            client_environment=client_environment,
+            label="sbatch",
+            pass_fds=(slurm_export_fd, job_wrapper_fd),
+            require_success=False,
+        )
+    finally:
+        os.close(slurm_export_fd)
+        os.close(job_wrapper_fd)
+    candidate_job_id = parse_job_id(completed.stdout)
+    if completed.returncode != 0:
+        fail(
+            f"sbatch exited {completed.returncode}: "
+            f"{completed.stderr.decode('utf-8', 'replace')}"
+        )
+    if completed.stderr not in {b"", None}:
+        fail("sbatch wrote stderr")
+    controller_script = run_scheduler_command(
+        [
+            host_tools["scontrol"]["path"],
+            "write",
+            "batch_script",
+            candidate_job_id,
+            "-",
+        ],
         env=submission_env,
         client_environment=client_environment,
-        label="sbatch",
+        label="scontrol write batch_script",
     )
-    candidate_job_id = parse_job_id(completed.stdout)
+    if controller_script.stdout != wrapper_raw:
+        fail("held controller batch script differs from authenticated job wrapper")
     accepted_payload = f"{candidate_job_id}\n".encode("ascii")
     accepted_sha = write_exclusive(accepted_path, accepted_payload, mode=0o400)
     accepted_record = {
@@ -1516,6 +1797,10 @@ try:
         client_environment=client_environment,
         label="scontrol release",
     )
+    # Slurm release and the stdout receipt below are not one atomic operation.
+    # Any failure observed here is cleaned up by the exception path.  External
+    # termination after a successful release is the documented scheduler
+    # commit/ack recovery boundary and must be reconciled by exact job identity.
 except BaseException as error:
     if candidate_job_id is not None:
         cleanup_result = cleanup_authenticated_candidate(
