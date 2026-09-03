@@ -172,6 +172,7 @@ policy:
       tensor_parallel_size: 4
       pipeline_parallel_size: 1
       expert_parallel_size: 1
+      strict_model_transport: disabled
       max_model_len: 2048
       http_server_serving_chat_kwargs:
         default_chat_template_kwargs:

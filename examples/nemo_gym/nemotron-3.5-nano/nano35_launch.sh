@@ -1298,8 +1298,10 @@ export SETUP_COMMAND
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
 UV_RUNNER=uv
+UV_CACHE_JOB_ID_REFERENCE="\${SLURM_JOB_ID:-default}"
 if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
   UV_RUNNER="${STRICT_PAIR_UV_SHIM}"
+  UV_CACHE_JOB_ID_REFERENCE="\${STRICT_PAIR_BOUND_JOB_ID}"
 fi
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${VLLM_ENV_SOURCE}\
@@ -1311,7 +1313,7 @@ NRL_VLLM_CACHE_SEED_DIR=${NRL_VLLM_CACHE_SEED_DIR} \
 DG_JIT_CACHE_DIR=${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
 TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
-UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default} \
+UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-${UV_CACHE_JOB_ID_REFERENCE} \
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
@@ -1362,7 +1364,7 @@ if [[ "${STRICT_PAIR_HOST_RUNTIME}" == "1" ]]; then
     fi
     strict_pair_publish_or_verify_slurm_export \
       "${STRICT_PAIR_SLURM_EXPORT_FILE}"
-    echo "STRICT_PAIR_SLURM_EXPORT_PREPARED arm=${STRICT_PAIR_ARM} schema=nemo-rl-strict-slurm-export-file-v2 sha256=${STRICT_PAIR_ACTIVE_SLURM_EXPORT_SHA256} names=${#STRICT_PAIR_SLURM_EXPORT_ALLOWED_NAMES[@]}"
+    echo "STRICT_PAIR_SLURM_EXPORT_PREPARED arm=${STRICT_PAIR_ARM} schema=nemo-rl-strict-slurm-export-file-v3 sha256=${STRICT_PAIR_ACTIVE_SLURM_EXPORT_SHA256} names=${#STRICT_PAIR_SLURM_EXPORT_ALLOWED_NAMES[@]}"
     exit 0
   fi
   if [[ ! "${EXPECTED_STRICT_PAIR_SLURM_EXPORT_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
