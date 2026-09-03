@@ -3325,7 +3325,7 @@ printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \\
         (
             "single_env_reasoning_gym_sc.yaml",
             "resources_servers/reasoning_gym/configs/reasoning_gym.yaml",
-            2048,
+            4096,
         ),
         (
             "single_env_citation_sc.yaml",
@@ -3338,7 +3338,7 @@ printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \\
                 "resources_servers/format_verification/configs/"
                 "freeform_formatting.yaml"
             ),
-            2048,
+            4096,
         ),
     ],
 )
@@ -3349,6 +3349,12 @@ def test_closed_environment_overlays_compose_as_strict_train_recipes(
     assert config.policy["max_total_sequence_length"] == max_sequence_length
     assert config.policy["generation"]["vllm_cfg"]["max_model_len"] == (
         max_sequence_length
+    )
+    assert config.policy["sequence_packing"]["train_mb_tokens"] == (
+        4 * max_sequence_length
+    )
+    assert config.policy["sequence_packing"]["logprob_mb_tokens"] == (
+        4 * max_sequence_length
     )
     assert config.env["nemo_gym"]["config_paths"][-1] == gym_config
     assert config.grpo.max_num_steps == 100
@@ -3908,7 +3914,7 @@ def test_strict_pair_config_composes_for_both_arms(mode: str) -> None:
     assert master_config.policy["train_micro_batch_size"] == 1
     assert master_config.policy["generation_batch_size"] == 4
     assert master_config.policy["logprob_batch_size"] == 1
-    assert master_config.policy["max_total_sequence_length"] == 2048
+    assert master_config.policy["max_total_sequence_length"] == 4096
     assert master_config.policy["logprob_chunk_size"] == 256
     assert master_config.policy["make_sequence_length_divisible_by"] == 128
     assert master_config.policy["quant_cfg"] is None
@@ -3943,8 +3949,8 @@ def test_strict_pair_config_composes_for_both_arms(mode: str) -> None:
     assert generation["val_top_k"] is None
     assert generation["nemo_gym_add_seed_per_rollout"] is True
     assert generation["nemo_gym_per_rollout_seed_base"] == 42
-    assert master_config.policy["sequence_packing"]["train_mb_tokens"] == 4096
-    assert master_config.policy["sequence_packing"]["logprob_mb_tokens"] == 4096
+    assert master_config.policy["sequence_packing"]["train_mb_tokens"] == 16384
+    assert master_config.policy["sequence_packing"]["logprob_mb_tokens"] == 16384
     assert not master_config.data["shuffle"]
     assert master_config.async_rl.min_groups_for_streaming_train == 1
     assert master_config.async_rl.max_inflight_prompts == 1

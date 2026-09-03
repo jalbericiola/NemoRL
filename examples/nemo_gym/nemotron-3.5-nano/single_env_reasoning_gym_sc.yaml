@@ -93,7 +93,10 @@ policy:
   train_micro_batch_size: 1
   generation_batch_size: 4
   logprob_batch_size: 1
-  max_total_sequence_length: 2048
+  # Use the same all-row-safe ceiling as the citation/freeform arms. Keeping
+  # the K=4 group whole is part of the shared-prefix benchmark contract: a
+  # smaller token bin may split the cohort and silently measure dense fallback.
+  max_total_sequence_length: 4096
   logprob_chunk_size: 256
   make_sequence_length_divisible_by: 128
   quant_cfg: null
@@ -147,8 +150,8 @@ policy:
 
   sequence_packing:
     enabled: true
-    train_mb_tokens: 4096
-    logprob_mb_tokens: 4096
+    train_mb_tokens: 16384
+    logprob_mb_tokens: 16384
 
   shared_prefix_training:
     mode: ???
@@ -173,7 +176,7 @@ policy:
       pipeline_parallel_size: 1
       expert_parallel_size: 1
       strict_model_transport: disabled
-      max_model_len: 2048
+      max_model_len: 4096
       http_server_serving_chat_kwargs:
         default_chat_template_kwargs:
           enable_thinking: true
