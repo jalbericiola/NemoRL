@@ -73,6 +73,7 @@ ATTEMPT_NAMES = ("replay-1", "replay-2")
 PROFILE_BY_ENVIRONMENT = {
     "citation": "citation-string-match-v1",
     "freeform": "freeform-regex-v1",
+    "reasoning_gym": "reasoning-gym-exact-match-v1",
 }
 MANIFEST_SCHEMA = "nemo-rl-strict-captured-replay-execution-manifest-v4"
 SUBMISSION_SCHEMA = "nemo-rl-strict-captured-replay-submission-receipt-v5"
@@ -92,6 +93,16 @@ OUTPUT_PATHS = {
     "transport_consumption": "model-transport-replay-consumption.json",
     "transcript_bundle": "transcript-bundle.json",
     "replay_ledger": "replay-ledger.json",
+}
+SCORER_INDEX_SCHEMA_BY_ENVIRONMENT = {
+    "citation": OUTPUT_SCHEMAS["scorer_call_index"],
+    "freeform": OUTPUT_SCHEMAS["scorer_call_index"],
+    "reasoning_gym": "nemo-rl-strict-reasoning-score-call-index-v1",
+}
+SCORER_INDEX_PATH_BY_ENVIRONMENT = {
+    "citation": OUTPUT_PATHS["scorer_call_index"],
+    "freeform": OUTPUT_PATHS["scorer_call_index"],
+    "reasoning_gym": "strict_gym_child_runtime/reasoning-score-call-index.json",
 }
 
 COMPANION_SOURCES: dict[str, tuple[str, str]] = {
@@ -2016,7 +2027,7 @@ def _validate_report_processes(snapshot: dict[str, Any], *, attempt: str) -> Non
         minimum=1,
         maximum=(1 << 31) - 1,
     )
-    driver_start = _bounded_int(
+    _bounded_int(
         driver["start_time_ticks"],
         name=f"{attempt} driver start ticks",
         minimum=1,
@@ -2046,7 +2057,7 @@ def _validate_report_processes(snapshot: dict[str, Any], *, attempt: str) -> Non
         minimum=1,
         maximum=(1 << 31) - 1,
     )
-    scorer_start = _bounded_int(
+    _bounded_int(
         scorer["start_ticks"],
         name=f"{attempt} scorer start ticks",
         minimum=1,
@@ -2054,7 +2065,7 @@ def _validate_report_processes(snapshot: dict[str, Any], *, attempt: str) -> Non
     )
     if driver_boot != hashlib.sha256((boot_id + "\n").encode("ascii")).hexdigest():
         _fail(f"{attempt} driver and scorer boot identities differ")
-    if (driver_pid, driver_start) == (scorer_pid, scorer_start):
+    if driver_pid == scorer_pid:
         _fail(f"{attempt} driver and scorer process identities alias")
 
 
@@ -2114,6 +2125,7 @@ def _validate_report_samples(
             passed = details["passed"]
             if type(passed) is not bool or passed is not (not details["missing"] and not details["spurious"]):
                 _fail(f"{attempt} citation sample {index} passed differs")
+            expected_reward = 1.0 if passed else 0.0
         elif environment == "freeform":
             details = _exact_dict(
                 details,
@@ -2135,14 +2147,35 @@ def _validate_report_samples(
             passed = details["passed"]
             if type(passed) is not bool or passed is not (matching >= minimum):
                 _fail(f"{attempt} freeform sample {index} passed differs")
+            expected_reward = 1.0 if passed else 0.0
+        elif environment == "reasoning_gym":
+            details = _exact_dict(
+                details,
+                {"task_name", "score", "extracted_answer"},
+                name=f"{attempt} reasoning sample {index} details",
+            )
+            if type(details["task_name"]) is not str or details["task_name"] != "knights_knaves":
+                _fail(f"{attempt} reasoning sample {index} task name differs")
+            score = details["score"]
+            if (
+                type(score) is not float
+                or not math.isfinite(score)
+                or not 0.0 <= score <= 1.0
+                or (score == 0.0 and math.copysign(1.0, score) < 0.0)
+            ):
+                _fail(f"{attempt} reasoning sample {index} score differs")
+            if type(details["extracted_answer"]) is not str:
+                _fail(f"{attempt} reasoning sample {index} extracted answer differs")
+            expected_reward = score
         else:
             _fail(f"{attempt} environment differs")
         reward = sample["raw_environment_reward"]
         if (
             type(reward) is not float
-            or reward not in (0.0, 1.0)
+            or not math.isfinite(reward)
+            or not 0.0 <= reward <= 1.0
             or (reward == 0.0 and math.copysign(1.0, reward) < 0)
-            or reward != (1.0 if passed else 0.0)
+            or reward != expected_reward
         ):
             _fail(f"{attempt} sample {index} reward differs")
     return samples
@@ -2256,11 +2289,15 @@ def _validate_report_snapshot(
         schema=INDEX_SCHEMA,
     )
     outputs = _exact_dict(snapshot["outputs"], set(OUTPUT_SCHEMAS), name=f"{attempt} outputs")
-    for output_name, schema in OUTPUT_SCHEMAS.items():
+    output_schemas = dict(OUTPUT_SCHEMAS)
+    output_paths = dict(OUTPUT_PATHS)
+    output_schemas["scorer_call_index"] = SCORER_INDEX_SCHEMA_BY_ENVIRONMENT[pair["environment"]]
+    output_paths["scorer_call_index"] = SCORER_INDEX_PATH_BY_ENVIRONMENT[pair["environment"]]
+    for output_name, schema in output_schemas.items():
         _require_artifact(
             outputs[output_name],
             name=f"{attempt} output {output_name}",
-            path=f"{result_root}/{OUTPUT_PATHS[output_name]}",
+            path=f"{result_root}/{output_paths[output_name]}",
             schema=schema,
         )
     _validate_report_samples(snapshot["samples"], environment=pair["environment"], attempt=attempt)
@@ -2366,7 +2403,13 @@ def _validate_evaluator_report(
     if (
         type(vector) is not list
         or len(vector) != 4
-        or any(type(value) is not float or value not in (0.0, 1.0) for value in vector)
+        or any(
+            type(value) is not float
+            or not math.isfinite(value)
+            or not 0.0 <= value <= 1.0
+            or (value == 0.0 and math.copysign(1.0, value) < 0.0)
+            for value in vector
+        )
         or _canonical_json(parity, allow_float=True) != _canonical_json(expected_parity, allow_float=True)
     ):
         _fail("authenticated evaluator report parity differs")

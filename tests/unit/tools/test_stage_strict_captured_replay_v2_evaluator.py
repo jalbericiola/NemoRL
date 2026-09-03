@@ -448,7 +448,7 @@ def test_parent_and_isolated_bootstrap_share_exact_module_order() -> None:
     assert ast.literal_eval(assignments[0].value) == STAGER._MODULE_LOAD_ORDER
 
 
-@pytest.mark.parametrize("environment", ("citation", "freeform"))
+@pytest.mark.parametrize("environment", ("citation", "freeform", "reasoning_gym"))
 def test_parent_mirrors_exact_request_report_and_parity(
     environment: str,
 ) -> None:
@@ -467,6 +467,19 @@ def test_parent_mirrors_exact_request_report_and_parity(
         )
         == report
     )
+
+
+def test_parent_preserves_fractional_reasoning_reward_vector() -> None:
+    program = {"path": "/staged/evaluator-source-manifest-v1.json", "sha256": _sha256(STAGER_PATH)}
+    request, report = _evaluator_request_and_report(program, "reasoning_gym")
+
+    validated = STAGER._validate_evaluator_report(
+        EVALUATOR_FIXTURES._canonical(report),
+        request=request,
+        program=program,
+    )
+
+    assert validated["parity"]["reward_vector"] == [0.0, 0.25, 0.75, 1.0]
 
 
 @pytest.mark.parametrize(
@@ -502,6 +515,65 @@ def test_parent_rejects_forged_child_report(mutation: str) -> None:
         STAGER._validate_evaluator_report(
             EVALUATOR_FIXTURES._canonical(report),
             request=request,
+            program=program,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "reward-mismatch",
+        "out-of-range-score",
+        "wrong-task",
+        "nonstring-answer",
+        "format-scorer-authority",
+        "same-driver-scorer-pid",
+        "not-k4",
+    ),
+)
+def test_parent_rejects_forged_reasoning_child_report(mutation: str) -> None:
+    program = {"path": "/staged/evaluator-source-manifest-v1.json", "sha256": _sha256(STAGER_PATH)}
+    request, report = _evaluator_request_and_report(program, "reasoning_gym")
+    first = report["attempts"]["replay-1"]
+    if mutation == "reward-mismatch":
+        first["samples"][1]["raw_environment_reward"] = 0.5
+    elif mutation == "out-of-range-score":
+        first["samples"][1]["match_details"]["score"] = 1.1
+        first["samples"][1]["raw_environment_reward"] = 1.1
+    elif mutation == "wrong-task":
+        first["samples"][1]["match_details"]["task_name"] = "decimal_arithmetic"
+    elif mutation == "nonstring-answer":
+        first["samples"][1]["match_details"]["extracted_answer"] = None
+    elif mutation == "format-scorer-authority":
+        scorer = first["outputs"]["scorer_call_index"]
+        scorer["path"] = f"{first['result_root']}/strict_gym_child_runtime/" "format-verification-call-index.json"
+        scorer["schema"] = STAGER.OUTPUT_SCHEMAS["scorer_call_index"]
+    elif mutation == "same-driver-scorer-pid":
+        first["scorer_process_identity"]["pid"] = first["driver_process"]["pid"]
+    else:
+        first["samples"].pop()
+
+    with pytest.raises(STAGER.EvaluatorStageError):
+        STAGER._validate_evaluator_report(
+            EVALUATOR_FIXTURES._canonical(report),
+            request=request,
+            program=program,
+        )
+
+
+@pytest.mark.parametrize(
+    "claim",
+    ("result_root", "result_inventory_sha256", "authenticated_job_id"),
+)
+def test_parent_rejects_caller_supplied_terminal_authority(claim: str) -> None:
+    program = {"path": "/staged/evaluator-source-manifest-v1.json", "sha256": _sha256(STAGER_PATH)}
+    request, _ = _evaluator_request_and_report(program, "reasoning_gym")
+    request["attempts"]["replay-1"][claim] = "attacker-controlled"
+    EVALUATOR_FIXTURES._rehash_request(request)
+
+    with pytest.raises(STAGER.EvaluatorStageError, match="key set"):
+        STAGER._validate_evaluator_request(
+            EVALUATOR_FIXTURES._canonical(request),
             program=program,
         )
 

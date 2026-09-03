@@ -59,6 +59,7 @@ def _rehash_request(request: dict[str, Any]) -> None:
 
 def _samples(environment: str) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
+    reasoning_scores = (0.0, 0.25, 0.75, 1.0)
     for index in range(4):
         if environment == "citation":
             details: dict[str, Any] = {
@@ -67,11 +68,20 @@ def _samples(environment: str) -> list[dict[str, Any]]:
                 "spurious": [],
                 "passed": True,
             }
-        else:
+            reward = 1.0
+        elif environment == "freeform":
             details = {
                 "matching_lines": 2,
                 "min_matches": 2,
                 "passed": True,
+            }
+            reward = 1.0
+        else:
+            reward = reasoning_scores[index]
+            details = {
+                "task_name": "knights_knaves",
+                "score": reward,
+                "extracted_answer": f"person-{index} is a knight",
             }
         result.append(
             {
@@ -84,7 +94,7 @@ def _samples(environment: str) -> list[dict[str, Any]]:
                 "model_transport_response_body_sha256": _sha(f"response-{index}"),
                 "model_response_sha256": _sha(f"model-response-{index}"),
                 "match_details": details,
-                "raw_environment_reward": 1.0,
+                "raw_environment_reward": reward,
             }
         )
     return result
@@ -138,6 +148,10 @@ def _snapshot(request: dict[str, Any], attempt: str) -> dict[str, Any]:
     )
     number = 1 if attempt == "replay-1" else 2
     boot_id = f"12345678-1234-1234-1234-1234567890a{number}"
+    output_schemas = dict(EVALUATOR.OUTPUT_SCHEMAS)
+    output_paths = dict(EVALUATOR.OUTPUT_PATHS)
+    output_schemas["scorer_call_index"] = EVALUATOR.SCORER_INDEX_SCHEMA_BY_ENVIRONMENT[pair["environment"]]
+    output_paths["scorer_call_index"] = EVALUATOR.SCORER_INDEX_PATH_BY_ENVIRONMENT[pair["environment"]]
     return {
         "schema": EVALUATOR.SNAPSHOT_SCHEMA,
         "pair_id": pair["pair_id"],
@@ -198,11 +212,11 @@ def _snapshot(request: dict[str, Any], attempt: str) -> dict[str, Any]:
         ),
         "outputs": {
             name: _artifact(
-                f"{result_root}/{EVALUATOR.OUTPUT_PATHS[name]}",
+                f"{result_root}/{output_paths[name]}",
                 schema,
                 f"{attempt}-{name}",
             )
-            for name, schema in EVALUATOR.OUTPUT_SCHEMAS.items()
+            for name, schema in output_schemas.items()
         },
         "samples": _samples(pair["environment"]),
     }
@@ -248,7 +262,7 @@ def _api(request: dict[str, Any], snapshots: dict[str, dict[str, Any]] | None = 
     return (_Consumed, consume, vars(_Consumed)["snapshot"])
 
 
-@pytest.mark.parametrize("environment", ("citation", "freeform"))
+@pytest.mark.parametrize("environment", ("citation", "freeform", "reasoning_gym"))
 def test_accepts_exact_profile_bound_dual_attempts(environment: str) -> None:
     request = _request(environment)
 
@@ -262,7 +276,7 @@ def test_accepts_exact_profile_bound_dual_attempts(environment: str) -> None:
     assert report["status"] == "authenticated"
     assert report["pair"]["environment"] == environment
     assert report["parity"]["status"] == "exact-match"
-    assert report["parity"]["reward_vector"] == [1.0] * 4
+    assert report["parity"]["reward_vector"] == [sample["raw_environment_reward"] for sample in _samples(environment)]
     assert set(report["attempts"]) == set(EVALUATOR.ATTEMPT_NAMES)
 
 
@@ -321,6 +335,19 @@ def test_rejects_old_attempt_authority_or_extra_claims() -> None:
     request = _request()
     item = request["attempts"]["replay-1"]
     item["evidence_index"] = _ref("old-index")
+    _rehash_request(request)
+
+    with pytest.raises(EVALUATOR.ReplayV2EvaluationError, match="key set"):
+        EVALUATOR._validate_request(request)
+
+
+@pytest.mark.parametrize(
+    "claim",
+    ("result_root", "result_inventory_sha256", "authenticated_job_id"),
+)
+def test_rejects_caller_supplied_terminal_authority(claim: str) -> None:
+    request = _request("reasoning_gym")
+    request["attempts"]["replay-1"][claim] = "/attacker/result" if claim == "result_root" else _sha(f"attacker-{claim}")
     _rehash_request(request)
 
     with pytest.raises(EVALUATOR.ReplayV2EvaluationError, match="key set"):
@@ -460,18 +487,150 @@ def test_rejects_relabelled_attempt_output_digest(output_name: str) -> None:
         )
 
 
-def test_rejects_authenticated_sample_parity_mismatch() -> None:
-    request = _request("freeform")
+@pytest.mark.parametrize("environment", ("freeform", "reasoning_gym"))
+def test_rejects_authenticated_sample_parity_mismatch(environment: str) -> None:
+    request = _request(environment)
     snapshots = {attempt: _snapshot(request, attempt) for attempt in EVALUATOR.ATTEMPT_NAMES}
     second = snapshots["replay-2"]["samples"][3]
-    second["match_details"] = {
-        "matching_lines": 1,
-        "min_matches": 2,
-        "passed": False,
-    }
-    second["raw_environment_reward"] = 0.0
+    if environment == "freeform":
+        second["match_details"] = {
+            "matching_lines": 1,
+            "min_matches": 2,
+            "passed": False,
+        }
+        second["raw_environment_reward"] = 0.0
+    else:
+        second["match_details"]["score"] = 0.5
+        second["raw_environment_reward"] = 0.5
 
     with pytest.raises(EVALUATOR.ReplayV2EvaluationError, match="sample evidence differs"):
+        EVALUATOR.evaluate_authenticated_request(
+            request,
+            evaluator_program=request["evaluator_program"],
+            coordinator_api=_api(request, snapshots),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "integer-score",
+        "negative-zero-score",
+        "nonfinite-score",
+        "low-score",
+        "high-score",
+        "wrong-task",
+        "nonstring-answer",
+        "missing-detail",
+        "extra-detail",
+        "reward-mismatch",
+    ),
+)
+def test_rejects_invalid_reasoning_sample_projection_even_when_attempts_match(
+    mutation: str,
+) -> None:
+    request = _request("reasoning_gym")
+    snapshots = {attempt: _snapshot(request, attempt) for attempt in EVALUATOR.ATTEMPT_NAMES}
+    for snapshot in snapshots.values():
+        sample = snapshot["samples"][1]
+        details = sample["match_details"]
+        if mutation == "integer-score":
+            details["score"] = 1
+            sample["raw_environment_reward"] = 1.0
+        elif mutation == "negative-zero-score":
+            details["score"] = -0.0
+            sample["raw_environment_reward"] = -0.0
+        elif mutation == "nonfinite-score":
+            details["score"] = float("inf")
+            sample["raw_environment_reward"] = float("inf")
+        elif mutation == "low-score":
+            details["score"] = -0.1
+            sample["raw_environment_reward"] = -0.1
+        elif mutation == "high-score":
+            details["score"] = 1.1
+            sample["raw_environment_reward"] = 1.1
+        elif mutation == "wrong-task":
+            details["task_name"] = "decimal_arithmetic"
+        elif mutation == "nonstring-answer":
+            details["extracted_answer"] = None
+        elif mutation == "missing-detail":
+            details.pop("extracted_answer")
+        elif mutation == "extra-detail":
+            details["passed"] = True
+        else:
+            sample["raw_environment_reward"] = 0.5
+
+    with pytest.raises(EVALUATOR.ReplayV2EvaluationError):
+        EVALUATOR.evaluate_authenticated_request(
+            request,
+            evaluator_program=request["evaluator_program"],
+            coordinator_api=_api(request, snapshots),
+        )
+
+
+@pytest.mark.parametrize("member", ("path", "schema"))
+def test_rejects_reasoning_snapshot_with_format_scorer_authority(member: str) -> None:
+    request = _request("reasoning_gym")
+    snapshots = {attempt: _snapshot(request, attempt) for attempt in EVALUATOR.ATTEMPT_NAMES}
+    for snapshot in snapshots.values():
+        scorer = snapshot["outputs"]["scorer_call_index"]
+        if member == "path":
+            scorer["path"] = (
+                f"{snapshot['result_root']}/strict_gym_child_runtime/" "format-verification-call-index.json"
+            )
+        else:
+            scorer["schema"] = EVALUATOR.SCORER_INDEX_SCHEMA
+
+    with pytest.raises(EVALUATOR.ReplayV2EvaluationError, match="scorer_call_index"):
+        EVALUATOR.evaluate_authenticated_request(
+            request,
+            evaluator_program=request["evaluator_program"],
+            coordinator_api=_api(request, snapshots),
+        )
+
+
+@pytest.mark.parametrize("environment", ("citation", "freeform"))
+@pytest.mark.parametrize("member", ("path", "schema"))
+def test_rejects_format_snapshot_with_reasoning_scorer_authority(environment: str, member: str) -> None:
+    request = _request(environment)
+    snapshots = {attempt: _snapshot(request, attempt) for attempt in EVALUATOR.ATTEMPT_NAMES}
+    for snapshot in snapshots.values():
+        scorer = snapshot["outputs"]["scorer_call_index"]
+        if member == "path":
+            scorer["path"] = f"{snapshot['result_root']}/strict_gym_child_runtime/" "reasoning-score-call-index.json"
+        else:
+            scorer["schema"] = EVALUATOR.REASONING_SCORER_INDEX_SCHEMA
+
+    with pytest.raises(EVALUATOR.ReplayV2EvaluationError, match="scorer_call_index"):
+        EVALUATOR.evaluate_authenticated_request(
+            request,
+            evaluator_program=request["evaluator_program"],
+            coordinator_api=_api(request, snapshots),
+        )
+
+
+def test_rejects_reasoning_snapshot_without_exact_k4() -> None:
+    request = _request("reasoning_gym")
+    snapshots = {attempt: _snapshot(request, attempt) for attempt in EVALUATOR.ATTEMPT_NAMES}
+    for snapshot in snapshots.values():
+        snapshot["samples"].pop()
+
+    with pytest.raises(EVALUATOR.ReplayV2EvaluationError, match="K=4"):
+        EVALUATOR.evaluate_authenticated_request(
+            request,
+            evaluator_program=request["evaluator_program"],
+            coordinator_api=_api(request, snapshots),
+        )
+
+
+def test_rejects_same_driver_and_scorer_pid_with_different_start_ticks() -> None:
+    request = _request("reasoning_gym")
+    snapshots = {attempt: _snapshot(request, attempt) for attempt in EVALUATOR.ATTEMPT_NAMES}
+    first = snapshots["replay-1"]
+    first["scorer_process_identity"]["pid"] = first["driver_process"]["pid"]
+    assert first["scorer_process_identity"]["start_ticks"] != first["driver_process"]["start_time_ticks"]
+
+    with pytest.raises(EVALUATOR.ReplayV2EvaluationError, match="process identities alias"):
         EVALUATOR.evaluate_authenticated_request(
             request,
             evaluator_program=request["evaluator_program"],

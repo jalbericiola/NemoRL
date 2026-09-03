@@ -25,7 +25,7 @@ injects the authenticated program reference and the exact coordinator
 The injected coordinator seam owns all filesystem and producer lifecycle
 authentication, including FINAL-before-result authority and the retained
 thirteen-file sealed-result byte capability.  This evaluator independently
-validates the detached snapshots, exact citation/freeform profile semantics,
+validates the detached snapshots, exact citation/freeform/reasoning profile semantics,
 and the required distinctions and parity between replay-1 and replay-2.
 """
 
@@ -53,6 +53,7 @@ ATTEMPT_NAMES = ("replay-1", "replay-2")
 PROFILE_BY_ENVIRONMENT = {
     "citation": "citation-string-match-v1",
     "freeform": "freeform-regex-v1",
+    "reasoning_gym": "reasoning-gym-exact-match-v1",
 }
 EXACT_ENVIRONMENT = {"LANG": "C", "LC_ALL": "C", "TZ": "UTC"}
 
@@ -64,6 +65,7 @@ FINAL_SCHEMA = "nemo-rl-strict-captured-replay-result-final-receipt-v1"
 INVENTORY_SCHEMA = "nemo-rl-strict-captured-replay-result-inventory-v2"
 INDEX_SCHEMA = "nemo-rl-strict-captured-replay-evidence-index-v4"
 SCORER_INDEX_SCHEMA = "nemo-rl-strict-format-verification-call-index-v1"
+REASONING_SCORER_INDEX_SCHEMA = "nemo-rl-strict-reasoning-score-call-index-v1"
 TRANSPORT_SCHEMA = "nemo-rl-strict-model-transport-replay-consumption-v3"
 TRANSCRIPT_SCHEMA = "nemo-rl-strict-step1-transcript-bundle-v4"
 LEDGER_SCHEMA = "nemo-rl-strict-captured-replay-step1-ledger-v5"
@@ -117,6 +119,16 @@ OUTPUT_PATHS = {
     "transport_consumption": "model-transport-replay-consumption.json",
     "transcript_bundle": "transcript-bundle.json",
     "replay_ledger": "replay-ledger.json",
+}
+SCORER_INDEX_SCHEMA_BY_ENVIRONMENT = {
+    "citation": SCORER_INDEX_SCHEMA,
+    "freeform": SCORER_INDEX_SCHEMA,
+    "reasoning_gym": REASONING_SCORER_INDEX_SCHEMA,
+}
+SCORER_INDEX_PATH_BY_ENVIRONMENT = {
+    "citation": OUTPUT_PATHS["scorer_call_index"],
+    "freeform": OUTPUT_PATHS["scorer_call_index"],
+    "reasoning_gym": "strict_gym_child_runtime/reasoning-score-call-index.json",
 }
 
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
@@ -421,7 +433,7 @@ def _validate_processes(snapshot: dict[str, Any]) -> None:
     )
     driver_boot = _digest(driver["boot_id_sha256"], "driver boot ID SHA-256")
     driver_pid = _bounded_int(driver["pid"], "driver PID", minimum=1, maximum=(1 << 31) - 1)
-    driver_start = _bounded_int(
+    _bounded_int(
         driver["start_time_ticks"],
         "driver start ticks",
         minimum=1,
@@ -446,10 +458,10 @@ def _validate_processes(snapshot: dict[str, Any]) -> None:
     if len(hostname_raw) > 255:
         _fail("invalid_evidence", "scorer hostname is too long")
     scorer_pid = _bounded_int(scorer["pid"], "scorer PID", minimum=1, maximum=(1 << 31) - 1)
-    scorer_start = _bounded_int(scorer["start_ticks"], "scorer start ticks", minimum=1, maximum=(1 << 63) - 1)
+    _bounded_int(scorer["start_ticks"], "scorer start ticks", minimum=1, maximum=(1 << 63) - 1)
     if driver_boot != hashlib.sha256((boot_id + "\n").encode("ascii")).hexdigest():
         _fail("invalid_evidence", "driver and scorer boot identities differ")
-    if (driver_pid, driver_start) == (scorer_pid, scorer_start):
+    if driver_pid == scorer_pid:
         _fail("invalid_evidence", "driver and scorer process identities alias")
 
 
@@ -493,6 +505,7 @@ def _validate_samples(snapshot: dict[str, Any], environment: str) -> list[dict[s
             passed = details["passed"]
             if type(passed) is not bool or passed is not (not details["missing"] and not details["spurious"]):
                 _fail("invalid_evidence", f"citation sample {index} passed differs")
+            expected_reward = 1.0 if passed else 0.0
         elif environment == "freeform":
             details = _exact_dict(
                 details,
@@ -514,11 +527,36 @@ def _validate_samples(snapshot: dict[str, Any], environment: str) -> list[dict[s
             passed = details["passed"]
             if type(passed) is not bool or passed is not (matching >= minimum):
                 _fail("invalid_evidence", f"freeform sample {index} passed differs")
+            expected_reward = 1.0 if passed else 0.0
+        elif environment == "reasoning_gym":
+            details = _exact_dict(
+                details,
+                frozenset({"task_name", "score", "extracted_answer"}),
+                f"reasoning sample {index} match details",
+            )
+            if type(details["task_name"]) is not str or details["task_name"] != "knights_knaves":
+                _fail("invalid_evidence", f"reasoning sample {index} task name differs")
+            score = details["score"]
+            if (
+                type(score) is not float
+                or not math.isfinite(score)
+                or not 0.0 <= score <= 1.0
+                or (score == 0.0 and math.copysign(1.0, score) < 0.0)
+            ):
+                _fail("invalid_evidence", f"reasoning sample {index} score differs")
+            if type(details["extracted_answer"]) is not str:
+                _fail("invalid_evidence", f"reasoning sample {index} extracted answer differs")
+            expected_reward = score
         else:  # Closed by request dispatch.
             raise AssertionError("unreachable profile")
         reward = sample["raw_environment_reward"]
-        expected_reward = 1.0 if passed else 0.0
-        if type(reward) is not float or reward not in (0.0, 1.0) or reward != expected_reward:
+        if (
+            type(reward) is not float
+            or not math.isfinite(reward)
+            or not 0.0 <= reward <= 1.0
+            or (reward == 0.0 and math.copysign(1.0, reward) < 0.0)
+            or reward != expected_reward
+        ):
             _fail("invalid_evidence", f"sample {index} reward differs")
     return samples
 
@@ -613,11 +651,15 @@ def _validate_snapshot(
         schema=INDEX_SCHEMA,
     )
     outputs = _exact_dict(snapshot["outputs"], frozenset(OUTPUT_SCHEMAS), f"{attempt} outputs")
-    for name, schema in OUTPUT_SCHEMAS.items():
+    output_schemas = dict(OUTPUT_SCHEMAS)
+    output_paths = dict(OUTPUT_PATHS)
+    output_schemas["scorer_call_index"] = SCORER_INDEX_SCHEMA_BY_ENVIRONMENT[pair["environment"]]
+    output_paths["scorer_call_index"] = SCORER_INDEX_PATH_BY_ENVIRONMENT[pair["environment"]]
+    for name, schema in output_schemas.items():
         _artifact(
             outputs[name],
             f"{attempt} output {name}",
-            path=f"{result_root}/{OUTPUT_PATHS[name]}",
+            path=f"{result_root}/{output_paths[name]}",
             schema=schema,
         )
     _validate_samples(snapshot, pair["environment"])
