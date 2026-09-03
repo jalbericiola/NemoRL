@@ -105,12 +105,14 @@ def _train_result(
     mtp_metrics: dict[str, float] | None = None,
     draft_grad_norm: float | None = None,
     leader: bool = True,
+    update_successful: bool = True,
 ) -> dict:
     result = {
         "global_loss": 1.0,
         "grad_norm": 0.5,
         "all_mb_metrics": {"loss": [0.1]},
         "is_replica_leader": leader,
+        "update_successful": update_successful,
     }
     if mtp_metrics is not None:
         result["mtp_metrics"] = mtp_metrics
@@ -174,7 +176,6 @@ def _make_tq_policy(
     }
     p.shared_prefix_training_config = validate_shared_prefix_training_config(p.cfg)
     p._router_replay_enabled = False
-    p.shared_prefix_training_config = MagicMock(mode="disabled")
     p.flops_tracker = None
     wg = MagicMock()
     wg.run_all_workers_single_data.return_value = ["f0", "f1"]

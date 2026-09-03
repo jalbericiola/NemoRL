@@ -3286,10 +3286,8 @@ def test_closed_environment_overlays_compose_as_strict_train_recipes(
     assert config.env["nemo_gym"]["config_paths"][-1] == gym_config
     assert config.grpo.max_num_steps == 100
     assert config.grpo.max_num_epochs == 20
-    assert config.policy["shared_prefix_training"]["mode"] == "train"
-    assert config.policy["shared_prefix_training"][
-        "require_deterministic_execution"
-    ]
+    assert config.policy["shared_prefix_training"].mode == "train"
+    assert config.policy["shared_prefix_training"].require_deterministic_execution
 
 
 def test_off_and_on_commands_differ_only_by_arm_identity_paths_and_mode() -> None:
