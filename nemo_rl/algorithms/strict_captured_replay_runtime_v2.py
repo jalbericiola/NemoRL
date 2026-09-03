@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fail-closed K=4 citation/freeform scorer-only captured replay V2.
+"""Fail-closed K=4 profiled scorer-only captured replay V2.
 
 This module deliberately contains no model-generation path.  It consumes the
 authenticated OFF transport material exactly once, sends the reconstructed
@@ -104,19 +104,19 @@ class StrictModelTransportReplaySourceV3(Protocol):
         authenticated_job_id: str,
         process: Mapping[str, Any],
         scheduler_device_environment: Mapping[str, Any],
-        format_verification_call_index_ref: Mapping[str, Any],
+        scorer_call_index_ref: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         """Return terminal exact-once consumption evidence."""
 
 
 VerifierPost = Callable[[int, int, Mapping[str, Any]], Mapping[str, Any]]
-IndependentFormatCheck = Callable[[int, Mapping[str, Any], Mapping[str, Any]], None]
-FinalizeFormatCallEvidence = Callable[[], Mapping[str, Any]]
+IndependentScorerCheck = Callable[[int, Mapping[str, Any], Mapping[str, Any]], None]
+FinalizeScorerCallEvidence = Callable[[], Mapping[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
 class ReplayDocumentsV2:
-    """The three runtime-owned documents declared by the replay manifest."""
+    """The runtime-owned documents declared by the replay manifest."""
 
     transcript_bundle: dict[str, Any]
     replay_ledger: dict[str, Any]
@@ -136,12 +136,12 @@ def execute_profiled_captured_replay_cohort(
     source_main_ledger_document: Mapping[str, Any],
     transport_source: StrictModelTransportReplaySourceV3,
     post_verifier: VerifierPost,
-    independent_format_check: IndependentFormatCheck | None,
-    finalize_format_call_evidence: FinalizeFormatCallEvidence,
+    independent_scorer_check: IndependentScorerCheck | None,
+    finalize_scorer_call_evidence: FinalizeScorerCallEvidence,
     expected_environment: str,
     expected_profile_id: str,
 ) -> ReplayDocumentsV2:
-    """Execute one explicitly selected K=4 citation/freeform replay.
+    """Execute one explicitly selected K=4 profiled scorer replay.
 
     ``manifest`` must already have passed
     :func:`validate_replay_execution_manifest` against the authenticated Pair.
@@ -284,11 +284,11 @@ def execute_profiled_captured_replay_cohort(
             post_verifier(rollout_index, generation_seed, derived_request),
             f"fresh verifier response {rollout_index}",
         )
-        if independent_format_check is None:
+        if independent_scorer_check is None:
             raise StrictCapturedReplayError(
-                "profiled replay requires an independent pinned format check"
+                "profiled replay requires an independent pinned scorer check"
             )
-        independent_format_check(rollout_index, derived_request, verifier_response)
+        independent_scorer_check(rollout_index, derived_request, verifier_response)
         transport_source.record_fresh_verifier_result(
             rollout_index=rollout_index,
             verifier_response=verifier_response,
@@ -402,20 +402,16 @@ def execute_profiled_captured_replay_cohort(
     validate_ledger_transcript_join(ledger=ledger, transcript_bundle=transcript)
 
     scorer_call_index_ref = _mapping(
-        finalize_format_call_evidence(),
-        "format-verification terminal reference",
+        finalize_scorer_call_evidence(),
+        "scorer terminal reference",
     )
     if set(scorer_call_index_ref) != {"path", "schema", "sha256"}:
-        raise StrictCapturedReplayError(
-            "format-verification terminal reference keyset differs"
-        )
+        raise StrictCapturedReplayError("scorer terminal reference keyset differs")
     if scorer_call_index_ref.get("schema") != profile.call_index_schema:
-        raise StrictCapturedReplayError(
-            "format-verification terminal reference schema differs"
-        )
+        raise StrictCapturedReplayError("scorer terminal reference schema differs")
     _digest(
         scorer_call_index_ref.get("sha256"),
-        "format-verification terminal SHA-256",
+        "scorer terminal SHA-256",
     )
     scorer_output = _declared_output(
         outputs.get("scorer_call_index"),
@@ -427,7 +423,7 @@ def execute_profiled_captured_replay_cohort(
         or scorer_output.get("schema") != profile.call_index_schema
     ):
         raise StrictCapturedReplayError(
-            "format-verification terminal reference differs from manifest output"
+            "scorer terminal reference differs from manifest output"
         )
     consumption = _mapping(
         transport_source.finalize(
@@ -435,7 +431,7 @@ def execute_profiled_captured_replay_cohort(
             authenticated_job_id=authenticated_job_id,
             process=driver_process,
             scheduler_device_environment=driver_scheduler_device_environment,
-            format_verification_call_index_ref=scorer_call_index_ref,
+            scorer_call_index_ref=scorer_call_index_ref,
         ),
         "transport replay consumption",
     )
@@ -491,6 +487,73 @@ def post_resource_verify(
     finally:
         connection.close()
     return _strict_json_object(raw, name="resource scorer response")
+
+
+def reasoning_gym_score_call_material(
+    *,
+    derived_verifier_request: Mapping[str, Any],
+    verifier_response: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive the exact scorer input/result aliases without trusting the server."""
+    request = _mapping(derived_verifier_request, "derived verifier request")
+    response = _mapping(verifier_response, "verifier response")
+    if set(response) != {
+        "responses_create_params",
+        "response",
+        "reward",
+        "task_name",
+        "score",
+        "extracted_answer",
+    }:
+        raise StrictCapturedReplayError("fresh Reasoning-Gym response keyset differs")
+    model_response = _mapping(request.get("response"), "derived response")
+    task_name = _mapping(request.get("metadata"), "derived metadata").get(
+        "source_dataset"
+    )
+    if task_name != "knights_knaves":
+        raise StrictCapturedReplayError(
+            "derived scorer task_name differs from the admitted Reasoning-Gym task"
+        )
+    extracted_answer = _reasoning_gym_extracted_answer(
+        _reward_facing_text(model_response)
+    )
+    response_task = response.get("task_name")
+    response_answer = response.get("extracted_answer")
+    if (
+        type(response_task) is not str
+        or response_task != task_name
+        or type(response_answer) is not str
+        or response_answer != extracted_answer
+    ):
+        raise StrictCapturedReplayError(
+            "fresh Reasoning-Gym response aliases differ from independent request "
+            "projection"
+        )
+    score = response.get("score")
+    reward = response.get("reward")
+    if (
+        type(score) is not float
+        or type(reward) is not float
+        or not math.isfinite(score)
+        or not math.isfinite(reward)
+        or not 0.0 <= score <= 1.0
+        or (score == 0.0 and math.copysign(1.0, score) < 0.0)
+        or (reward == 0.0 and math.copysign(1.0, reward) < 0.0)
+        or reward != score
+    ):
+        raise StrictCapturedReplayError(
+            "fresh Reasoning-Gym score/reward is outside the exact domain"
+        )
+    return {
+        "answer": extracted_answer,
+        "entry": {
+            "question": request.get("question"),
+            "answer": request.get("answer"),
+            "metadata": request.get("metadata"),
+        },
+        "task_name": task_name,
+        "float_result": score,
+    }
 
 
 def _scorer_profile(profile: Any) -> dict[str, Any]:
@@ -586,6 +649,42 @@ def _build_replay_ledger_rows(
             }
         )
     return rows
+
+
+def _reward_facing_text(model_response: Mapping[str, Any]) -> str:
+    output = model_response.get("output")
+    if not isinstance(output, list):
+        raise StrictCapturedReplayError("derived response output must be a list")
+    pieces: list[str] = []
+    for output_index, item in enumerate(output):
+        item = _mapping(item, f"derived response output {output_index}")
+        if item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            raise StrictCapturedReplayError("message content must be a list")
+        for content_index, part in enumerate(content):
+            part = _mapping(
+                part,
+                f"derived response output {output_index} content {content_index}",
+            )
+            if part.get("type") != "output_text":
+                continue
+            text = part.get("text")
+            if type(text) is not str:
+                raise StrictCapturedReplayError("output_text text must be a string")
+            pieces.append(text)
+    return "".join(pieces)
+
+
+def _reasoning_gym_extracted_answer(text: str) -> str:
+    matches = list(re.finditer(r"<answer>\s?(.*?)\s?</answer>", text, flags=re.DOTALL))
+    if matches:
+        return matches[-1].group(1).strip()
+    boxed = re.search(r"\\boxed\{([^}]+)\}", text)
+    if boxed:
+        return boxed.group(1).strip()
+    return text.strip() if text.strip() else ""
 
 
 def _transcript_bindings(
@@ -811,12 +910,13 @@ def _safe_pair_id(value: Any) -> str:
 
 
 __all__ = [
-    "IndependentFormatCheck",
-    "FinalizeFormatCallEvidence",
+    "FinalizeScorerCallEvidence",
+    "IndependentScorerCheck",
     "ReplayDocumentsV2",
     "StrictCapturedReplayError",
     "StrictModelTransportReplaySourceV3",
     "VerifierPost",
     "execute_profiled_captured_replay_cohort",
     "post_resource_verify",
+    "reasoning_gym_score_call_material",
 ]

@@ -1,4 +1,4 @@
-"""Profile-bound citation/freeform model-transport replay consumption.
+"""Profile-bound model-transport replay consumption.
 
 This module is intentionally parallel to :mod:`strict_model_transport_replay`.
 Importing the legacy module does not import the profile registry, and callers
@@ -269,8 +269,27 @@ def _scorer_profile_v3(
     }
 
 
+def _profile_reward(
+    profile: StrictCapturedReplayProfile,
+    reward: Any,
+) -> float:
+    if type(reward) is not float or not math.isfinite(reward):
+        raise TypeError("profiled replay reward must be a finite float")
+    if reward == 0.0 and math.copysign(1.0, reward) < 0.0:
+        raise ValueError("profiled replay reward must not be negative zero")
+    if profile.environment in {"citation", "freeform"}:
+        if reward not in (0.0, 1.0):
+            raise ValueError("profiled replay format reward must be binary")
+    elif profile.environment == "reasoning_gym":
+        if not 0.0 <= reward <= 1.0:
+            raise ValueError("profiled replay reasoning reward is outside [0,1]")
+    else:
+        raise ValueError("unsupported profiled replay reward environment")
+    return reward
+
+
 class StrictModelTransportReplaySourceV3:
-    """Exact-once citation/freeform source with one closed profile."""
+    """Exact-once source with one closed scorer profile."""
 
     def __init__(
         self,
@@ -368,7 +387,7 @@ class StrictModelTransportReplaySourceV3:
         rollout_index: int,
         verifier_response: Mapping[str, Any],
     ) -> None:
-        """Validate and bind one format-verifier result after consumption."""
+        """Validate and bind one scorer result after consumption."""
         with self._lock:
             self._require_open()
             try:
@@ -390,6 +409,7 @@ class StrictModelTransportReplaySourceV3:
                     model_response=material.model_response,
                     verifier_response=response,
                 )
+                reward = _profile_reward(self._profile, reward)
                 response_sha256 = domain_sha256(
                     "step1-verifier-response",
                     response,
@@ -410,9 +430,9 @@ class StrictModelTransportReplaySourceV3:
         authenticated_job_id: str,
         process: Mapping[str, Any],
         scheduler_device_environment: Mapping[str, Any],
-        format_verification_call_index_ref: Mapping[str, Any],
+        scorer_call_index_ref: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Seal V3 after the selected format verifier's K=4 graph is reaped."""
+        """Seal V3 after the selected scorer's K=4 graph is reaped."""
         with self._lock:
             self._require_open()
             try:
@@ -433,8 +453,8 @@ class StrictModelTransportReplaySourceV3:
                     raise ValueError("not all K=4 OFF entries were consumed")
                 if set(self._fresh_results) != expected_indices:
                     raise ValueError("not all K=4 fresh verifier results were recorded")
-                scorer_evidence = self._load_format_scorer_evidence(
-                    format_verification_call_index_ref,
+                scorer_evidence = self._load_scorer_evidence(
+                    scorer_call_index_ref,
                     authenticated_job_id=replay_job,
                 )
                 entries = [
@@ -614,6 +634,132 @@ class StrictModelTransportReplaySourceV3:
             "original_process_reaped": True,
         }
 
+    def _load_scorer_evidence(
+        self,
+        reference: Mapping[str, Any],
+        *,
+        authenticated_job_id: str,
+    ) -> dict[str, Any]:
+        if self._profile.environment in {"citation", "freeform"}:
+            return self._load_format_scorer_evidence(
+                reference,
+                authenticated_job_id=authenticated_job_id,
+            )
+        if self._profile.environment == "reasoning_gym":
+            if (
+                self._profile.profile_id != "reasoning-gym-exact-match-v1"
+                or self._profile.verifier_type != "score_answer"
+                or self._profile.method != "KnightsKnavesDataset.score_answer"
+            ):
+                raise ValueError("reasoning scorer profile identity differs")
+            return self._load_reasoning_scorer_evidence(
+                reference,
+                authenticated_job_id=authenticated_job_id,
+            )
+        raise ValueError("unsupported scorer evidence environment")
+
+    def _load_reasoning_scorer_evidence(
+        self,
+        reference: Mapping[str, Any],
+        *,
+        authenticated_job_id: str,
+    ) -> dict[str, Any]:
+        terminal_ref = _artifact_ref(
+            reference,
+            self._profile.call_index_schema,
+            "reasoning score-call terminal index",
+        )
+        receipt_root = f"{self._replay_attempt_root}/strict_gym_child_runtime"
+        expected_path = (
+            f"{self._replay_attempt_root}/{self._profile.scorer_terminal_index_path}"
+        )
+        if terminal_ref["path"] != expected_path:
+            raise ValueError("reasoning score-call index path differs")
+
+        from nemo_rl.environments.strict_gym_child_runtime_v2 import (
+            load_finalized_reasoning_score_call_index,
+        )
+
+        terminal, terminal_sha256 = load_finalized_reasoning_score_call_index(
+            Path(terminal_ref["path"]),
+            expected_sha256=terminal_ref["sha256"],
+            expected_receipt_root=Path(receipt_root),
+            expected_pair_id=self._pair_id,
+            expected_job_id=authenticated_job_id,
+        )
+        if terminal_sha256 != terminal_ref["sha256"]:
+            raise ValueError("reasoning score-call index digest differs")
+        if (
+            terminal.get("schema") != self._profile.call_index_schema
+            or terminal.get("environment") != "reasoning_gym"
+            or terminal.get("scope") != "scorer-only"
+            or terminal.get("pair_id") != self._pair_id
+            or terminal.get("job_id") != authenticated_job_id
+            or terminal.get("call_count") != K4_SAMPLES
+            or type(terminal.get("call_count")) is not int
+        ):
+            raise ValueError("reasoning score-call index identity differs")
+        quiescence = terminal.get("quiescence")
+        if (
+            not isinstance(quiescence, Mapping)
+            or quiescence.get("original_process_reaped") is not True
+        ):
+            raise ValueError("reasoning scorer process was not reaped")
+        calls = terminal.get("calls")
+        if not isinstance(calls, list) or len(calls) != K4_SAMPLES:
+            raise ValueError("reasoning score-call index must contain K=4")
+        for index, actual in enumerate(calls):
+            if not isinstance(actual, Mapping):
+                raise TypeError(
+                    f"reasoning score-call index entry {index + 1} must be an object"
+                )
+            expected = self._expected_reasoning_score_call(index)
+            expected_record = {
+                "sequence": index + 1,
+                "task_name": expected["task_name"],
+                "input": expected["input"],
+                "float_result": expected["float_result"],
+                "receipt": copy.deepcopy(actual.get("receipt")),
+            }
+            _exact_document(
+                actual,
+                expected_record,
+                f"reasoning score-call index entry {index + 1}",
+            )
+        return {
+            "status": "authenticated",
+            "terminal_index": terminal_ref,
+            "original_process_reaped": True,
+        }
+
+    def _expected_reasoning_score_call(self, rollout_index: int) -> dict[str, Any]:
+        material = self._materials[rollout_index]
+        request = material.derived_verifier_request
+        response = self._fresh_results[rollout_index]["verifier_response"]
+        metadata = request.get("metadata")
+        if not isinstance(metadata, Mapping):
+            raise TypeError("reasoning scorer metadata must be an object")
+        task_name = metadata.get("source_dataset")
+        if type(task_name) is not str or task_name != "knights_knaves":
+            raise ValueError("reasoning scorer task must be knights_knaves")
+        scorer_entry = {
+            "question": copy.deepcopy(request.get("question")),
+            "answer": copy.deepcopy(request.get("answer")),
+            "metadata": copy.deepcopy(dict(metadata)),
+        }
+        return {
+            "task_name": task_name,
+            "input": {
+                "answer_sha256": hashlib.sha256(
+                    canonical_ascii_json(response.get("extracted_answer"))
+                ).hexdigest(),
+                "entry_sha256": hashlib.sha256(
+                    canonical_ascii_json(scorer_entry)
+                ).hexdigest(),
+            },
+            "float_result": self._fresh_results[rollout_index]["fresh_native_reward"],
+        }
+
     def _require_open(self) -> None:
         if self._phase != "open":
             suffix = f": {self._failure}" if self._failure is not None else ""
@@ -633,7 +779,7 @@ def load_strict_model_transport_replay_source_v3(
     expected_environment: str,
     expected_profile_id: str,
 ) -> StrictModelTransportReplaySourceV3:
-    """Reload one format source under explicit V3 manifest/profile authority."""
+    """Reload one scorer source under explicit V3 manifest/profile authority."""
     profile = _profile_v3(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
@@ -660,7 +806,7 @@ def load_strict_model_transport_replay_source_v3(
     pair = _pair_id(replay_execution_manifest["pair_id"])
     environment = replay_execution_manifest["environment"]
     if environment != profile.environment:
-        raise ValueError("replay source differs from expected format profile")
+        raise ValueError("replay source differs from expected scorer profile")
     if replay_execution_manifest.get("scorer_profile") != _scorer_profile_v3(profile):
         raise ValueError("replay source scorer profile differs from registry")
     attempt_id = _attempt_id(replay_execution_manifest["attempt_id"])
@@ -890,7 +1036,7 @@ def validate_strict_model_transport_replay_consumption_v3(
     expected_environment: str,
     expected_profile_id: str,
 ) -> None:
-    """Validate one terminal V3 document against an explicit format profile."""
+    """Validate one terminal V3 document against an explicit scorer profile."""
     profile = _profile_v3(
         expected_environment=expected_environment,
         expected_profile_id=expected_profile_id,
@@ -1041,13 +1187,7 @@ def validate_strict_model_transport_replay_consumption_v3(
             "fresh_native_reward",
         }:
             _digest(raw_entry[name], f"entry[{index}].{name}")
-        reward = raw_entry["fresh_native_reward"]
-        if type(reward) is not float or not math.isfinite(reward):
-            raise TypeError("profiled replay reward must be a finite float")
-        if reward == 0.0 and math.copysign(1.0, reward) < 0.0:
-            raise ValueError("profiled replay reward must not be negative zero")
-        if reward not in (0.0, 1.0):
-            raise ValueError("profiled replay format reward must be binary")
+        reward = _profile_reward(profile, raw_entry["fresh_native_reward"])
         projection = {
             key: copy.deepcopy(value)
             for key, value in raw_entry.items()
