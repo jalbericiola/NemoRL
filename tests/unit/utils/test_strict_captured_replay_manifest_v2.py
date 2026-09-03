@@ -102,7 +102,7 @@ def test_reasoning_gym_profile_has_distinct_pair_and_scorer_config_authorities()
     assert profile.resource_config_path_name == "reasoning_gym"
     assert profile.resource_config_path == ("resources_servers/reasoning_gym/configs/reasoning_gym.yaml")
     assert profile.resource_config_sha256 == ("bdbb459a4a920bc47cf84b1d7dc30aeaa9be35cf0dfac09c77879e45b62a52ab")
-    assert profile.scorer_config_path_name == "resources_only"
+    assert profile.scorer_config_path_name == "reasoning_gym"
     assert profile.scorer_config_path == ("resources_servers/reasoning_gym/configs/resources_only.yaml")
     assert profile.scorer_config_sha256 == ("e11a3084f050e4c24101550f63efe71ac6c10f3bc125489ba7293cd81778de68")
     assert profile.resource_app_sha256 == ("3a35c5d27392dae05499ceefac04e9c32ad963b51a54d77bb470ee59b1fe3127")
@@ -465,7 +465,9 @@ def test_reasoning_gym_manifest_keeps_pair_config_full_and_launches_resources_on
     assert scorer["resources"]["config"] == full_config
     assert launcher["working_directory"] == ("/opt/nemo-rl/3rdparty/Gym-workspace/Gym/resources_servers/reasoning_gym")
     assert launcher["venv_directory"] == ("/opt/gym_venvs/resources_servers/reasoning_gym/.venv")
-    assert launcher["config_path_name"] == "resources_only"
+    # The selected file is resources_only.yaml, while the logical RunHelper
+    # target/NEMO_GYM_CONFIG_PATH remains the YAML's ``reasoning_gym`` key.
+    assert launcher["config_path_name"] == "reasoning_gym"
     assert launcher["resource_only_config"] == scorer_config
     assert runtime["selected_resource_config"] == scorer_config
     assert runtime["scorer_pin"] == {
@@ -539,7 +541,7 @@ def test_reasoning_gym_manifest_rejects_independent_config_authority_poison(
     elif mutation == "effective_missing":
         scorer["launcher"]["resource_only_config"] = None
     elif mutation == "effective_name_mutation":
-        scorer["launcher"]["config_path_name"] = "reasoning_gym"
+        scorer["launcher"]["config_path_name"] = "resources_only"
     elif mutation == "effective_path_mutation":
         scorer["launcher"]["resource_only_config"]["path"] = (
             profile.resource_config_path

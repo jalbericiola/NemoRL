@@ -246,7 +246,10 @@ STRICT_CAPTURED_REPLAY_PROFILES = (
         resource_config_sha256=(
             "bdbb459a4a920bc47cf84b1d7dc30aeaa9be35cf0dfac09c77879e45b62a52ab"
         ),
-        scorer_config_path_name="resources_only",
+        # ``scorer_config_path_name`` is the resolved RunHelper target key,
+        # not the selected YAML filename stem.  The resource-only YAML still
+        # resolves the admitted scorer under ``reasoning_gym``.
+        scorer_config_path_name="reasoning_gym",
         scorer_config_path=(
             "resources_servers/reasoning_gym/configs/resources_only.yaml"
         ),
