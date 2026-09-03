@@ -3123,7 +3123,11 @@ if [[ -n "$COMMAND" ]]; then
   fi
 
   # Sandbox sidecars are not provenance-bearing. Stop their srun only after all
-  # Ray worker receipts have either been validated or failed closed.
+  # Ray worker receipts have either been validated or failed closed. Do not kill
+  # the local srun client: Slurm records that otherwise-successful step as
+  # CANCELLED (commonly ExitCode=0:9) and copies it to the allocation's
+  # DerivedExitCode. USR1 is forwarded to every task, whose handler must finish
+  # the sandbox tree and return zero; any forced or nonzero teardown fails closed.
   if [[ -n "${SRUN_PIDS["sandbox"]:-}" ]]; then
     if ! stop-background-processes \
       10 "sandbox teardown" USR1 TERM 1 "${SRUN_PIDS["sandbox"]}"; then
