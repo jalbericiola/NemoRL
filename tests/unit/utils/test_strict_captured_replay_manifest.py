@@ -487,12 +487,16 @@ def test_generated_manifest_closes_runtime_direct_on_bindings(tmp_path: Path) ->
 
 
 def test_replay_export_names_equal_pair_shell_boundary() -> None:
+    from nemo_rl.utils.strict_captured_replay_manifest_v2 import (
+        SLURM_EXPORT_ALLOWED_NAMES as V2_SLURM_EXPORT_ALLOWED_NAMES,
+    )
+
     contract = (
         Path(__file__).resolve().parents[3] / "examples/nemo_gym/nemotron-3.5-nano/strict_pair_contract.sh"
     ).read_text(encoding="utf-8")
     body = contract.split("STRICT_PAIR_SLURM_EXPORT_ALLOWED_NAMES=(\n", 1)[1].split("\n)", 1)[0]
     shell_names = tuple(line.strip() for line in body.splitlines() if line.strip())
-    assert shell_names == SLURM_EXPORT_ALLOWED_NAMES
+    assert shell_names == V2_SLURM_EXPORT_ALLOWED_NAMES
 
 
 @pytest.mark.parametrize(
