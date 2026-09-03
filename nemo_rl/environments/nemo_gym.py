@@ -11,13 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
+import json
 import math
 import os
+import stat
 import subprocess
 import sys
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from copy import deepcopy
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
 
@@ -47,10 +51,12 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
+from nemo_rl.experience.interfaces import NEMO_GYM_STRICT_TRANSCRIPT_KEY
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.strict_main_step_ledger import strict_main_step1_enabled
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 # Kept local so the Gym actor does not depend on model-config dtype resolution.
@@ -80,6 +86,391 @@ RAY_DEFAULT_ASYNC_ACTOR_MAX_CONCURRENCY = 1000
 # non-rollout methods (_spinup, shutdown), so a saturated rollout queue cannot
 # lock the actor's control plane out.
 NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM = 8
+
+_STRICT_VERIFIER_DERIVATION_DISTRIBUTIONS = {
+    "openai": "2.6.1",
+    "pydantic": "2.13.4",
+}
+_STRICT_VERIFIER_CHILD_SERVER_TYPE = "responses_api_agents"
+_STRICT_VERIFIER_GYM_SOURCE_ROOT = Path("/opt/nemo-rl/3rdparty/Gym-workspace/Gym")
+_STRICT_VERIFIER_CHILD_SOURCE_SUFFIX = Path("responses_api_agents/simple_agent")
+_STRICT_VERIFIER_CHILD_SOURCE_SHA256 = (
+    "ea8179439c54962fdd48de3b0f64caed61049848a7801f1a63d0c1d0fd0ab97a"
+)
+_STRICT_VERIFIER_CHILD_VENV_ROOT = Path("/opt/gym_venvs")
+_STRICT_VERIFIER_CHILD_VENV_SUFFIX = Path("responses_api_agents/simple_agent/.venv")
+_STRICT_VERIFIER_CHILD_PROBE_MAX_BYTES = 4096
+_STRICT_VERIFIER_CHILD_PROBE_TIMEOUT_SECONDS = 30
+_STRICT_VERIFIER_CHILD_PROBE_PROGRAM = (
+    "import importlib.metadata as m,json,sys;"
+    "assert sys.flags.isolated == 1;"
+    "print(json.dumps({"
+    "'openai_version':m.version('openai'),"
+    "'pydantic_version':m.version('pydantic')"
+    "},ensure_ascii=True,sort_keys=True,separators=(',',':')))"
+)
+
+
+def _validate_strict_verifier_derivation_runtime() -> dict[str, str]:
+    """Return exact versions after checking the supporting Gym actor runtime."""
+    runtime: dict[str, str] = {}
+    for (
+        distribution,
+        expected_version,
+    ) in _STRICT_VERIFIER_DERIVATION_DISTRIBUTIONS.items():
+        try:
+            actual_version = importlib_metadata.version(distribution)
+        except importlib_metadata.PackageNotFoundError as error:
+            raise RuntimeError(
+                "strict verifier-request derivation requires installed "
+                f"distribution {distribution!r}=={expected_version}"
+            ) from error
+        if actual_version != expected_version:
+            raise RuntimeError(
+                "strict verifier-request derivation runtime differs from the "
+                f"authenticated contract: {distribution} expected "
+                f"{expected_version!r}, got {actual_version!r}"
+            )
+        runtime[f"{distribution}_version"] = actual_version
+    return runtime
+
+
+def _strict_json_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a JSON object while rejecting duplicate keys from probe output."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _strict_stable_source_sha256(path: Path) -> tuple[str, os.stat_result]:
+    """Hash one canonical regular source file while rejecting path replacement."""
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("source must be a single-link regular file")
+        digest = hashlib.sha256()
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise ValueError("source changed before open")
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            after_read = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        after_path = path.lstat()
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            "strict verifier derivation child source could not be stable-read"
+        ) from error
+    identity_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+    )
+    if any(
+        getattr(before, field) != getattr(after_read, field)
+        or getattr(before, field) != getattr(after_path, field)
+        for field in identity_fields
+    ):
+        raise RuntimeError(
+            "strict verifier derivation child source changed during stable-read"
+        )
+    return digest.hexdigest(), after_read
+
+
+def _probe_strict_verifier_derivation_child_runtime(
+    run_helper: Any,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Attest versions in the exact SimpleAgent child venv selected by Gym.
+
+    ``RunHelper`` may reuse a pre-existing per-server venv, so inspecting this
+    actor's packages is not evidence about the process that expands the
+    SimpleAgent request.  Resolve the venv with the same pinned Gym helper that
+    launched that process, then execute its absolute interpreter in isolated
+    mode.  The returned path/stat record is diagnostic only; the observed
+    version pair is the part bound into strict transcript evidence.
+    """
+    from nemo_gym import PARENT_DIR as nemo_gym_parent_dir
+    from nemo_gym.cli.setup_command import get_venv_path
+    from nemo_gym.global_config import UV_VENV_DIR_KEY_NAME, get_global_config_dict
+
+    instances = getattr(run_helper, "_server_instance_display_configs", None)
+    if not isinstance(instances, list):
+        raise RuntimeError(
+            "strict verifier derivation requires Gym server instance metadata"
+        )
+    agent_instances = [
+        instance
+        for instance in instances
+        if getattr(instance, "server_type", None) == _STRICT_VERIFIER_CHILD_SERVER_TYPE
+    ]
+    if len(agent_instances) != 1:
+        raise RuntimeError(
+            "strict verifier derivation requires exactly one "
+            f"{_STRICT_VERIFIER_CHILD_SERVER_TYPE!r} child; found "
+            f"{len(agent_instances)}"
+        )
+    instance = agent_instances[0]
+    raw_dir_path = getattr(instance, "dir_path", None)
+    if not isinstance(raw_dir_path, (str, Path)):
+        raise RuntimeError(
+            "strict verifier derivation child has no canonical instance directory"
+        )
+    try:
+        gym_source_root_input = Path(nemo_gym_parent_dir)
+        if gym_source_root_input != _STRICT_VERIFIER_GYM_SOURCE_ROOT:
+            raise ValueError(
+                "Gym PARENT_DIR differs from the authenticated campaign source root"
+            )
+        gym_source_root = gym_source_root_input.resolve(strict=True)
+        expected_instance_dir_input = (
+            gym_source_root_input / _STRICT_VERIFIER_CHILD_SOURCE_SUFFIX
+        )
+        instance_dir_input = Path(raw_dir_path)
+        if instance_dir_input != expected_instance_dir_input:
+            raise ValueError(
+                "selected instance is not the authenticated built-in SimpleAgent"
+            )
+        instance_dir = instance_dir_input.resolve(strict=True)
+        expected_instance_dir = expected_instance_dir_input.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError(
+            "strict verifier derivation child instance directory is unavailable"
+        ) from error
+    except ValueError as error:
+        raise RuntimeError(
+            "strict verifier derivation child instance directory differs from the "
+            "authenticated Gym source"
+        ) from error
+    if (
+        not instance_dir.is_absolute()
+        or not instance_dir.is_dir()
+        or instance_dir != expected_instance_dir
+    ):
+        raise RuntimeError(
+            "strict verifier derivation child instance directory is not absolute "
+            "and canonical"
+        )
+    try:
+        instance_dir.relative_to(gym_source_root)
+    except ValueError as error:
+        raise RuntimeError(
+            "strict verifier derivation child instance directory escapes the "
+            "authenticated Gym source"
+        ) from error
+    source_sha256, source_stat = _strict_stable_source_sha256(instance_dir / "app.py")
+    if source_sha256 != _STRICT_VERIFIER_CHILD_SOURCE_SHA256:
+        raise RuntimeError(
+            "strict verifier derivation child source differs from the authenticated "
+            f"SimpleAgent: expected {_STRICT_VERIFIER_CHILD_SOURCE_SHA256!r}, got "
+            f"{source_sha256!r}"
+        )
+
+    try:
+        global_config = get_global_config_dict()
+        configured_venv_root_raw = global_config[UV_VENV_DIR_KEY_NAME]
+        if type(configured_venv_root_raw) is not str or configured_venv_root_raw != str(
+            _STRICT_VERIFIER_CHILD_VENV_ROOT
+        ):
+            raise ValueError(
+                "configured venv root differs from the authenticated campaign root"
+            )
+        configured_venv_root_input = Path(configured_venv_root_raw)
+        configured_venv_root = configured_venv_root_input.resolve(strict=True)
+        selected_venv_input = Path(get_venv_path(instance_dir, global_config))
+        if (
+            not selected_venv_input.is_absolute()
+            or ".." in selected_venv_input.parts
+            or selected_venv_input == configured_venv_root_input
+            or selected_venv_input
+            != configured_venv_root_input / _STRICT_VERIFIER_CHILD_VENV_SUFFIX
+        ):
+            raise ValueError(
+                "selected venv path differs from the exact authenticated server path"
+            )
+        selected_venv = selected_venv_input.resolve(strict=True)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "strict verifier derivation child venv could not be resolved"
+        ) from error
+    try:
+        selected_venv.relative_to(configured_venv_root)
+    except ValueError as error:
+        raise RuntimeError(
+            "strict verifier derivation child venv is outside the configured venv root"
+        ) from error
+
+    # Execute the exact lexical `.venv/bin/python` selected by pinned Gym;
+    # `resolved_interpreter` below is captured separately for stat diagnostics.
+    interpreter = selected_venv_input / "bin" / "python"
+    try:
+        interpreter_lstat = interpreter.lstat()
+        resolved_interpreter = interpreter.resolve(strict=True)
+        interpreter_stat = resolved_interpreter.stat()
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError(
+            "strict verifier derivation child interpreter is unavailable"
+        ) from error
+    if (
+        not interpreter.is_absolute()
+        or not stat.S_ISREG(interpreter_stat.st_mode)
+        or not os.access(interpreter, os.X_OK)
+    ):
+        raise RuntimeError(
+            "strict verifier derivation child interpreter is not an executable "
+            "regular file"
+        )
+
+    try:
+        completed = subprocess.run(
+            [
+                str(interpreter),
+                "-I",
+                "-c",
+                _STRICT_VERIFIER_CHILD_PROBE_PROGRAM,
+            ],
+            check=False,
+            capture_output=True,
+            timeout=_STRICT_VERIFIER_CHILD_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(
+            "strict verifier derivation child package probe could not complete"
+        ) from error
+    stdout = completed.stdout
+    stderr = completed.stderr
+    if not isinstance(stdout, bytes) or not isinstance(stderr, bytes):
+        raise RuntimeError(
+            "strict verifier derivation child probe returned non-byte output"
+        )
+    if (
+        completed.returncode != 0
+        or stderr
+        or not stdout
+        or len(stdout) > _STRICT_VERIFIER_CHILD_PROBE_MAX_BYTES
+    ):
+        raise RuntimeError(
+            "strict verifier derivation child package probe failed closed: "
+            f"returncode={completed.returncode!r}, stdout={stdout[:256]!r}, "
+            f"stderr={stderr[:256]!r}"
+        )
+    try:
+        text = stdout.decode("ascii")
+        parsed = json.loads(
+            text,
+            object_pairs_hook=_strict_json_object_pairs,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant {value!r}")
+            ),
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "strict verifier derivation child probe output is not strict ASCII JSON"
+        ) from error
+    expected_keys = {"openai_version", "pydantic_version"}
+    if not isinstance(parsed, dict) or set(parsed) != expected_keys:
+        raise RuntimeError(
+            "strict verifier derivation child probe output has the wrong keyset"
+        )
+    if any(type(parsed[name]) is not str for name in expected_keys):
+        raise RuntimeError(
+            "strict verifier derivation child probe versions must be exact strings"
+        )
+    canonical_output = (
+        json.dumps(
+            parsed,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        + b"\n"
+    )
+    if stdout != canonical_output:
+        raise RuntimeError(
+            "strict verifier derivation child probe output is not canonical JSON-LF"
+        )
+    runtime = {name: parsed[name] for name in sorted(expected_keys)}
+    expected_runtime = {
+        f"{distribution}_version": version
+        for distribution, version in _STRICT_VERIFIER_DERIVATION_DISTRIBUTIONS.items()
+    }
+    if runtime != expected_runtime:
+        raise RuntimeError(
+            "strict verifier derivation child runtime differs from the "
+            f"authenticated contract: expected {expected_runtime!r}, got "
+            f"{runtime!r}"
+        )
+
+    diagnostic = {
+        "server_type": _STRICT_VERIFIER_CHILD_SERVER_TYPE,
+        "server_name": getattr(instance, "name", None),
+        "config_path": getattr(instance, "config_path", None),
+        "pid": getattr(instance, "pid", None),
+        "instance_dir": str(instance_dir),
+        "gym_source_root": str(gym_source_root),
+        "simple_agent_source_sha256": source_sha256,
+        "simple_agent_source_stat": {
+            "st_dev": source_stat.st_dev,
+            "st_ino": source_stat.st_ino,
+            "st_mode": source_stat.st_mode,
+            "st_uid": source_stat.st_uid,
+            "st_gid": source_stat.st_gid,
+            "st_size": source_stat.st_size,
+            "st_mtime_ns": source_stat.st_mtime_ns,
+        },
+        "configured_venv_root": str(configured_venv_root),
+        "interpreter": str(interpreter),
+        "resolved_interpreter": str(resolved_interpreter),
+        "interpreter_lstat": {
+            "st_dev": interpreter_lstat.st_dev,
+            "st_ino": interpreter_lstat.st_ino,
+            "st_mode": interpreter_lstat.st_mode,
+            "st_uid": interpreter_lstat.st_uid,
+            "st_gid": interpreter_lstat.st_gid,
+            "st_size": interpreter_lstat.st_size,
+            "st_mtime_ns": interpreter_lstat.st_mtime_ns,
+        },
+        "interpreter_stat": {
+            "st_dev": interpreter_stat.st_dev,
+            "st_ino": interpreter_stat.st_ino,
+            "st_mode": interpreter_stat.st_mode,
+            "st_uid": interpreter_stat.st_uid,
+            "st_gid": interpreter_stat.st_gid,
+            "st_size": interpreter_stat.st_size,
+            "st_mtime_ns": interpreter_stat.st_mtime_ns,
+        },
+        "runtime": dict(runtime),
+    }
+    return runtime, diagnostic
+
+
+def _attest_strict_verifier_derivation_runtime(
+    run_helper: Any,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Require the supporting actor and selected child to match the contract."""
+    actor_runtime = _validate_strict_verifier_derivation_runtime()
+    child_runtime, child_diagnostic = _probe_strict_verifier_derivation_child_runtime(
+        run_helper
+    )
+    if actor_runtime != child_runtime:
+        raise RuntimeError(
+            "strict verifier derivation actor and SimpleAgent child runtimes "
+            f"differ: actor={actor_runtime!r}, child={child_runtime!r}"
+        )
+    return child_runtime, child_diagnostic
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -507,6 +898,16 @@ class NemoGym(EnvironmentInterface):
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
+        # Populated synchronously by _spinup before it returns in strict mode.
+        # The package versions are observed through the exact per-server Python
+        # interpreter that RunHelper selected for SimpleAgent, rather than
+        # inferred from this actor's environment.  The path/stat record is
+        # diagnostic only and is deliberately absent from transcript evidence.
+        self._strict_verifier_derivation_runtime: dict[str, str] | None = None
+        self._strict_verifier_derivation_child_diagnostic: dict[str, Any] | None = None
+        self._strict_gym_child_process_index: dict[str, Any] | None = None
+        self._strict_gym_child_process_index_sha256: str | None = None
+        self._strict_main_step1_enabled_at_spinup: bool | None = None
         tokenizer_config = cfg.get("tokenizer_config")
         if tokenizer_config:
             from nemo_rl.algorithms.utils import get_tokenizer
@@ -551,6 +952,16 @@ class NemoGym(EnvironmentInterface):
         scheduled onto reserved nodes) and spun up explicitly once the vLLM
         server URLs are available, overlapping with vLLM model loading.
         """
+        if any(
+            value is not None for value in (self.rh, self.rch, self.head_server_config)
+        ):
+            raise RuntimeError("NeMo-Gym actor spinup may run only once at a time")
+        strict_enabled = strict_main_step1_enabled()
+        self._strict_verifier_derivation_runtime = None
+        self._strict_verifier_derivation_child_diagnostic = None
+        self._strict_gym_child_process_index = None
+        self._strict_gym_child_process_index_sha256 = None
+        self._strict_main_step1_enabled_at_spinup = None
         self.node_ip = _get_node_ip_local()
         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
@@ -623,22 +1034,111 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
-        self.rh = RunHelper()
-        self.rh.start(
-            global_config_dict_parser_config=GlobalConfigDictParserConfig(
-                dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
-                / "nemo_gym_env.yaml",
-                initial_global_config_dict=DictConfig(initial_global_config_dict),
-                skip_load_from_cli=True,
-            )
+        parser_config = GlobalConfigDictParserConfig(
+            dotenv_path=Path(__file__.removesuffix(RELATIVE_PATH)).absolute()
+            / "nemo_gym_env.yaml",
+            initial_global_config_dict=DictConfig(initial_global_config_dict),
+            skip_load_from_cli=True,
         )
+        run_helper: Any = None
+        strict_session: Any = None
+        try:
+            if strict_enabled:
+                from nemo_rl.environments.strict_gym_child_runtime import (
+                    prepare_strict_gym_child_runtime,
+                )
 
-        # Setup for rollout collection
-        self.head_server_config = BaseServerConfig(
-            host=self.node_ip,
-            port=self.head_server_port,
+                # Prepare the immutable process-attestation spec before the
+                # first RunHelper child exists.  The scoped environment is
+                # inherited only by the child launch and restored before the
+                # resulting receipts are validated.
+                strict_session = prepare_strict_gym_child_runtime(scope="main")
+            run_helper = RunHelper()
+            if strict_session is None:
+                run_helper.start(global_config_dict_parser_config=parser_config)
+            else:
+                with strict_session.launch_environment():
+                    run_helper.start(global_config_dict_parser_config=parser_config)
+
+            process_index: dict[str, Any] | None = None
+            process_index_sha256: str | None = None
+            child_runtime: dict[str, str] | None = None
+            child_diagnostic: dict[str, Any] | None = None
+            if strict_session is not None:
+                process_index, process_index_sha256 = strict_session.attest_started(
+                    run_helper
+                )
+                if (
+                    not isinstance(process_index, dict)
+                    or type(process_index_sha256) is not str
+                    or len(process_index_sha256) != 64
+                    or process_index_sha256 == "0" * 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in process_index_sha256
+                    )
+                ):
+                    raise RuntimeError(
+                        "strict Gym child process attestation returned an invalid index"
+                    )
+                # Retain the separate exact-interpreter probe as supporting
+                # defense.  Process-bound receipts above close the live-child
+                # boundary; this probe additionally checks actor/child version
+                # equality and the selected venv path.
+                child_runtime, child_diagnostic = (
+                    _attest_strict_verifier_derivation_runtime(run_helper)
+                )
+                child_diagnostic = deepcopy(child_diagnostic)
+                child_diagnostic["in_process"] = {
+                    "index_path": str(strict_session.receipt_root / "index.json"),
+                    "index_sha256": process_index_sha256,
+                    "index": deepcopy(process_index),
+                }
+
+            head_server_config = BaseServerConfig(
+                host=self.node_ip,
+                port=self.head_server_port,
+            )
+            rollout_collection_helper = RolloutCollectionHelper()
+        except BaseException as primary_error:
+            if run_helper is not None:
+                try:
+                    run_helper.shutdown()
+                except BaseException as cleanup_error:
+                    primary_error.add_note(
+                        "NeMo-Gym cleanup after failed strict child attestation "
+                        f"also failed: {cleanup_error!r}"
+                    )
+            self.rh = None
+            self.rch = None
+            self.head_server_config = None
+            self.node_ip = None
+            self.head_server_port = None
+            self._strict_verifier_derivation_runtime = None
+            self._strict_verifier_derivation_child_diagnostic = None
+            self._strict_gym_child_process_index = None
+            self._strict_gym_child_process_index_sha256 = None
+            self._strict_main_step1_enabled_at_spinup = None
+            raise
+
+        # Publish all rollout-capable state only after every strict
+        # process/version attestation and helper construction succeeds.
+        self.rh = run_helper
+        self.head_server_config = head_server_config
+        self.rch = rollout_collection_helper
+        self._strict_verifier_derivation_runtime = child_runtime
+        self._strict_verifier_derivation_child_diagnostic = child_diagnostic
+        self._strict_gym_child_process_index = (
+            deepcopy(process_index) if process_index is not None else None
         )
-        self.rch = RolloutCollectionHelper()
+        self._strict_gym_child_process_index_sha256 = process_index_sha256
+        self._strict_main_step1_enabled_at_spinup = strict_enabled
+        if strict_enabled:
+            print(
+                "Strict verifier derivation live-child runtime attested before "
+                f"rollout: {child_diagnostic!r}",
+                flush=True,
+            )
 
     def set_tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         """Install the tokenizer run_rollouts postprocesses with.
@@ -679,6 +1179,44 @@ Depending on your data shape, you may want to change these values."""
                 "NemoGym.set_tokenizer must be called before run_rollouts"
             )
         tokenizer = self._tokenizer
+        strict_enabled = strict_main_step1_enabled()
+        cached_strict_enabled = self._strict_main_step1_enabled_at_spinup
+        if (
+            type(cached_strict_enabled) is not bool
+            or strict_enabled is not cached_strict_enabled
+        ):
+            raise RuntimeError(
+                "strict main-step activation changed after NeMo-Gym spinup"
+            )
+        verifier_request_derivation_runtime: dict[str, str] | None = None
+        if strict_enabled:
+            cached_runtime = self._strict_verifier_derivation_runtime
+            cached_diagnostic = self._strict_verifier_derivation_child_diagnostic
+            cached_process_index = self._strict_gym_child_process_index
+            cached_process_index_sha256 = self._strict_gym_child_process_index_sha256
+            if (
+                not isinstance(cached_runtime, dict)
+                or set(cached_runtime) != {"openai_version", "pydantic_version"}
+                or any(type(value) is not str for value in cached_runtime.values())
+                or not isinstance(cached_diagnostic, dict)
+                or not isinstance(cached_process_index, dict)
+                or type(cached_process_index_sha256) is not str
+                or len(cached_process_index_sha256) != 64
+                or cached_process_index_sha256 == "0" * 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in cached_process_index_sha256
+                )
+                or not isinstance(cached_diagnostic.get("in_process"), dict)
+                or cached_diagnostic["in_process"].get("index_sha256")
+                != cached_process_index_sha256
+                or cached_diagnostic["in_process"].get("index") != cached_process_index
+            ):
+                raise RuntimeError(
+                    "strict verifier derivation live-child runtime was not attested "
+                    "during Gym spinup"
+                )
+            verifier_request_derivation_runtime = deepcopy(cached_runtime)
 
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
@@ -721,6 +1259,50 @@ Depending on your data shape, you may want to change these values."""
                         raise typed from None
                     raise
 
+            strict_transcript: dict[str, Any] | None = None
+            if strict_enabled:
+                if verifier_request_derivation_runtime is None:
+                    raise AssertionError(
+                        "strict verifier derivation runtime preflight was lost"
+                    )
+                if (
+                    not isinstance(nemo_gym_row, dict)
+                    or not isinstance(nemo_gym_result, dict)
+                    or not isinstance(nemo_gym_row.get("responses_create_params"), dict)
+                    or not isinstance(
+                        nemo_gym_result.get("responses_create_params"), dict
+                    )
+                    or not isinstance(nemo_gym_result.get("response"), dict)
+                ):
+                    raise RuntimeError(
+                        "strict NeMo-Gym transcript capture requires exact JSON objects"
+                    )
+                generation_request = deepcopy(nemo_gym_row["responses_create_params"])
+                model_response = deepcopy(nemo_gym_result["response"])
+                agent_run_request = deepcopy(nemo_gym_row)
+                verifier_response = deepcopy(nemo_gym_result)
+                # SimpleAgent deterministically constructs the resource-server
+                # `/verify` body by dumping its validated `/run` request, replacing
+                # the compact response parameters with their Pydantic-expanded
+                # form, and adding the model response.  This is a pinned-source
+                # reconstruction, not a claim that these bytes were observed on
+                # the HTTP wire.
+                derived_verifier_request = deepcopy(agent_run_request)
+                derived_verifier_request["responses_create_params"] = deepcopy(
+                    verifier_response["responses_create_params"]
+                )
+                derived_verifier_request["response"] = deepcopy(model_response)
+                strict_transcript = {
+                    "generation_request": generation_request,
+                    "model_response": model_response,
+                    "agent_run_request": agent_run_request,
+                    "derived_verifier_request": derived_verifier_request,
+                    "verifier_response": verifier_response,
+                    "verifier_request_derivation_runtime": (
+                        deepcopy(verifier_request_derivation_runtime)
+                    ),
+                }
+
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
                     nemo_gym_row,
@@ -730,6 +1312,8 @@ Depending on your data shape, you may want to change these values."""
                 )
                 if _has_nan_generation_logprobs(nemo_rl_result):
                     raise RuntimeError("Generation logprobs contain NaN")
+                if strict_transcript is not None:
+                    nemo_rl_result[NEMO_GYM_STRICT_TRANSCRIPT_KEY] = strict_transcript
 
             num_results += 1
             timing_metrics = None
@@ -1035,6 +1619,13 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             return
         run_helper = self.rh
         self.rh = None
+        self.rch = None
+        self.head_server_config = None
+        self._strict_verifier_derivation_runtime = None
+        self._strict_verifier_derivation_child_diagnostic = None
+        self._strict_gym_child_process_index = None
+        self._strict_gym_child_process_index_sha256 = None
+        self._strict_main_step1_enabled_at_spinup = None
         run_helper.shutdown()
 
     def step(self, message_log_batch, metadata):

@@ -78,6 +78,10 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     squeeze_trailing_unit_dim,
     tensor_field,
 )
+from nemo_rl.algorithms.strict_main_step_runtime import (
+    DISABLED_STRICT_MAIN_STEP1_RECORDER,
+    StrictMainStep1Recorder,
+)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.packing.shared_prefix_metadata import (
     SHARED_PREFIX_GROUP_ID,
@@ -713,6 +717,11 @@ class SingleControllerActor:
     All other actors are passive — they expose methods and wait to be called.
     """
 
+    # Many focused unit fixtures instantiate Ray's modified class via __new__
+    # and set only the subsystem under test. Give those objects an explicit
+    # feature-off recorder; the real constructor always replaces it.
+    _strict_main_step1_recorder = DISABLED_STRICT_MAIN_STEP1_RECORDER
+
     def __init__(
         self,
         master_config: MasterConfig,
@@ -893,6 +902,11 @@ class SingleControllerActor:
 
         self._trainer_version: int = actor_args.save_state.current_step
         self._train_steps: int = actor_args.save_state.current_step
+        self._strict_main_step1_recorder = StrictMainStep1Recorder(
+            master_config=master_config,
+            shared_prefix_mode=self._shared_prefix_training_config.mode,
+            current_step=self._train_steps,
+        )
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
@@ -1770,6 +1784,19 @@ class SingleControllerActor:
 
                 with self._timer.time("policy_training"):
                     result = await asyncio.to_thread(self._trainer.finish_train_step)
+                published_step1 = (
+                    self._strict_main_step1_recorder.publish_after_successful_step(
+                        step_index=version_during_step,
+                        update_successful=result.get("update_successful"),
+                    )
+                )
+                if published_step1 is not None:
+                    ledger_path, ledger_sha256 = published_step1
+                    print(
+                        "STRICT_MAIN_STEP1_LEDGER "
+                        f"path={ledger_path} sha256={ledger_sha256}",
+                        flush=True,
+                    )
 
                 step_metrics = aggregate_step_metrics(result)
                 step_metrics.update(
@@ -2459,6 +2486,7 @@ class SingleControllerActor:
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
+        verifier_rewards = rewards.clone()
         token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
@@ -2726,6 +2754,20 @@ class SingleControllerActor:
         ):
             advantages = _clip_grpo_advantages(advantages, grpo_cfg)
 
+        self._strict_main_step1_recorder.capture_consumed_rows(
+            step_index=self._train_steps,
+            meta=meta,
+            data=data,
+            prompt_ids=prompt_ids,
+            verifier_rewards=verifier_rewards,
+            processed_rewards=rewards,
+            token_loss_mask=token_mask,
+            sample_mask=sample_mask,
+            advantages=advantages,
+            invalid_advantage_enabled=invalid_advantage is not None,
+            malformed_advantage_enabled=malformed_advantage is not None,
+        )
+
         fields_to_put = {adv_cfg.output_field: advantages}
         if sample_mask_modified:
             fields_to_put[adv_cfg.sample_mask_field] = sample_mask
@@ -2788,4 +2830,5 @@ class SingleControllerActor:
             fields.append(adv_cfg.generation_logprobs_field)
         if self._reference_logprobs_required:
             fields.append(adv_cfg.reference_logprobs_field)
+        fields.extend(self._strict_main_step1_recorder.required_fields())
         return list(dict.fromkeys(fields))

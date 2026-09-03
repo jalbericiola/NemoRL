@@ -16,10 +16,12 @@ import asyncio
 import copy
 import gc
 import logging
+import os
 import threading
 import time
 import uuid
 import warnings
+from pathlib import Path
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -99,6 +101,8 @@ class VllmAsyncGenerationWorkerImpl(
         self.server_thread = None
         self.base_url = None
         self.http_server = None
+        self._strict_model_transport_capture = None
+        self._strict_model_transport_policy = None
 
         super().__init__(
             config,
@@ -345,6 +349,21 @@ class VllmAsyncGenerationWorkerImpl(
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
+    def attest_strict_model_transport_step1(
+        self,
+        *,
+        expected_generation_requests: list[dict[str, Any]],
+        expected_model_responses: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Seal the exact K=4 HTTP capture after the rollout owner joins it."""
+        capture = self._strict_model_transport_capture
+        if capture is None:
+            raise RuntimeError("strict model transport capture is not active")
+        return capture.attest_step1_complete(
+            expected_generation_requests=expected_generation_requests,
+            expected_model_responses=expected_model_responses,
+        )
+
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from copy import deepcopy
@@ -378,6 +397,104 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
+
+        strict_transport_mode = self.cfg["vllm_cfg"].get("strict_model_transport")
+        if strict_transport_mode not in (None, "disabled"):
+            if strict_transport_mode != "capture":
+                raise RuntimeError(
+                    "the live NeMo-RL vLLM route only admits "
+                    "strict_model_transport='capture'; replay is a separate "
+                    "authenticated calibration path"
+                )
+            if self._strict_model_transport_capture is not None:
+                raise RuntimeError(
+                    "strict model transport capture was initialized twice"
+                )
+            from nemo_rl.utils.strict_model_transport import (
+                StrictModelTransportCapture,
+                load_runtime_model_transport_policy,
+            )
+
+            expected_policy_sha256 = os.environ.get(
+                "EXPECTED_STRICT_PAIR_MODEL_TRANSPORT_POLICY_SHA256"
+            )
+            if expected_policy_sha256 is None:
+                raise RuntimeError(
+                    "strict model transport is missing "
+                    "EXPECTED_STRICT_PAIR_MODEL_TRANSPORT_POLICY_SHA256"
+                )
+            source_root = Path(__file__).resolve().parents[4]
+            strict_transport_policy = load_runtime_model_transport_policy(
+                expected_policy_sha256=expected_policy_sha256,
+                source_root=source_root,
+            )
+            required_environment = {
+                name: os.environ.get(name)
+                for name in (
+                    "PAIR_ID",
+                    "STRICT_PAIR_ENVIRONMENT",
+                    "STRICT_PAIR_ARM",
+                    "RESULTS_DIR",
+                )
+            }
+            missing = [
+                name for name, value in required_environment.items() if value is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "strict model transport is missing runtime identity: "
+                    + ", ".join(missing)
+                )
+            self._strict_model_transport_policy = strict_transport_policy
+            self._strict_model_transport_capture = StrictModelTransportCapture(
+                pair_id=required_environment["PAIR_ID"],
+                environment=required_environment["STRICT_PAIR_ENVIRONMENT"],
+                arm=required_environment["STRICT_PAIR_ARM"],
+                results_dir=required_environment["RESULTS_DIR"],
+                model_path=self.model_name,
+                model_transport_policy=strict_transport_policy,
+            )
+
+        if self._strict_model_transport_capture is not None:
+
+            @app.middleware("http")
+            async def strict_model_transport_http_boundary(
+                raw_request: Request, call_next
+            ):
+                """Fail closed for requests rejected before the route owns a ticket.
+
+                FastAPI validates Pydantic inputs before invoking the route handler.
+                Without this boundary, a malformed/retried step-1 request could
+                receive a 4xx response without reaching ``begin_chat_call`` and
+                would therefore be invisible to the exact-four-call finalizer.
+                Once the finalizer has attested step 1, both guard methods are
+                explicit no-ops and ordinary later-step traffic passes through.
+                """
+                capture = self._strict_model_transport_capture
+                if capture is None:
+                    raise RuntimeError(
+                        "strict model transport middleware lost its capture owner"
+                    )
+                is_chat_completion = (
+                    raw_request.method == "POST"
+                    and raw_request.url.path == "/v1/chat/completions"
+                )
+                if not is_chat_completion:
+                    capture.guard_unlisted(
+                        method=raw_request.method, path=raw_request.url.path
+                    )
+                try:
+                    response = await call_next(raw_request)
+                except BaseException:
+                    capture.record_unmatched_failure(
+                        reason="HTTP request failed before a successful capture"
+                    )
+                    raise
+                if is_chat_completion and response.status_code != 200:
+                    capture.record_unmatched_failure(
+                        reason="chat request returned non-success before attestation"
+                    )
+                return response
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
         if maybe_tool_parser_plugin:
@@ -732,6 +849,10 @@ class VllmAsyncGenerationWorkerImpl(
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
+            # Starlette caches the body, so this is the byte-exact HTTP request
+            # even though FastAPI has already built the typed request. Capture it
+            # before NeMo-RL normalizes top_k on the Pydantic object below.
+            raw_request_body = await raw_request.body()
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
             # Right now we explicitly assert set this to -1.
             assert request.top_k in (None, -1), (
@@ -773,11 +894,27 @@ class VllmAsyncGenerationWorkerImpl(
                 f"val_top_p={generation_config['val_top_p']})"
             )
 
+            transport_capture = self._strict_model_transport_capture
+            transport_ticket = None
+            if transport_capture is not None:
+                transport_ticket = transport_capture.begin_chat_call(
+                    request_body=raw_request_body,
+                    typed_seed=request.seed,
+                    method=raw_request.method,
+                    path=raw_request.url.path,
+                    query=raw_request.url.query,
+                    media_type=raw_request.headers.get("content-type", ""),
+                )
+
             try:
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
             except VLLMValidationError as e:
+                if transport_ticket is not None:
+                    transport_capture.record_failure(
+                        transport_ticket, reason="vLLM request validation failed"
+                    )
                 # vLLM raises VLLMValidationError for prompts exceeding
                 # max_model_len during tokenization, instead of returning an
                 # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
@@ -792,19 +929,50 @@ class VllmAsyncGenerationWorkerImpl(
                     },
                     status_code=400,
                 )
+            except BaseException:
+                if transport_ticket is not None:
+                    transport_capture.record_failure(
+                        transport_ticket, reason="vLLM chat execution raised"
+                    )
+                raise
 
             if isinstance(generator, ErrorResponse):
+                if transport_ticket is not None:
+                    transport_capture.record_failure(
+                        transport_ticket, reason="vLLM returned ErrorResponse"
+                    )
                 return JSONResponse(
                     content=generator.model_dump(), status_code=generator.error.code
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
-                return JSONResponse(
-                    content=model_dump_chat_response_with_dynamic_message_fields(
-                        generator
+                try:
+                    response_payload = (
+                        model_dump_chat_response_with_dynamic_message_fields(generator)
                     )
-                )
+                    response = JSONResponse(content=response_payload)
+                    if transport_ticket is not None:
+                        transport_capture.record_success(
+                            transport_ticket,
+                            response_body=response.body,
+                            status_code=response.status_code,
+                            media_type=response.media_type,
+                            streaming=False,
+                            expected_response_payload=response_payload,
+                        )
+                except BaseException:
+                    if transport_ticket is not None:
+                        transport_capture.record_failure(
+                            transport_ticket,
+                            reason="vLLM response serialization/capture failed",
+                        )
+                    raise
+                return response
 
+            if transport_ticket is not None:
+                transport_capture.record_failure(
+                    transport_ticket, reason="vLLM attempted a streaming response"
+                )
             return StreamingResponse(content=generator, media_type="text/event-stream")
 
         ########################################
@@ -845,6 +1013,10 @@ class VllmAsyncGenerationWorkerImpl(
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
+            if self._strict_model_transport_capture is not None:
+                self._strict_model_transport_capture.guard_unlisted(
+                    method=raw_request.method, path=raw_request.url.path
+                )
             generator = await openai_serving_tokenization.create_tokenize(
                 request, raw_request
             )

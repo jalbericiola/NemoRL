@@ -117,6 +117,7 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     p = object.__new__(TQPolicy)
     p.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
     p._router_replay_enabled = False
+    p.shared_prefix_training_config = MagicMock(mode="disabled")
     p.flops_tracker = None
     wg = MagicMock()
     wg.run_all_workers_single_data.return_value = ["f0", "f1"]
@@ -191,6 +192,7 @@ class TestTQPolicySplitFanout:
                 "grad_norm": 0.5,
                 "all_mb_metrics": {"loss": [0.1]},
                 "is_replica_leader": leader,
+                "update_successful": True,
             }
 
         p, wg = _make_tq_policy()
@@ -206,6 +208,7 @@ class TestTQPolicySplitFanout:
         assert out["all_mb_metrics"]["loss"] == [0.1, 0.1]  # twins dropped
         # _aggregate_train_results surfaces global_loss under "loss"
         assert out["loss"] == 1.0
+        assert out["update_successful"] is True
 
     def test_abort_consumes_single_data_futures_with_ray_get(self):
         p, wg = _make_tq_policy()

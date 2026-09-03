@@ -42,6 +42,9 @@ from nemo_rl.experience.interfaces import (
     INVALID_TOOL_CALL_TOKEN_MASK,
     MALFORMED_THINKING_MESSAGE_COUNT,
     MALFORMED_THINKING_TOKEN_MASK,
+    NEMO_GYM_REQUEST_SEEDS_METADATA_KEY,
+    NEMO_GYM_REWARD_PENALTY_FLAG_KEYS,
+    NEMO_GYM_TRANSCRIPT_BUNDLE_SHA256_METADATA_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     RESPONSE_TOKEN_LENGTHS,
@@ -50,6 +53,14 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 from nemo_rl.utils.r3_trace import trace_rollout_payload
+from nemo_rl.utils.strict_main_step_ledger import (
+    MAIN_STEP1_REWARD_PENALTY_TAGS,
+    MAIN_STEP1_TAG_FIXTURE_ROW_INDEX,
+    MAIN_STEP1_TAG_GENERATION_SEED,
+    MAIN_STEP1_TAG_ROLLOUT_INDEX,
+    MAIN_STEP1_TAG_TRANSCRIPT_BUNDLE_SHA256,
+    strict_main_step1_enabled,
+)
 
 
 RolloutScalarMetrics = dict[str, int | float]
@@ -1020,6 +1031,93 @@ class ReplayBuffer(ReplayBufferImpl):
     pass
 
 
+def _stamp_strict_main_step1_tags(
+    *,
+    record: PromptGroupRecord,
+    sample_ids: list[str],
+    tags: list[dict[str, Any]],
+) -> None:
+    """Bind rollout-time request and penalty decisions to each DP row."""
+    if len(sample_ids) != len(record.completions) or len(tags) != len(sample_ids):
+        raise RuntimeError(
+            "strict main-step metadata must align completions, sample IDs, and tags"
+        )
+    fixture_row_index = record.prompt_idx
+    if (
+        isinstance(fixture_row_index, bool)
+        or not isinstance(fixture_row_index, int)
+        or fixture_row_index < 0
+    ):
+        raise RuntimeError(
+            "strict main-step fixture row index must be an exact nonnegative int"
+        )
+    request_seeds = record.metadata.get(NEMO_GYM_REQUEST_SEEDS_METADATA_KEY)
+    if not isinstance(request_seeds, list) or len(request_seeds) != len(sample_ids):
+        raise RuntimeError(
+            "strict main-step rollout is missing one captured request seed per row"
+        )
+    transcript_bundle_sha256 = record.metadata.get(
+        NEMO_GYM_TRANSCRIPT_BUNDLE_SHA256_METADATA_KEY
+    )
+    if transcript_bundle_sha256 is not None and (
+        type(transcript_bundle_sha256) is not str
+        or len(transcript_bundle_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in transcript_bundle_sha256
+        )
+    ):
+        raise RuntimeError(
+            "strict main-step transcript bundle SHA-256 must be lowercase hex"
+        )
+
+    for rollout_index, (sample_id, completion, request_seed, tag) in enumerate(
+        zip(
+            sample_ids,
+            record.completions,
+            request_seeds,
+            tags,
+            strict=True,
+        )
+    ):
+        expected_sample_id = f"{sample_id.rsplit('_g', 1)[0]}_g{rollout_index}"
+        if sample_id != expected_sample_id:
+            raise RuntimeError(
+                "strict main-step sample IDs must retain ordered rollout indices"
+            )
+        if (
+            isinstance(request_seed, bool)
+            or not isinstance(request_seed, int)
+            or request_seed < 0
+            or request_seed >= 1 << 63
+        ):
+            raise RuntimeError(
+                "strict main-step request seed must be an exact signed-int63 value"
+            )
+        penalty_flags = completion.reward_penalty_flags
+        if (
+            not isinstance(penalty_flags, Mapping)
+            or set(penalty_flags) != set(NEMO_GYM_REWARD_PENALTY_FLAG_KEYS)
+            or any(type(value) is not bool for value in penalty_flags.values())
+        ):
+            raise RuntimeError(
+                "strict main-step completion is missing exact reward penalty flags"
+            )
+        tag.update(
+            {
+                MAIN_STEP1_TAG_FIXTURE_ROW_INDEX: fixture_row_index,
+                MAIN_STEP1_TAG_ROLLOUT_INDEX: rollout_index,
+                MAIN_STEP1_TAG_GENERATION_SEED: request_seed,
+                **{
+                    MAIN_STEP1_REWARD_PENALTY_TAGS[name]: penalty_flags[name]
+                    for name in NEMO_GYM_REWARD_PENALTY_FLAG_KEYS
+                },
+            }
+        )
+        if transcript_bundle_sha256 is not None:
+            tag[MAIN_STEP1_TAG_TRANSCRIPT_BUNDLE_SHA256] = transcript_bundle_sha256
+
+
 class TQReplayBuffer:
     """Meta cache + TQ writer with reserve-then-commit slot semantics.
 
@@ -1053,6 +1151,7 @@ class TQReplayBuffer:
         self._rollout_reward_semantics_fingerprint = (
             rollout_reward_semantics_fingerprint
         )
+        self._strict_main_step1_enabled = strict_main_step1_enabled()
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
@@ -1147,6 +1246,12 @@ class TQReplayBuffer:
             group_id=group_id,
             **shared_prefix_kwargs,
         )
+        if self._strict_main_step1_enabled:
+            _stamp_strict_main_step1_tags(
+                record=record,
+                sample_ids=sample_ids,
+                tags=tags,
+            )
         _validate_rollout_metric_receipt(
             scalar_rollout_metrics,
             expected_samples=len(sample_ids),

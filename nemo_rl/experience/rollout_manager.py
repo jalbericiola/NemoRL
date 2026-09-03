@@ -23,6 +23,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 import ray.exceptions
@@ -46,9 +47,14 @@ from nemo_rl.experience.failures import (
     classify_rollout_failure,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_REQUEST_SEEDS_METADATA_KEY,
+    NEMO_GYM_REWARD_PENALTY_FLAG_KEYS,
+    NEMO_GYM_REWARD_PENALTY_FLAGS_KEY,
     NEMO_GYM_RESERVED_KEY_PREFIX,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_STRICT_TRANSCRIPT_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
+    NEMO_GYM_TRANSCRIPT_BUNDLE_SHA256_METADATA_KEY,
     Completion,
     PromptGroupRecord,
     completion_reward_boundaries,
@@ -74,6 +80,19 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
 )
+from nemo_rl.utils.strict_captured_replay_evidence import (
+    build_transcript_bundle,
+    build_verifier_request_derivation,
+    canonical_ascii_json,
+    load_strict_fixture_row0,
+    publish_main_transcript_bundle,
+    validate_transcript_model_transport_join,
+)
+from nemo_rl.utils.strict_main_step_ledger import (
+    main_step1_runtime_contract,
+    strict_main_step1_enabled,
+)
+from nemo_rl.utils.strict_model_transport import load_runtime_model_transport_policy
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -89,6 +108,22 @@ _PENALTY_COUNT_TO_RATE = {
     "empty_final_answer": "empty_final_answer_rate",
     "unwanted_token": "unwanted_token_rate",
     "malformed_think_tag": "malformed_think_tag_rate",
+}
+
+_STRICT_TRANSCRIPT_BINDING_NAMES = (
+    "pair_manifest_sha256",
+    "submission_receipt_sha256",
+    "job_id",
+    "run_id",
+    "fixture_sha256",
+    "verifier_source_sha256",
+    "config_sha256",
+    "snapshot_manifest_sha256",
+)
+_STRICT_VERIFIER_AGENT_BY_ENVIRONMENT = {
+    "reasoning_gym": "reasoning_gym_simple_agent",
+    "citation": "citation_format_simple_agent",
+    "freeform": "freeform_formatting_simple_agent",
 }
 
 
@@ -133,6 +168,178 @@ def _derive_nemo_gym_request_seed(
     ).encode("ascii")
     digest_prefix = hashlib.sha256(canonical_identity).digest()[:8]
     return int.from_bytes(digest_prefix, byteorder="big") & _NEMO_GYM_TASK_INDEX_MASK
+
+
+def _publish_strict_main_step1_transcript(
+    *,
+    input_sample: DatumSpec,
+    completions: list[Completion],
+    request_seeds: list[int] | None,
+    generation_config: GenerationConfig,
+    rollout_group_id: str,
+    model_transport_capture: Mapping[str, Any],
+    model_transport_bundle_ref: Mapping[str, Any],
+    model_transport_bundle: Mapping[str, Any],
+    model_transport_policy: Mapping[str, Any],
+    model_path: str,
+) -> str:
+    """Publish the immutable raw Gym transcript for the ordered step-one K=4."""
+    fixture_row_index = input_sample.get("idx")
+    if type(fixture_row_index) is not int or fixture_row_index != 0:
+        raise RuntimeError(
+            "strict main-step transcript must come from fixture row exactly zero"
+        )
+    if request_seeds is None or len(request_seeds) != 4 or len(completions) != 4:
+        raise RuntimeError(
+            "strict main-step transcript requires four completions and request seeds"
+        )
+
+    contract = main_step1_runtime_contract()
+    try:
+        group_uuid = uuid.UUID(rollout_group_id)
+    except (AttributeError, ValueError) as error:
+        raise RuntimeError(
+            "strict main-step rollout_group_id must be a canonical UUID4"
+        ) from error
+    if group_uuid.version != 4 or str(group_uuid) != rollout_group_id:
+        raise RuntimeError(
+            "strict main-step rollout_group_id must be a canonical lowercase UUID4"
+        )
+    expected_task_index = (
+        group_uuid.int ^ (group_uuid.int >> 64)
+    ) & _NEMO_GYM_TASK_INDEX_MASK
+    fixture_value = load_strict_fixture_row0(
+        path=contract["fixture_path"],
+        expected_sha256=contract["bindings"]["fixture_sha256"],
+    )
+    input_fixture_value = input_sample.get("extra_env_info")
+    if canonical_ascii_json(input_fixture_value) != canonical_ascii_json(fixture_value):
+        raise RuntimeError(
+            "strict main-step consumed fixture row differs from authenticated row zero"
+        )
+    if model_transport_capture.get("record_count") != 4:
+        raise RuntimeError("strict model transport capture must contain four calls")
+    transport_entries = model_transport_bundle.get("entries")
+    if not isinstance(transport_entries, list) or len(transport_entries) != 4:
+        raise RuntimeError("strict model transport bundle must contain four entries")
+    generation = {
+        "seed_base": generation_config["nemo_gym_per_rollout_seed_base"],
+        "max_new_tokens": generation_config["max_new_tokens"],
+        "temperature": generation_config["temperature"],
+        "top_k": generation_config["top_k"],
+        "top_p": generation_config["top_p"],
+    }
+    transcript_bindings = {
+        name: contract["bindings"][name] for name in _STRICT_TRANSCRIPT_BINDING_NAMES
+    }
+    expected_agent = _STRICT_VERIFIER_AGENT_BY_ENVIRONMENT[contract["environment"]]
+    entry_inputs: list[dict[str, Any]] = []
+    derivation_runtimes: list[dict[str, str]] = []
+    for rollout_index, (completion, request_seed, transport_entry) in enumerate(
+        zip(completions, request_seeds, transport_entries, strict=True)
+    ):
+        transcript = completion.strict_transcript
+        if not isinstance(transcript, Mapping):
+            raise RuntimeError(
+                f"strict completion {rollout_index} has no raw Gym transcript"
+            )
+        required = {
+            "generation_request",
+            "model_response",
+            "agent_run_request",
+            "derived_verifier_request",
+            "verifier_response",
+            "verifier_request_derivation_runtime",
+        }
+        if set(transcript) != required or any(
+            not isinstance(transcript[name], dict) for name in required
+        ):
+            raise RuntimeError(
+                f"strict completion {rollout_index} transcript has wrong keyset/types"
+            )
+        model_response = transcript["model_response"]
+        if "reward" in model_response:
+            raise RuntimeError(
+                "strict model_response must contain only raw model output, not reward"
+            )
+        agent_run_request = transcript["agent_run_request"]
+        agent_ref = agent_run_request.get("agent_ref")
+        if (
+            not isinstance(agent_ref, Mapping)
+            or agent_ref.get("name") != expected_agent
+        ):
+            raise RuntimeError(
+                "strict agent run request agent_ref.name differs from the selected "
+                f"environment: expected {expected_agent!r}"
+            )
+        if agent_run_request.get(NEMO_GYM_TASK_INDEX_KEY) != expected_task_index:
+            raise RuntimeError(
+                "strict agent run request task identity differs from its UUID4 cohort"
+            )
+        derivation_runtime = transcript["verifier_request_derivation_runtime"]
+        if set(derivation_runtime) != {"openai_version", "pydantic_version"} or any(
+            type(value) is not str for value in derivation_runtime.values()
+        ):
+            raise RuntimeError(
+                "strict completion has malformed verifier derivation runtime"
+            )
+        derivation_runtimes.append(dict(derivation_runtime))
+        raw_reward, _, _ = completion_reward_boundaries(completion)
+        entry_inputs.append(
+            {
+                "sample_index": rollout_index,
+                "fixture_row_index": 0,
+                "rollout_index": rollout_index,
+                "generation_seed": request_seed,
+                "generation_request": transcript["generation_request"],
+                "model_response": model_response,
+                "agent_run_request": agent_run_request,
+                "derived_verifier_request": transcript["derived_verifier_request"],
+                "verifier_response": transcript["verifier_response"],
+                "raw_environment_reward": raw_reward,
+                "model_transport_entry_sha256": transport_entry["entry_sha256"],
+                "model_transport_request_body_sha256": transport_entry[
+                    "request_body_sha256"
+                ],
+                "model_transport_response_body_sha256": transport_entry[
+                    "response_body_sha256"
+                ],
+            }
+        )
+
+    if any(runtime != derivation_runtimes[0] for runtime in derivation_runtimes[1:]):
+        raise RuntimeError(
+            "strict K=4 completions disagree on verifier derivation runtime"
+        )
+    derivation_runtime = derivation_runtimes[0]
+    bundle = build_transcript_bundle(
+        pair_id=contract["pair_id"],
+        environment=contract["environment"],
+        arm=contract["arm"],
+        mode=contract["mode"],
+        attempt_id=None,
+        generation=generation,
+        bindings=transcript_bindings,
+        fixture_row=fixture_value,
+        verifier_request_derivation=build_verifier_request_derivation(
+            gym_gitlink_commit=contract["gym_gitlink_commit"],
+            gym_tree=contract["gym_tree"],
+            openai_version=derivation_runtime["openai_version"],
+            pydantic_version=derivation_runtime["pydantic_version"],
+        ),
+        model_transport_bundle=model_transport_bundle_ref,
+        entry_inputs=entry_inputs,
+    )
+    validate_transcript_model_transport_join(
+        transcript_bundle=bundle,
+        model_transport_bundle=model_transport_bundle,
+        model_transport_policy=model_transport_policy,
+        model_path=model_path,
+    )
+    _, digest = publish_main_transcript_bundle(
+        results_dir=contract["results_dir"], document=bundle
+    )
+    return digest
 
 
 def _require_datum_loss_multiplier(input_sample: DatumSpec) -> float:
@@ -958,6 +1165,7 @@ class AsyncNemoGymRolloutImpl:
         max_seq_len: int,
         max_rollout_turns: int,
         generation_config: GenerationConfig,
+        policy_generation: GenerationInterface | None = None,
         mask_env_flagged_samples: bool = True,
         effort_config: Mapping[str, Any] | BaseModel | None = None,
         reward_penalty_config: Mapping[str, Any] | BaseModel | None = None,
@@ -977,6 +1185,7 @@ class AsyncNemoGymRolloutImpl:
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
+        self._policy_generation = policy_generation
         self._mask_env_flagged_samples = mask_env_flagged_samples
         effort_config_data = (
             effort_config.model_dump()
@@ -1001,8 +1210,67 @@ class AsyncNemoGymRolloutImpl:
             else RolloutRetryPolicy.single_attempt()
         ).max_gym_row_attempts
         self._stats = stats
+        self._strict_main_transcript_published = False
 
         self._validate_init_params()
+
+    async def _attest_strict_model_transport_step1(
+        self, completions: list[Completion]
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], str]:
+        """Finalize the model-owner HTTP capture and authenticate its source policy."""
+        policy_generation = self._policy_generation
+        worker_group = getattr(policy_generation, "worker_group", None)
+        if worker_group is None:
+            raise RuntimeError(
+                "strict model transport requires the vLLM generation worker group"
+            )
+        if type(worker_group.dp_size) is not int or worker_group.dp_size != 1:
+            raise RuntimeError(
+                "strict K=4 model transport currently requires generation DP=1"
+            )
+        generation_requests: list[dict[str, Any]] = []
+        model_responses: list[dict[str, Any]] = []
+        for index, completion in enumerate(completions):
+            transcript = completion.strict_transcript
+            if not isinstance(transcript, Mapping):
+                raise RuntimeError(
+                    f"strict completion {index} has no raw Gym transcript"
+                )
+            generation_request = transcript.get("generation_request")
+            model_response = transcript.get("model_response")
+            if not isinstance(generation_request, dict) or not isinstance(
+                model_response, dict
+            ):
+                raise RuntimeError(
+                    f"strict completion {index} has malformed transport join data"
+                )
+            generation_requests.append(copy.deepcopy(generation_request))
+            model_responses.append(copy.deepcopy(model_response))
+        leader_worker_idx = worker_group.get_dp_leader_worker_idx(0)
+        result_ref = worker_group.run_single_worker_single_data(
+            method_name="attest_strict_model_transport_step1",
+            worker_idx=leader_worker_idx,
+            expected_generation_requests=generation_requests,
+            expected_model_responses=model_responses,
+        )
+        transport_result = await result_ref
+        if (
+            not isinstance(transport_result, tuple)
+            or len(transport_result) != 3
+            or any(not isinstance(item, dict) for item in transport_result)
+        ):
+            raise RuntimeError("strict model transport finalizer returned wrong shape")
+        capture_ref, bundle_ref, bundle = transport_result
+        contract = main_step1_runtime_contract()
+        source_root = Path(__file__).resolve().parents[2]
+        policy = load_runtime_model_transport_policy(
+            expected_policy_sha256=contract["model_transport_policy_sha256"],
+            source_root=source_root,
+        )
+        model_path = self._generation_config.get("model_name")
+        if not isinstance(model_path, str) or not model_path:
+            raise RuntimeError("strict model transport requires generation.model_name")
+        return capture_ref, bundle_ref, bundle, policy, model_path
 
     async def run_rollout(
         self,
@@ -1032,9 +1300,50 @@ class AsyncNemoGymRolloutImpl:
         rollout_inputs = self._build_inputs(
             input_sample, rollout_group_id=rollout_group_id
         )
+        request_seeds: list[int] | None = None
+        if self._generation_config.get("nemo_gym_add_seed_per_rollout"):
+            request_seeds = []
+            for rollout_index, row in enumerate(rollout_inputs):
+                serialized_extra_body = row["responses_create_params"]["metadata"][
+                    "extra_body"
+                ]
+                extra_body = json.loads(serialized_extra_body)
+                request_seed = extra_body.get("seed")
+                if (
+                    isinstance(request_seed, bool)
+                    or not isinstance(request_seed, int)
+                    or request_seed < 0
+                ):
+                    raise RuntimeError(
+                        "NeMo-Gym rollout request is missing its exact nonnegative "
+                        f"seed at rollout index {rollout_index}"
+                    )
+                expected_seed = _derive_nemo_gym_request_seed(
+                    base_seed=self._generation_config.get(
+                        "nemo_gym_per_rollout_seed_base"
+                    ),
+                    sample_idx=input_sample.get("idx"),
+                    rollout_index=rollout_index,
+                )
+                if request_seed != expected_seed:
+                    raise RuntimeError(
+                        "NeMo-Gym rollout request seed changed after construction: "
+                        f"index={rollout_index}, expected={expected_seed}, "
+                        f"actual={request_seed}"
+                    )
+                request_seeds.append(request_seed)
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs, timer, timer_prefix
         )
+        strict_transport = None
+        if (
+            strict_main_step1_enabled()
+            and input_sample.get("idx") == 0
+            and not self._strict_main_transcript_published
+        ):
+            strict_transport = await self._attest_strict_model_transport_step1(
+                completions
+            )
         source_message_log = input_sample["message_log"]
         attach_static_multimodal_payload(prompt_message_log, source_message_log)
         for completion in completions:
@@ -1050,14 +1359,45 @@ class AsyncNemoGymRolloutImpl:
             }
         )
 
+        metadata: dict[str, Any] = {
+            "task_name": "nemo_gym",
+            "loss_multiplier": loss_multiplier,
+        }
+        if request_seeds is not None:
+            metadata[NEMO_GYM_REQUEST_SEEDS_METADATA_KEY] = request_seeds
+        if (
+            strict_main_step1_enabled()
+            and input_sample.get("idx") == 0
+            and not self._strict_main_transcript_published
+        ):
+            if strict_transport is None:
+                raise AssertionError("strict model transport finalizer did not run")
+            (
+                model_transport_capture,
+                model_transport_bundle_ref,
+                model_transport_bundle,
+                model_transport_policy,
+                model_path,
+            ) = strict_transport
+            transcript_sha256 = _publish_strict_main_step1_transcript(
+                input_sample=input_sample,
+                completions=completions,
+                request_seeds=request_seeds,
+                generation_config=self._generation_config,
+                rollout_group_id=rollout_group_id,
+                model_transport_capture=model_transport_capture,
+                model_transport_bundle_ref=model_transport_bundle_ref,
+                model_transport_bundle=model_transport_bundle,
+                model_transport_policy=model_transport_policy,
+                model_path=model_path,
+            )
+            self._strict_main_transcript_published = True
+            metadata[NEMO_GYM_TRANSCRIPT_BUNDLE_SHA256_METADATA_KEY] = transcript_sha256
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
             prompt=prompt_message_log,
             extra_env_info=input_sample["extra_env_info"],
-            metadata={
-                "task_name": "nemo_gym",
-                "loss_multiplier": loss_multiplier,
-            },
+            metadata=metadata,
             completions=completions,
             rollout_metrics=rollout_metrics,
         )
@@ -1418,6 +1758,37 @@ class AsyncNemoGymRolloutImpl:
         )
 
         effective_reward = float(result["full_result"]["reward"])
+        reward_penalty_flags = result.get(NEMO_GYM_REWARD_PENALTY_FLAGS_KEY)
+        strict_evidence_enabled = strict_main_step1_enabled()
+        if reward_penalty_flags is None and not strict_evidence_enabled:
+            reward_penalty_flags = {
+                key: False for key in NEMO_GYM_REWARD_PENALTY_FLAG_KEYS
+            }
+        if (
+            not isinstance(reward_penalty_flags, Mapping)
+            or set(reward_penalty_flags) != set(NEMO_GYM_REWARD_PENALTY_FLAG_KEYS)
+            or any(type(value) is not bool for value in reward_penalty_flags.values())
+        ):
+            raise RuntimeError(
+                "NeMo-Gym result is missing exact per-completion reward penalty flags"
+            )
+        strict_transcript = result.get(NEMO_GYM_STRICT_TRANSCRIPT_KEY)
+        if strict_evidence_enabled and (
+            not isinstance(strict_transcript, Mapping)
+            or set(strict_transcript)
+            != {
+                "generation_request",
+                "model_response",
+                "agent_run_request",
+                "derived_verifier_request",
+                "verifier_response",
+                "verifier_request_derivation_runtime",
+            }
+            or any(not isinstance(value, dict) for value in strict_transcript.values())
+        ):
+            raise RuntimeError(
+                "strict NeMo-Gym result is missing exact raw transcript objects"
+            )
         return Completion(
             message_log=result["message_log"],
             env_extras=result["full_result"],
@@ -1434,6 +1805,12 @@ class AsyncNemoGymRolloutImpl:
                 else float(pre_penalty_reward)
             ),
             env_masked=env_masked,
+            reward_penalty_flags=dict(reward_penalty_flags),
+            strict_transcript=(
+                dict(strict_transcript)
+                if isinstance(strict_transcript, Mapping)
+                else None
+            ),
         )
 
     def _compute_rollout_metrics(

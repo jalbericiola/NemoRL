@@ -59,6 +59,8 @@ from nemo_rl.environments.nemo_gym import (
     get_pad_dynamic_image_shapes,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_REWARD_PENALTY_FLAG_KEYS,
+    NEMO_GYM_REWARD_PENALTY_FLAGS_KEY,
     NEMO_GYM_RESERVED_KEY_PREFIX,
     NEMO_GYM_TASK_INDEX_KEY,
     PRE_PENALTY_REWARD,
@@ -2068,6 +2070,18 @@ def apply_reward_penalties(
         "unwanted_token": 0,
         "malformed_think_tag": 0,
     }
+    # Preserve each decision, not merely aggregate counts.  The strict first-step
+    # ledger later binds the four rows actually consumed by the trainer, so it
+    # must be able to distinguish which configured rule zeroed which completion.
+    # Keep this on NeMo-RL's outer result rather than inside Gym's full_result.
+    for result in results:
+        if NEMO_GYM_REWARD_PENALTY_FLAGS_KEY in result:
+            raise RuntimeError(
+                "NeMo-Gym result already contains NeMo-RL reward penalty flags"
+            )
+        result[NEMO_GYM_REWARD_PENALTY_FLAGS_KEY] = {
+            key: False for key in NEMO_GYM_REWARD_PENALTY_FLAG_KEYS
+        }
     if not reward_penalty_config or not results:
         return counts
 
@@ -2116,6 +2130,9 @@ def apply_reward_penalties(
                     break
             if is_duplicated:
                 result["full_result"]["reward"] = 0.0
+                result[NEMO_GYM_REWARD_PENALTY_FLAGS_KEY][
+                    "reasoning_equal_to_final_answer"
+                ] = True
 
                 counts["duplicated_reasoning"] += 1
 
@@ -2143,6 +2160,7 @@ def apply_reward_penalties(
                     break
             if final_answer_text is None or final_answer_text == "":
                 result["full_result"]["reward"] = 0.0
+                result[NEMO_GYM_REWARD_PENALTY_FLAGS_KEY]["empty_final_answer"] = True
 
                 counts["empty_final_answer"] += 1
 
@@ -2165,6 +2183,7 @@ def apply_reward_penalties(
                     break
             if has_unwanted_token:
                 result["full_result"]["reward"] = 0.0
+                result[NEMO_GYM_REWARD_PENALTY_FLAGS_KEY]["unwanted_token"] = True
 
                 counts["unwanted_token"] += 1
 
@@ -2251,6 +2270,7 @@ def apply_reward_penalties(
                         break
             if has_violation:
                 result["full_result"]["reward"] = 0.0
+                result[NEMO_GYM_REWARD_PENALTY_FLAGS_KEY]["malformed_think_tag"] = True
 
                 counts["malformed_think_tag"] += 1
 

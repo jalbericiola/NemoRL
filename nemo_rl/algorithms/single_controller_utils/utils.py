@@ -67,6 +67,11 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
         metrics["total_flops"] = float(train_result["total_flops"])
     if "num_ranks" in train_result:
         metrics["num_ranks"] = int(train_result["num_ranks"])
+    if "update_successful" in train_result:
+        update_successful = train_result["update_successful"]
+        if type(update_successful) is not bool:
+            raise TypeError("train_result.update_successful must be an exact bool")
+        metrics["update_successful"] = update_successful
 
     # moe/mtp share the same reduction rules as all_mb_metrics in grpo.py.
     mb: dict[str, list[Any]] = {}

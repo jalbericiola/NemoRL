@@ -96,6 +96,14 @@ class TestAggregateStepMetrics:
         assert out["num_ranks"] == 4
         assert "grad_norm" not in out
 
+    def test_update_successful_remains_an_exact_boolean_for_wandb(self) -> None:
+        out = aggregate_step_metrics({"update_successful": True})
+        assert type(out["update_successful"]) is bool
+        assert out["update_successful"] is True
+
+        with pytest.raises(TypeError, match="exact bool"):
+            aggregate_step_metrics({"update_successful": 1})
+
     def test_mb_metric_reduction_rules(self) -> None:
         result = {
             "all_mb_metrics": {
