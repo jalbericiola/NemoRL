@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Produce profile-bound fail-closed evidence for citation/freeform replay V2.
+"""Produce profile-bound fail-closed evidence for strict captured replay V2.
 
 This module deliberately contains no scheduler, NeMo, Ray, Torch, or W&B
 dependency.  The login-side calibration launcher supplies the exact ``sbatch``
@@ -76,6 +76,7 @@ AUTHENTICATED_REPLAY_RESULT_SNAPSHOT_V2_SCHEMA = "nemo-rl-strict-captured-replay
 _RESULT_INVENTORY_V2_SCHEMA = "nemo-rl-strict-captured-replay-result-inventory-v2"
 _RESULT_INVENTORY_V2_FILENAME = "result-inventory-v2.json"
 _RESULT_PROFILE_IDS_V2 = {
+    "reasoning_gym": "reasoning-gym-exact-match-v1",
     "citation": "citation-string-match-v1",
     "freeform": "freeform-regex-v1",
 }
@@ -126,6 +127,7 @@ __all__ = [
 REPLAY_EXECUTION_MANIFEST_V2_SCHEMA = "nemo-rl-strict-captured-replay-execution-manifest-v4"
 REPLAY_TRANSPORT_CONSUMPTION_V3_SCHEMA = "nemo-rl-strict-model-transport-replay-consumption-v3"
 FORMAT_VERIFICATION_CALL_INDEX_SCHEMA = "nemo-rl-strict-format-verification-call-index-v1"
+REASONING_SCORE_CALL_INDEX_SCHEMA = "nemo-rl-strict-reasoning-score-call-index-v1"
 PAIR_MANIFEST_SCHEMA = "nemo-rl-strict-single-env-pair-v2"
 PAIR_SUBMISSION_RECEIPT_SCHEMA = "nemo-rl-strict-pair-submission-receipt-v2"
 HARDWARE_OBSERVATION_SCHEMA = "nemo-rl-strict-hardware-observation-v2"
@@ -546,6 +548,20 @@ _AUTHENTICATED_RESULT_SNAPSHOT_V2_KEYS = frozenset(
         "evidence_index",
         "outputs",
         "samples",
+    }
+)
+_AUTHENTICATED_RESULT_SAMPLE_V2_KEYS = frozenset(
+    {
+        "sample_index",
+        "fixture_row_index",
+        "rollout_index",
+        "generation_seed",
+        "model_transport_entry_sha256",
+        "model_transport_request_body_sha256",
+        "model_transport_response_body_sha256",
+        "model_response_sha256",
+        "match_details",
+        "raw_environment_reward",
     }
 )
 REPLAY_RUNTIME_ATTESTATION_V2_KEYS = frozenset(
@@ -3157,6 +3173,140 @@ def _derive_result_final_receipt_v2(
     return final_document, receipt_paths["final"]
 
 
+def _validate_retained_scorer_call_index_v2(
+    payload_roster: tuple[tuple[str, bytes], ...],
+    *,
+    expected_sha256: str,
+    expected_receipt_root: Path,
+    expected_bootstrap_root: Path,
+    expected_bootstrap_sha256: str,
+    expected_pair_id: str,
+    expected_job_id: str,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> tuple[dict[str, Any], str]:
+    """Validate the profile-specific scorer graph from retained bytes only."""
+    from nemo_rl.environments.strict_gym_child_runtime_v2 import (
+        validate_finalized_format_verification_call_index_payloads,
+        validate_finalized_reasoning_score_call_index_payloads,
+    )
+
+    if _RESULT_PROFILE_IDS_V2.get(expected_environment) != expected_profile_id:
+        raise ValueError("retained scorer differs from outer profile authority")
+    common_arguments = {
+        "expected_sha256": expected_sha256,
+        "expected_receipt_root": expected_receipt_root,
+        "expected_bootstrap_root": expected_bootstrap_root,
+        "expected_bootstrap_sha256": expected_bootstrap_sha256,
+        "expected_pair_id": expected_pair_id,
+        "expected_job_id": expected_job_id,
+    }
+    if expected_environment == "reasoning_gym":
+        document, digest = validate_finalized_reasoning_score_call_index_payloads(
+            payload_roster,
+            **common_arguments,
+        )
+        terminal = _strict_json_object(document, name="retained reasoning scorer terminal")
+        if (
+            terminal.get("schema") != REASONING_SCORE_CALL_INDEX_SCHEMA
+            or terminal.get("environment") != "reasoning_gym"
+            or "profile_id" in terminal
+        ):
+            raise ValueError("reasoning scorer terminal differs from outer profile authority")
+        return terminal, digest
+    if expected_environment in {"citation", "freeform"}:
+        document, digest = validate_finalized_format_verification_call_index_payloads(
+            payload_roster,
+            **common_arguments,
+            expected_environment=expected_environment,
+            expected_profile_id=expected_profile_id,
+        )
+        terminal = _strict_json_object(document, name="retained format scorer terminal")
+        if (
+            terminal.get("schema") != FORMAT_VERIFICATION_CALL_INDEX_SCHEMA
+            or terminal.get("environment") != expected_environment
+            or terminal.get("profile_id") != expected_profile_id
+        ):
+            raise ValueError("format scorer terminal differs from outer profile authority")
+        return terminal, digest
+    raise ValueError("retained scorer profile dispatch is unsupported")
+
+
+def _project_authenticated_result_samples_v2(
+    transcript: Mapping[str, Any],
+    *,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> list[dict[str, Any]]:
+    """Project the fixed sample shape without weakening profile semantics."""
+    if _RESULT_PROFILE_IDS_V2.get(expected_environment) != expected_profile_id:
+        raise ValueError("sample projection differs from outer profile authority")
+    entries = transcript.get("entries")
+    if type(entries) is not list or len(entries) != K4_SAMPLES:
+        raise ValueError("authenticated result semantic projection is not exact K=4")
+    samples: list[dict[str, Any]] = []
+    for index, entry_value in enumerate(entries):
+        entry = _strict_json_object(entry_value, name=f"replay transcript entry {index}")
+        verifier_response = _strict_json_object(
+            entry.get("verifier_response"),
+            name=f"replay verifier response {index}",
+        )
+        if expected_environment == "reasoning_gym":
+            score = _require_exact_float(
+                verifier_response.get("score"),
+                name=f"replay reasoning verifier score {index}",
+            )
+            raw_reward = _require_exact_float(
+                entry.get("raw_environment_reward"),
+                name=f"replay reasoning reward {index}",
+            )
+            server_reward = _require_exact_float(
+                verifier_response.get("reward"),
+                name=f"replay reasoning server reward {index}",
+            )
+            extracted_answer = verifier_response.get("extracted_answer")
+            if (
+                verifier_response.get("task_name") != "knights_knaves"
+                or type(verifier_response.get("task_name")) is not str
+                or type(extracted_answer) is not str
+                or not 0.0 <= score <= 1.0
+                or server_reward != score
+                or raw_reward != score
+            ):
+                raise ValueError("replay reasoning match projection differs")
+            match_details = {
+                "task_name": "knights_knaves",
+                "score": score,
+                "extracted_answer": extracted_answer,
+            }
+        else:
+            match_details = _strict_json_object(
+                verifier_response.get("match_details"),
+                name=f"replay verifier match_details {index}",
+            )
+            raw_reward = entry.get("raw_environment_reward")
+        sample = {
+            "sample_index": entry.get("sample_index"),
+            "fixture_row_index": entry.get("fixture_row_index"),
+            "rollout_index": entry.get("rollout_index"),
+            "generation_seed": entry.get("generation_seed"),
+            "model_transport_entry_sha256": entry.get("model_transport_entry_sha256"),
+            "model_transport_request_body_sha256": entry.get("model_transport_request_body_sha256"),
+            "model_transport_response_body_sha256": entry.get("model_transport_response_body_sha256"),
+            "model_response_sha256": entry.get("model_response_sha256"),
+            "match_details": match_details,
+            "raw_environment_reward": raw_reward,
+        }
+        _require_exact_keys(
+            sample,
+            _AUTHENTICATED_RESULT_SAMPLE_V2_KEYS,
+            name=f"authenticated result sample {index}",
+        )
+        samples.append(sample)
+    canonical_ascii_json(samples)
+    return samples
+
+
 def _validate_sealed_result_outputs_v2(
     *,
     replay_execution_manifest: Mapping[str, Any],
@@ -3168,9 +3318,6 @@ def _validate_sealed_result_outputs_v2(
     expected_profile_id: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Validate the exact 13 retained members and all K=4 semantic joins."""
-    from nemo_rl.environments.strict_gym_child_runtime_v2 import (
-        validate_finalized_format_verification_call_index_payloads,
-    )
     from nemo_rl.utils.strict_captured_replay_manifest_v2 import (
         AuthenticatedOffSourceCapture,
     )
@@ -3300,7 +3447,7 @@ def _validate_sealed_result_outputs_v2(
         name="authenticated replay source snapshot",
     )
     bootstrap_root = snapshot_root / bootstrap_relative.parent
-    scorer_document, scorer_sha256 = validate_finalized_format_verification_call_index_payloads(
+    scorer_document, scorer_sha256 = _validate_retained_scorer_call_index_v2(
         child_payloads,
         expected_sha256=references["scorer_call_index"]["sha256"],
         expected_receipt_root=Path(result_root) / "strict_gym_child_runtime",
@@ -3346,33 +3493,11 @@ def _validate_sealed_result_outputs_v2(
     expected_runtime = _replay_runtime_attestation(manifest, references)
     if not _exact_json_equal(exit_document["runtime_attestation"], expected_runtime):
         raise ValueError("EXIT runtime attestation differs from retained outputs")
-    samples: list[dict[str, Any]] = []
-    for entry in transcript["entries"]:
-        verifier_response = _strict_json_object(
-            entry["verifier_response"],
-            name="replay verifier response",
-        )
-        match_details = _strict_json_object(
-            verifier_response["match_details"],
-            name="replay verifier match_details",
-        )
-        samples.append(
-            {
-                "sample_index": entry["sample_index"],
-                "fixture_row_index": entry["fixture_row_index"],
-                "rollout_index": entry["rollout_index"],
-                "generation_seed": entry["generation_seed"],
-                "model_transport_entry_sha256": entry["model_transport_entry_sha256"],
-                "model_transport_request_body_sha256": entry["model_transport_request_body_sha256"],
-                "model_transport_response_body_sha256": entry["model_transport_response_body_sha256"],
-                "model_response_sha256": entry["model_response_sha256"],
-                "match_details": match_details,
-                "raw_environment_reward": entry["raw_environment_reward"],
-            }
-        )
-    if len(samples) != K4_SAMPLES:
-        raise ValueError("authenticated result semantic projection is not exact K=4")
-    canonical_ascii_json(samples)
+    samples = _project_authenticated_result_samples_v2(
+        transcript,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
     return documents, samples
 
 
@@ -3931,13 +4056,14 @@ def load_authenticated_captured_replay_result_v2(
     The sealed inventory and its exact thirteen members are captured once by the
     sealer verifier.  Every subsequent semantic check consumes only those retained
     bytes; no named result member is reopened after the verifier mints authority.
-    This V2 boundary is deliberately limited to citation/freeform profiles;
-    reasoning_gym remains on the separately versioned V1 replay path.
+    The outer V2 manifest/inventory/FINAL graph is the sole profile authority.
+    Reasoning Gym retains its environment-only V1 scorer-terminal bytes inside
+    that profile-bound outer graph.
     """
     if type(expected_environment) is not str or type(expected_profile_id) is not str:
         raise TypeError("expected environment/profile must be exact strings")
     if _RESULT_PROFILE_IDS_V2.get(expected_environment) != expected_profile_id:
-        raise ValueError("authenticated result V2 admits only the exact citation/freeform profiles")
+        raise ValueError("authenticated result V2 environment/profile pair is unsupported")
     manifest_path = str(
         _canonical_absolute_path(
             replay_execution_manifest_path,
@@ -5351,8 +5477,12 @@ def _validate_environment_verifier_response(
         if type(verifier_response["task_name"]) is not str or verifier_response["task_name"] != task_name:
             raise ValueError(f"{name}.task_name differs from metadata.source_dataset")
         score = _require_exact_float(verifier_response["score"], name=f"{name}.score")
-        if score != reward:
-            raise ValueError(f"{name}.score differs from raw reward")
+        server_reward = _require_exact_float(
+            verifier_response["reward"],
+            name=f"{name}.reward",
+        )
+        if score != reward or server_reward != score:
+            raise ValueError(f"{name}.score/reward differs from raw reward")
         extracted = _bounded_utf8_allow_empty(
             verifier_response["extracted_answer"],
             name=f"{name}.extracted_answer",
@@ -5928,19 +6058,41 @@ def _load_finalized_scorer_call_index(
     try:
         from nemo_rl.environments.strict_gym_child_runtime_v2 import (
             load_finalized_format_verification_call_index,
+            load_finalized_reasoning_score_call_index,
         )
     except ImportError as error:
         raise RuntimeError("public finalized scorer call loader is unavailable") from error
+    if _RESULT_PROFILE_IDS_V2.get(expected_environment) != expected_profile_id:
+        raise ValueError("scorer loader differs from outer profile authority")
     receipt_root = Path(reference["path"]).parent
-    loaded, digest = load_finalized_format_verification_call_index(
-        Path(reference["path"]),
-        expected_sha256=reference["sha256"],
-        expected_receipt_root=receipt_root,
-        expected_pair_id=replay_execution_manifest["pair_id"],
-        expected_job_id=authenticated_job_id,
-        expected_environment=expected_environment,
-        expected_profile_id=expected_profile_id,
-    )
+    common_arguments = {
+        "expected_sha256": reference["sha256"],
+        "expected_receipt_root": receipt_root,
+        "expected_pair_id": replay_execution_manifest["pair_id"],
+        "expected_job_id": authenticated_job_id,
+    }
+    if expected_environment == "reasoning_gym":
+        if expected_profile_id != _RESULT_PROFILE_IDS_V2["reasoning_gym"]:
+            raise ValueError("reasoning scorer differs from outer profile authority")
+        loaded, digest = load_finalized_reasoning_score_call_index(
+            Path(reference["path"]),
+            **common_arguments,
+        )
+        if (
+            loaded.get("schema") != REASONING_SCORE_CALL_INDEX_SCHEMA
+            or loaded.get("environment") != "reasoning_gym"
+            or "profile_id" in loaded
+        ):
+            raise ValueError("reasoning scorer terminal differs from outer profile authority")
+    elif expected_environment in {"citation", "freeform"}:
+        loaded, digest = load_finalized_format_verification_call_index(
+            Path(reference["path"]),
+            **common_arguments,
+            expected_environment=expected_environment,
+            expected_profile_id=expected_profile_id,
+        )
+    else:
+        raise ValueError("scorer loader profile dispatch is unsupported")
     if digest != reference["sha256"]:
         raise ValueError("scorer call loader digest differs")
     return _strict_json_object(loaded, name="scorer call terminal index")
@@ -6090,23 +6242,136 @@ def _close_score_transcript_join(
     expected_environment: str,
     expected_profile_id: str,
 ) -> None:
+    if _RESULT_PROFILE_IDS_V2.get(expected_environment) != expected_profile_id:
+        raise ValueError("scorer call index differs from outer profile authority")
+    if expected_environment == "reasoning_gym":
+        _close_reasoning_score_transcript_join(
+            score_index,
+            transcript,
+            expected_profile_id=expected_profile_id,
+        )
+        return
+    _close_format_score_transcript_join(
+        score_index,
+        transcript,
+        expected_environment=expected_environment,
+        expected_profile_id=expected_profile_id,
+    )
+
+
+def _close_reasoning_score_transcript_join(
+    score_index: Mapping[str, Any],
+    transcript: Mapping[str, Any],
+    *,
+    expected_profile_id: str,
+) -> None:
+    """Bind environment-only V1 reasoning bytes to outer V2 profile authority."""
+    from nemo_rl.environments.strict_gym_child_runtime_v2 import (
+        reasoning_score_call_expectation,
+    )
+
+    if (
+        expected_profile_id != _RESULT_PROFILE_IDS_V2["reasoning_gym"]
+        or score_index.get("environment") != "reasoning_gym"
+        or score_index.get("schema") != REASONING_SCORE_CALL_INDEX_SCHEMA
+        or "profile_id" in score_index
+    ):
+        raise ValueError("reasoning scorer call index differs from outer profile authority")
+    quiescence = score_index.get("quiescence")
+    if type(quiescence) is not dict or quiescence.get("original_process_reaped") is not True:
+        raise ValueError("scorer call index does not prove process reaping")
+    calls = score_index.get("calls")
+    entries = transcript.get("entries")
+    if type(calls) is not list or len(calls) != K4_SAMPLES or type(entries) is not list or len(entries) != K4_SAMPLES:
+        raise ValueError("scorer call index is not exact K=4")
+    for index, (call, entry_value) in enumerate(zip(calls, entries, strict=True)):
+        entry = _strict_json_object(entry_value, name=f"reasoning transcript entry {index}")
+        request = _strict_json_object(
+            entry.get("derived_verifier_request"),
+            name=f"reasoning verifier request {index}",
+        )
+        response = _strict_json_object(
+            entry.get("verifier_response"),
+            name=f"reasoning verifier response {index}",
+        )
+        metadata = _strict_json_object(
+            request.get("metadata"),
+            name=f"reasoning verifier metadata {index}",
+        )
+        task_name = metadata.get("source_dataset")
+        extracted_answer = response.get("extracted_answer")
+        score = _require_exact_float(
+            response.get("score"),
+            name=f"reasoning verifier score {index}",
+        )
+        server_reward = _require_exact_float(
+            response.get("reward"),
+            name=f"reasoning verifier server reward {index}",
+        )
+        reward = _require_exact_float(
+            entry.get("raw_environment_reward"),
+            name=f"reasoning transcript reward {index}",
+        )
+        if (
+            task_name != "knights_knaves"
+            or type(task_name) is not str
+            or response.get("task_name") != task_name
+            or type(response.get("task_name")) is not str
+            or type(extracted_answer) is not str
+            or not 0.0 <= score <= 1.0
+            or server_reward != score
+            or score != reward
+        ):
+            raise ValueError(f"reasoning scorer call {index + 1} result differs from transcript")
+        scorer_entry = {
+            "question": copy.deepcopy(request.get("question")),
+            "answer": copy.deepcopy(request.get("answer")),
+            "metadata": copy.deepcopy(metadata),
+        }
+        expectation = reasoning_score_call_expectation(
+            task_name=task_name,
+            answer=extracted_answer,
+            entry=scorer_entry,
+            float_result=reward,
+        )
+        expected = {
+            "sequence": index + 1,
+            "task_name": expectation["task_name"],
+            "input": {
+                "answer_sha256": expectation["answer_sha256"],
+                "entry_sha256": expectation["entry_sha256"],
+            },
+            "float_result": expectation["float_result"],
+        }
+        _require_exact_projection(call, expected, name=f"reasoning scorer call {index + 1}")
+
+
+def _close_format_score_transcript_join(
+    score_index: Mapping[str, Any],
+    transcript: Mapping[str, Any],
+    *,
+    expected_environment: str,
+    expected_profile_id: str,
+) -> None:
     from nemo_rl.environments.strict_gym_child_runtime_v2 import (
         format_verification_call_expectation,
     )
 
     if (
-        score_index.get("environment") != expected_environment
+        expected_environment not in {"citation", "freeform"}
+        or score_index.get("environment") != expected_environment
         or score_index.get("profile_id") != expected_profile_id
         or score_index.get("schema") != FORMAT_VERIFICATION_CALL_INDEX_SCHEMA
     ):
-        raise ValueError("scorer call index profile identity differs")
+        raise ValueError("format scorer call index profile identity differs")
     quiescence = score_index.get("quiescence")
-    if not isinstance(quiescence, Mapping) or quiescence.get("original_process_reaped") is not True:
+    if type(quiescence) is not dict or quiescence.get("original_process_reaped") is not True:
         raise ValueError("scorer call index does not prove process reaping")
     calls = score_index.get("calls")
-    if not isinstance(calls, list) or len(calls) != K4_SAMPLES:
+    entries = transcript.get("entries")
+    if type(calls) is not list or len(calls) != K4_SAMPLES or type(entries) is not list or len(entries) != K4_SAMPLES:
         raise ValueError("scorer call index is not exact K=4")
-    for index, (call, entry) in enumerate(zip(calls, transcript["entries"], strict=True)):
+    for index, (call, entry) in enumerate(zip(calls, entries, strict=True)):
         request = entry["derived_verifier_request"]
         if type(request) is not dict:
             raise TypeError("derived format-verifier request must be an exact object")

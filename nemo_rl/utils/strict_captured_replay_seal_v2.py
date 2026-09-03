@@ -106,6 +106,11 @@ _MAX_INVENTORY_BYTES = 128 * 1024
 _MAX_RESULT_BYTES = 512 * 1024 * 1024
 _VERIFIED_RESULT_MINT_TOKEN = object()
 _VERIFIED_RESULT_V2_MINT_TOKEN = object()
+_REASONING_GYM_ENVIRONMENT = "reasoning_gym"
+_REASONING_GYM_PROFILE_ID = "reasoning-gym-exact-match-v1"
+_REASONING_SCORER_TERMINAL_SCHEMA = "nemo-rl-strict-reasoning-score-call-index-v1"
+_FORMAT_ENVIRONMENTS = frozenset({"citation", "freeform"})
+_FORMAT_SCORER_TERMINAL_SCHEMA = "nemo-rl-strict-format-verification-call-index-v1"
 
 
 class StrictCapturedReplaySealError(ValueError):
@@ -470,12 +475,29 @@ def _validate_reaped_scorer_bytes(
         )
     except (UnicodeError, json.JSONDecodeError) as error:
         raise StrictCapturedReplaySealError("reasoning score-call index is not strict ASCII JSON") from error
-    if type(document) is not dict or _canonical_json(document) != raw:
+    if type(document) is not dict:
         _fail("reasoning score-call index is not canonical")
-    if profile is not None and (
-        document.get("environment") != profile.environment or document.get("profile_id") != profile.profile_id
-    ):
-        _fail("scorer call-index environment/profile identity differs")
+    _reject_negative_zero(document)
+    if _canonical_json(document) != raw:
+        _fail("reasoning score-call index is not canonical")
+    if profile is not None:
+        if profile.environment == _REASONING_GYM_ENVIRONMENT:
+            if (
+                profile.profile_id != _REASONING_GYM_PROFILE_ID
+                or document.get("schema") != _REASONING_SCORER_TERMINAL_SCHEMA
+                or document.get("environment") != _REASONING_GYM_ENVIRONMENT
+                or "profile_id" in document
+            ):
+                _fail("reasoning scorer call-index differs from outer profile authority")
+        elif profile.environment in _FORMAT_ENVIRONMENTS:
+            if (
+                document.get("schema") != _FORMAT_SCORER_TERMINAL_SCHEMA
+                or document.get("environment") != profile.environment
+                or document.get("profile_id") != profile.profile_id
+            ):
+                _fail("format scorer call-index environment/profile identity differs")
+        else:
+            _fail("scorer call-index profile dispatch is unsupported")
     quiescence = document.get("quiescence")
     if (
         type(quiescence) is not dict

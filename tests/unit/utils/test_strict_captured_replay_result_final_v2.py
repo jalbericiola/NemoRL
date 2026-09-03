@@ -920,19 +920,15 @@ def test_loader_rejects_cross_profile_before_result_verification(
     assert sealed_state == {"verified": False}
 
 
-def test_loader_rejects_coherently_relabelled_reasoning_gym_at_profile_gate(
+def test_loader_rejects_relabelled_reasoning_gym_with_wrong_outer_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from nemo_rl.utils.strict_captured_replay_profiles import (
-        get_strict_captured_replay_profile,
-    )
-
     arguments, document, lifecycle, _, sealed_state = _loader_fixture(
         tmp_path,
         monkeypatch,
     )
-    profile_id = "reasoning-gym-exact-match-v1"
+    profile_id = "reasoning-gym-exact-match-v2"
     manifest = copy.deepcopy(lifecycle[0])
     manifest["environment"] = "reasoning_gym"
     manifest["scorer_profile"] = {
@@ -961,18 +957,21 @@ def test_loader_rejects_coherently_relabelled_reasoning_gym_at_profile_gate(
 
     registry_called = False
 
-    def registry_gate(value: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    def forbidden_registry_gate(
+        value: dict[str, Any],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         nonlocal registry_called
+        del value, kwargs
         registry_called = True
-        assert value == manifest
-        get_strict_captured_replay_profile(
-            expected_environment=kwargs["expected_environment"],
-            expected_profile_id=kwargs["expected_profile_id"],
-        )
-        raise AssertionError("unsupported reasoning_gym profile was accepted")
+        raise AssertionError("wrong outer profile passed the public profile gate")
 
-    monkeypatch.setattr(evidence, "_validated_lifecycle_manifest", registry_gate)
-    with pytest.raises(ValueError, match="citation/freeform"):
+    monkeypatch.setattr(
+        evidence,
+        "_validated_lifecycle_manifest",
+        forbidden_registry_gate,
+    )
+    with pytest.raises(ValueError, match="unsupported"):
         evidence.load_authenticated_captured_replay_result_v2(**arguments)
     assert registry_called is False
     assert sealed_state == {"verified": False}
@@ -2670,7 +2669,7 @@ def test_public_final_lifecycle_profiled_round_trip_with_real_sealer_and_semanti
         authenticated_job_id=_JOB_ID,
         process=driver_process,
         scheduler_device_environment=device_environment,
-        format_verification_call_index_ref=scorer_index_ref,
+        scorer_call_index_ref=scorer_index_ref,
     )
     consumption_path, consumption_sha256 = publish_strict_model_transport_replay_consumption_v3(
         output=manifest["artifacts"]["outputs"]["transport_consumption"]["path"],

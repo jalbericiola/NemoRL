@@ -14,8 +14,10 @@ from typing import Any
 import pytest
 
 import nemo_rl.utils.strict_captured_replay_evidence_v2 as evidence
+from nemo_rl.environments import strict_gym_child_runtime_v2 as child_runtime
 from nemo_rl.environments.strict_gym_child_runtime_v2 import (
     format_verification_call_expectation,
+    reasoning_score_call_expectation,
 )
 from tests.unit.utils.test_strict_captured_replay_evidence import _format_entry
 
@@ -35,16 +37,10 @@ def _profile(environment: str, profile_id: str) -> dict[str, Any]:
         "environment": environment,
         "profile_id": profile_id,
         "verifier_type": "string_match" if environment == "citation" else "regex",
-        "method": "_verify_string_match"
-        if environment == "citation"
-        else "_verify_regex",
-        "resource_config_path_name": (
-            "citation_format" if environment == "citation" else "freeform_formatting"
-        ),
+        "method": "_verify_string_match" if environment == "citation" else "_verify_regex",
+        "resource_config_path_name": ("citation_format" if environment == "citation" else "freeform_formatting"),
         "disabled_config_path_name": (
-            "citation_format_simple_agent"
-            if environment == "citation"
-            else "freeform_formatting_simple_agent"
+            "citation_format_simple_agent" if environment == "citation" else "freeform_formatting_simple_agent"
         ),
         "resource_app": {"path": "resource/app.py", "sha256": _digest("app")},
         "resource_config": {
@@ -244,6 +240,299 @@ def test_format_terminal_join_recomputes_exact_profile_result(
         )
 
 
+def _reasoning_terminal_and_transcript() -> tuple[dict[str, Any], dict[str, Any]]:
+    rewards = (0.0, 0.25, 0.5, 1.0)
+    entries: list[dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
+    for index, reward in enumerate(rewards):
+        request = {
+            "question": f"question-{index}",
+            "answer": f"reference-answer-{index}",
+            "metadata": {"source_dataset": "knights_knaves"},
+        }
+        extracted_answer = f"model-answer-{index}"
+        response = {
+            "task_name": "knights_knaves",
+            "score": reward,
+            "reward": reward,
+            "extracted_answer": extracted_answer,
+        }
+        entry = {
+            "sample_index": index,
+            "fixture_row_index": 0,
+            "rollout_index": index,
+            "generation_seed": 100 + index,
+            "model_transport_entry_sha256": _digest(f"entry-{index}"),
+            "model_transport_request_body_sha256": _digest(f"request-{index}"),
+            "model_transport_response_body_sha256": _digest(f"response-{index}"),
+            "model_response_sha256": _digest(f"model-response-{index}"),
+            "derived_verifier_request": request,
+            "verifier_response": response,
+            "raw_environment_reward": reward,
+        }
+        expectation = reasoning_score_call_expectation(
+            task_name="knights_knaves",
+            answer=extracted_answer,
+            entry=request,
+            float_result=reward,
+        )
+        entries.append(entry)
+        calls.append(
+            {
+                "sequence": index + 1,
+                "task_name": expectation["task_name"],
+                "input": {
+                    "answer_sha256": expectation["answer_sha256"],
+                    "entry_sha256": expectation["entry_sha256"],
+                },
+                "float_result": expectation["float_result"],
+                "receipt": {
+                    "path": f"/result/reasoning-score-call-{index + 1:08d}.json",
+                    "schema": "nemo-rl-strict-reasoning-score-call-v1",
+                    "sha256": _digest(f"score-call-{index}"),
+                },
+            }
+        )
+    terminal = {
+        "schema": evidence.REASONING_SCORE_CALL_INDEX_SCHEMA,
+        "environment": "reasoning_gym",
+        "quiescence": {"original_process_reaped": True},
+        "calls": calls,
+    }
+    return terminal, {"entries": entries}
+
+
+def test_reasoning_terminal_join_and_sample_projection_close_fractional_rewards() -> None:
+    profile_id = "reasoning-gym-exact-match-v1"
+    terminal, transcript = _reasoning_terminal_and_transcript()
+    evidence._close_score_transcript_join(
+        terminal,
+        transcript,
+        expected_environment="reasoning_gym",
+        expected_profile_id=profile_id,
+    )
+    samples = evidence._project_authenticated_result_samples_v2(
+        transcript,
+        expected_environment="reasoning_gym",
+        expected_profile_id=profile_id,
+    )
+
+    assert [sample["raw_environment_reward"] for sample in samples] == [
+        0.0,
+        0.25,
+        0.5,
+        1.0,
+    ]
+    assert all(set(sample) == set(evidence._AUTHENTICATED_RESULT_SAMPLE_V2_KEYS) for sample in samples)
+    assert samples[1]["match_details"] == {
+        "task_name": "knights_knaves",
+        "score": 0.25,
+        "extracted_answer": "model-answer-1",
+    }
+    assert type(samples[1]["match_details"]["score"]) is float
+
+
+@pytest.mark.parametrize(
+    ("target", "poison"),
+    (
+        ("inner_profile", "reasoning-gym-exact-match-v1"),
+        ("schema", evidence.FORMAT_VERIFICATION_CALL_INDEX_SCHEMA),
+        ("outer_profile", "citation-string-match-v1"),
+        ("call_hash", "0" * 64),
+        ("server_reward", 0.75),
+        ("server_reward", True),
+        ("score", -0.0),
+        ("raw_reward", 0.75),
+        ("response_task", "other_task"),
+    ),
+)
+def test_reasoning_terminal_join_rejects_profile_and_reward_poison(
+    target: str,
+    poison: Any,
+) -> None:
+    terminal, transcript = _reasoning_terminal_and_transcript()
+    profile_id = "reasoning-gym-exact-match-v1"
+    if target == "inner_profile":
+        terminal["profile_id"] = poison
+    elif target == "schema":
+        terminal["schema"] = poison
+    elif target == "outer_profile":
+        profile_id = poison
+    elif target == "call_hash":
+        terminal["calls"][0]["input"]["entry_sha256"] = poison
+    elif target == "server_reward":
+        transcript["entries"][0]["verifier_response"]["reward"] = poison
+    elif target == "score":
+        transcript["entries"][0]["verifier_response"]["score"] = poison
+    elif target == "raw_reward":
+        transcript["entries"][0]["raw_environment_reward"] = poison
+    elif target == "response_task":
+        transcript["entries"][0]["verifier_response"]["task_name"] = poison
+    else:  # pragma: no cover - the closed parameter table owns this branch.
+        raise AssertionError(target)
+
+    with pytest.raises((TypeError, ValueError)):
+        evidence._close_score_transcript_join(
+            terminal,
+            transcript,
+            expected_environment="reasoning_gym",
+            expected_profile_id=profile_id,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "poison"),
+    (
+        ("score", -0.0),
+        ("reward", True),
+        ("reward", 0.75),
+        ("raw_environment_reward", True),
+        ("raw_environment_reward", 0.75),
+    ),
+)
+def test_reasoning_sample_projection_rejects_nonexact_or_divergent_reward(
+    field: str,
+    poison: Any,
+) -> None:
+    _, transcript = _reasoning_terminal_and_transcript()
+    if field == "raw_environment_reward":
+        transcript["entries"][0][field] = poison
+    else:
+        transcript["entries"][0]["verifier_response"][field] = poison
+    with pytest.raises((TypeError, ValueError)):
+        evidence._project_authenticated_result_samples_v2(
+            transcript,
+            expected_environment="reasoning_gym",
+            expected_profile_id="reasoning-gym-exact-match-v1",
+        )
+
+
+def test_reasoning_verifier_response_binds_server_reward_to_score_and_raw() -> None:
+    model_response = {
+        "output": [
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "<answer>model-answer</answer>",
+                    }
+                ],
+            }
+        ]
+    }
+    verifier_response = {
+        "responses_create_params": {},
+        "response": model_response,
+        "reward": 0.25,
+        "task_name": "knights_knaves",
+        "score": 0.25,
+        "extracted_answer": "model-answer",
+    }
+    evidence._validate_environment_verifier_response(
+        verifier_response,
+        agent_run_request={"metadata": {"source_dataset": "knights_knaves"}},
+        model_response=model_response,
+        environment="reasoning_gym",
+        reward=0.25,
+        name="reasoning verifier response",
+    )
+
+    for poison in (True, -0.0, 0.5):
+        altered = copy.deepcopy(verifier_response)
+        altered["reward"] = poison
+        with pytest.raises((TypeError, ValueError)):
+            evidence._validate_environment_verifier_response(
+                altered,
+                agent_run_request={"metadata": {"source_dataset": "knights_knaves"}},
+                model_response=model_response,
+                environment="reasoning_gym",
+                reward=0.25,
+                name="reasoning verifier response",
+            )
+
+
+def test_retained_reasoning_scorer_dispatch_uses_only_payload_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal, _ = _reasoning_terminal_and_transcript()
+    roster = (("strict_gym_child_runtime/index.json", b"retained"),)
+    expected_sha256 = _digest("terminal")
+    observed: list[tuple[tuple[tuple[str, bytes], ...], dict[str, Any]]] = []
+
+    def validate_reasoning(payload_roster, **kwargs):
+        observed.append((payload_roster, kwargs))
+        return copy.deepcopy(terminal), expected_sha256
+
+    def forbidden_format(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("reasoning dispatch must not invoke format validation")
+
+    def forbidden_path_load(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("retained-byte validation must not reopen named paths")
+
+    monkeypatch.setattr(
+        child_runtime,
+        "validate_finalized_reasoning_score_call_index_payloads",
+        validate_reasoning,
+    )
+    monkeypatch.setattr(
+        child_runtime,
+        "validate_finalized_format_verification_call_index_payloads",
+        forbidden_format,
+    )
+    monkeypatch.setattr(Path, "read_bytes", forbidden_path_load)
+    admitted, digest = evidence._validate_retained_scorer_call_index_v2(
+        roster,
+        expected_sha256=expected_sha256,
+        expected_receipt_root=Path("/result/strict_gym_child_runtime"),
+        expected_bootstrap_root=Path("/snapshot/bootstrap"),
+        expected_bootstrap_sha256=_digest("bootstrap"),
+        expected_pair_id="pair-v2",
+        expected_job_id="12345",
+        expected_environment="reasoning_gym",
+        expected_profile_id="reasoning-gym-exact-match-v1",
+    )
+
+    assert admitted == terminal
+    assert admitted is not terminal
+    assert digest == expected_sha256
+    assert observed == [
+        (
+            roster,
+            {
+                "expected_sha256": expected_sha256,
+                "expected_receipt_root": Path("/result/strict_gym_child_runtime"),
+                "expected_bootstrap_root": Path("/snapshot/bootstrap"),
+                "expected_bootstrap_sha256": _digest("bootstrap"),
+                "expected_pair_id": "pair-v2",
+                "expected_job_id": "12345",
+            },
+        )
+    ]
+
+    poisoned_terminal = copy.deepcopy(terminal)
+    poisoned_terminal["profile_id"] = "reasoning-gym-exact-match-v1"
+    monkeypatch.setattr(
+        child_runtime,
+        "validate_finalized_reasoning_score_call_index_payloads",
+        lambda *args, **kwargs: (poisoned_terminal, expected_sha256),
+    )
+    with pytest.raises(ValueError, match="outer profile authority"):
+        evidence._validate_retained_scorer_call_index_v2(
+            roster,
+            expected_sha256=expected_sha256,
+            expected_receipt_root=Path("/result/strict_gym_child_runtime"),
+            expected_bootstrap_root=Path("/snapshot/bootstrap"),
+            expected_bootstrap_sha256=_digest("bootstrap"),
+            expected_pair_id="pair-v2",
+            expected_job_id="12345",
+            expected_environment="reasoning_gym",
+            expected_profile_id="reasoning-gym-exact-match-v1",
+        )
+
+
 @pytest.mark.parametrize(("environment", "profile_id"), _PROFILE_PAIRS)
 def test_evidence_index_v4_is_profile_bound_and_reaped(
     monkeypatch: pytest.MonkeyPatch,
@@ -399,9 +688,7 @@ def test_public_lifecycle_surface_is_v2_only_and_profile_explicit() -> None:
     lifecycle_names = {
         name
         for name in evidence.__all__
-        if name.startswith(
-            ("build_captured", "validate_captured", "publish_captured", "load_captured")
-        )
+        if name.startswith(("build_captured", "validate_captured", "publish_captured", "load_captured"))
     }
     assert lifecycle_names
     assert all(name.endswith("_v2") for name in lifecycle_names)

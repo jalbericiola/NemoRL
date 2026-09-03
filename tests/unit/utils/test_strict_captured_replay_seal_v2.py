@@ -8,7 +8,7 @@ import os
 import shutil
 import stat
 from collections import Counter
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
@@ -34,10 +34,12 @@ from nemo_rl.utils.strict_captured_replay_seal_v2 import (
     verify_sealed_result_v2,
 )
 
-_PROFILE_PAIRS = (
+_FORMAT_PROFILE_PAIRS = (
     ("citation", "citation-string-match-v1"),
     ("freeform", "freeform-regex-v1"),
 )
+_REASONING_PROFILE_PAIR = ("reasoning_gym", "reasoning-gym-exact-match-v1")
+_PROFILE_PAIRS = tuple((profile.environment, profile.profile_id) for profile in STRICT_CAPTURED_REPLAY_PROFILES)
 
 
 def _profile_payload(
@@ -50,13 +52,14 @@ def _profile_payload(
     if relative == profile.scorer_terminal_index_path:
         document = {
             "environment": profile.environment,
-            "profile_id": profile.profile_id,
             "schema": schema,
             "quiescence": {
                 "original_process_reaped": reaped,
                 "wrapper_returncode": 0,
             },
         }
+        if profile.environment != "reasoning_gym":
+            document["profile_id"] = profile.profile_id
     else:
         document = {
             "environment": profile.environment,
@@ -67,17 +70,43 @@ def _profile_payload(
     return json.dumps(document, sort_keys=True, separators=(",", ":")).encode("ascii")
 
 
-def _profile_tree(
+def _reasoning_profile() -> StrictCapturedReplayProfile:
+    try:
+        return get_strict_captured_replay_profile(
+            expected_environment="reasoning_gym",
+            expected_profile_id="reasoning-gym-exact-match-v1",
+        )
+    except ValueError:
+        # Slice D is developed on the exact Slice-A base.  The composed branch
+        # resolves this profile directly from Slice B's immutable registry.
+        pass
+    base = get_strict_captured_replay_profile(
+        expected_environment="citation",
+        expected_profile_id="citation-string-match-v1",
+    )
+    return replace(
+        base,
+        environment="reasoning_gym",
+        profile_id="reasoning-gym-exact-match-v1",
+        call_schema="nemo-rl-strict-reasoning-score-call-v1",
+        closed_schema="nemo-rl-strict-reasoning-score-closed-v1",
+        call_index_schema="nemo-rl-strict-reasoning-score-call-index-v1",
+        result_files=seal_module.RESULT_FILE_ALLOWLIST,
+        result_file_schemas=(
+            *FORMAT_RESULT_FILE_SCHEMAS[:3],
+            *seal_module.RESULT_FILE_SCHEMA_ALLOWLIST[3:],
+        ),
+        result_anchor_paths=seal_module.RESULT_ANCHOR_ALLOWLIST,
+        scorer_terminal_index_path=("strict_gym_child_runtime/reasoning-score-call-index.json"),
+    )
+
+
+def _profile_tree_from_profile(
     tmp_path: Path,
     *,
-    environment: str,
-    profile_id: str,
+    profile: StrictCapturedReplayProfile,
     reaped: bool = True,
-) -> tuple[Path, StrictCapturedReplayProfile, dict[str, str]]:
-    profile = get_strict_captured_replay_profile(
-        expected_environment=environment,
-        expected_profile_id=profile_id,
-    )
+) -> tuple[Path, dict[str, str]]:
     root = tmp_path / "result"
     child = root / "strict_gym_child_runtime"
     child.mkdir(mode=0o700, parents=True)
@@ -91,6 +120,25 @@ def _profile_tree(
         path.chmod(0o400)
         if relative in profile.result_anchor_paths:
             anchors[relative] = hashlib.sha256(raw).hexdigest()
+    return root, anchors
+
+
+def _profile_tree(
+    tmp_path: Path,
+    *,
+    environment: str,
+    profile_id: str,
+    reaped: bool = True,
+) -> tuple[Path, StrictCapturedReplayProfile, dict[str, str]]:
+    profile = get_strict_captured_replay_profile(
+        expected_environment=environment,
+        expected_profile_id=profile_id,
+    )
+    root, anchors = _profile_tree_from_profile(
+        tmp_path,
+        profile=profile,
+        reaped=reaped,
+    )
     return root, profile, anchors
 
 
@@ -124,9 +172,9 @@ def _restore_modes(tmp_path: Path):
 
 def test_profile_registry_is_closed_frozen_and_exact() -> None:
     assert type(STRICT_CAPTURED_REPLAY_PROFILES) is tuple
-    assert (
-        tuple((profile.environment, profile.profile_id) for profile in STRICT_CAPTURED_REPLAY_PROFILES)
-        == _PROFILE_PAIRS
+    assert _PROFILE_PAIRS in (
+        _FORMAT_PROFILE_PAIRS,
+        (*_FORMAT_PROFILE_PAIRS, _REASONING_PROFILE_PAIR),
     )
     assert len(FORMAT_RESULT_FILES) == 13
     assert len(FORMAT_RESULT_FILE_SCHEMAS) == len(FORMAT_RESULT_FILES)
@@ -667,4 +715,114 @@ def test_v2_rejects_cross_profile_scorer_call_index(tmp_path: Path) -> None:
             anchored_sha256=anchors,
             expected_environment="citation",
             expected_profile_id="citation-string-match-v1",
+        )
+
+
+def test_v2_reasoning_terminal_uses_only_outer_profile_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _reasoning_profile()
+    root, anchors = _profile_tree_from_profile(tmp_path, profile=profile)
+
+    def admitted_profile(*, expected_environment: str, expected_profile_id: str):
+        assert expected_environment == profile.environment
+        assert expected_profile_id == profile.profile_id
+        return profile
+
+    monkeypatch.setattr(
+        seal_module,
+        "_strict_captured_replay_profile",
+        admitted_profile,
+    )
+    _, digest = publish_sealed_result_v2(
+        result_root=str(root),
+        anchored_sha256=anchors,
+        expected_environment=profile.environment,
+        expected_profile_id=profile.profile_id,
+    )
+    verify_sealed_result_v2(
+        result_root=str(root),
+        expected_inventory_sha256=digest,
+        expected_environment=profile.environment,
+        expected_profile_id=profile.profile_id,
+    )
+
+    inventory = json.loads((root / RESULT_INVENTORY_V2_FILENAME).read_bytes())
+    terminal = json.loads((root / profile.scorer_terminal_index_path).read_bytes())
+    assert inventory["environment"] == "reasoning_gym"
+    assert inventory["profile_id"] == "reasoning-gym-exact-match-v1"
+    assert terminal["environment"] == "reasoning_gym"
+    assert terminal["schema"] == "nemo-rl-strict-reasoning-score-call-index-v1"
+    assert "profile_id" not in terminal
+
+
+def test_v2_scorer_terminal_dispatch_rejects_cross_shape_and_profile_poison() -> None:
+    reasoning_profile = _reasoning_profile()
+    format_profile = get_strict_captured_replay_profile(
+        expected_environment="citation",
+        expected_profile_id="citation-string-match-v1",
+    )
+    quiescence = {"original_process_reaped": True, "wrapper_returncode": 0}
+    reasoning_terminal = {
+        "environment": "reasoning_gym",
+        "schema": "nemo-rl-strict-reasoning-score-call-index-v1",
+        "quiescence": quiescence,
+    }
+    format_terminal = {
+        "environment": "citation",
+        "profile_id": "citation-string-match-v1",
+        "schema": "nemo-rl-strict-format-verification-call-index-v1",
+        "quiescence": quiescence,
+    }
+
+    def payload(document: dict[str, object]) -> bytes:
+        return json.dumps(document, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+    seal_module._validate_reaped_scorer_bytes(
+        payload(reasoning_terminal),
+        profile=reasoning_profile,
+    )
+    seal_module._validate_reaped_scorer_bytes(
+        payload(format_terminal),
+        profile=format_profile,
+    )
+
+    reasoning_with_inner_profile = dict(reasoning_terminal)
+    reasoning_with_inner_profile["profile_id"] = reasoning_profile.profile_id
+    wrong_outer_reasoning_profile = replace(
+        reasoning_profile,
+        profile_id="citation-string-match-v1",
+    )
+    format_without_inner_profile = dict(format_terminal)
+    del format_without_inner_profile["profile_id"]
+    poisons = (
+        (format_terminal, reasoning_profile),
+        (reasoning_terminal, format_profile),
+        (reasoning_with_inner_profile, reasoning_profile),
+        (reasoning_terminal, wrong_outer_reasoning_profile),
+        (format_without_inner_profile, format_profile),
+    )
+    for terminal, profile in poisons:
+        with pytest.raises(StrictCapturedReplaySealError, match="profile|authority"):
+            seal_module._validate_reaped_scorer_bytes(
+                payload(terminal),
+                profile=profile,
+            )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b'{"environment":"reasoning_gym","quiescence":{"original_process_reaped":true,"wrapper_returncode":-0.0},"schema":"nemo-rl-strict-reasoning-score-call-index-v1"}',
+        b'{"environment":"reasoning_gym","quiescence":{"original_process_reaped":true,"wrapper_returncode":0},"schema":"nemo-rl-strict-reasoning-score-call-index-v1"}\n',
+    ),
+)
+def test_v2_reasoning_terminal_rejects_negative_zero_and_noncanonical_framing(
+    raw: bytes,
+) -> None:
+    with pytest.raises(StrictCapturedReplaySealError):
+        seal_module._validate_reaped_scorer_bytes(
+            raw,
+            profile=_reasoning_profile(),
         )
