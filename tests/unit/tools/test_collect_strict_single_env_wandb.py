@@ -520,6 +520,8 @@ def test_requested_metric_inventory_matches_offline_evaluator() -> None:
     assert COLLECTOR.WANDB_RUN_ID_DERIVATION == evaluator.WANDB_RUN_ID_DERIVATION
     assert COLLECTOR.WANDB_SDK_VERSION == evaluator.WANDB_SDK_VERSION
     assert COLLECTOR.MAX_HISTORY_ROWS == evaluator.MAX_WANDB_HISTORY_ROWS
+    assert COLLECTOR.COMMON_PROVENANCE_KEYS == evaluator.COMMON_PROVENANCE_KEYS
+    assert "terminal_scheduler_collector_sha256" in COLLECTOR.COMMON_PROVENANCE_KEYS
 
 
 def test_production_exports_retain_pairable_reward_speed_and_work_history() -> None:

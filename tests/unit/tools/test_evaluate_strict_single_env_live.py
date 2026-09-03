@@ -1376,6 +1376,14 @@ def _terminal_pair_receipt(
                             "name": "",
                         },
                     },
+                    "derived_exit_code": {
+                        "status": ["SUCCESS"],
+                        "return_code": {"set": True, "infinite": False, "number": 0},
+                        "signal": {
+                            "id": {"set": False, "infinite": False, "number": 0},
+                            "name": "",
+                        },
+                    },
                     "hold": False,
                     "job_id": job_id,
                     "job_state": ["COMPLETED"],

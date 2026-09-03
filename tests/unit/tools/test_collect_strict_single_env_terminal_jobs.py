@@ -219,6 +219,14 @@ def _scontrol_raw(fixture: SimpleNamespace, arm: str, state: str = "COMPLETED") 
                         "name": "",
                     },
                 },
+                "derived_exit_code": {
+                    "status": ["SUCCESS"],
+                    "return_code": {"set": True, "infinite": False, "number": 0},
+                    "signal": {
+                        "id": {"set": False, "infinite": False, "number": 0},
+                        "name": "",
+                    },
+                },
                 "billable_tres": {"number": 0.0},
             }
         ],
@@ -563,6 +571,44 @@ def test_pure_validator_replays_poisoned_raw_scheduler_bytes(tmp_path: Path, mon
         )
 
 
+def test_pure_validator_replays_and_rejects_nonzero_derived_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    receipt, _, _ = _compose_valid(fixture, tmp_path)
+    poisoned = copy.deepcopy(receipt)
+    capture = poisoned["captures"]["off"]
+    raw = base64.b64decode(capture["query"]["raw_stdout_base64"])
+    scheduler = json.loads(raw)
+    scheduler["jobs"][0]["derived_exit_code"]["return_code"]["number"] = 49
+    raw = json.dumps(scheduler, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+    capture["query"]["raw_stdout_base64"] = base64.b64encode(raw).decode("ascii")
+    capture["query"]["raw_stdout_sha256"] = _digest(raw)
+    capture["query"]["raw_stdout_byte_count"] = len(raw)
+    capture_raw = COLLECTOR.canonical_json_bytes(capture, "poisoned capture") + b"\n"
+    poisoned["capture_sha256s"]["off"] = _digest(capture_raw)
+    composition = {
+        "domain": "nemo-rl-strict-terminal-pair-composition-v1",
+        "pair_manifest_sha256": fixture.pair.sha256,
+        "submission_receipt_sha256": fixture.submission.sha256,
+        "job_exit_receipt_sha256s": poisoned["job_exit_receipt_sha256s"],
+        "capture_sha256s": poisoned["capture_sha256s"],
+    }
+    poisoned["composition_sha256"] = _digest(COLLECTOR.canonical_json_bytes(composition, "poisoned composition"))
+
+    with pytest.raises(COLLECTOR.TerminalCollectionError, match="derived_exit_code return_code"):
+        COLLECTOR.validate_pair_receipt(
+            _document(poisoned),
+            pair_document=fixture.pair,
+            submission_document=fixture.submission,
+            exit_documents=fixture.exits,
+            expected_pair_sha256=fixture.pair.sha256,
+            expected_submission_sha256=fixture.submission.sha256,
+            expected_exit_sha256s={arm: fixture.exits[arm].sha256 for arm in ("off", "on")},
+            expected_collector_sha256=_digest(COLLECTOR_PATH.read_bytes()),
+        )
+
+
 def test_pure_validator_accepts_an_equivalent_foreign_frozen_document_protocol(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -667,6 +713,8 @@ def test_compose_requires_the_same_oob_collector_digest(tmp_path: Path, monkeypa
         (("jobs", 0, "hold"), 0),
         (("jobs", 0, "exit_code", "return_code", "number"), False),
         (("jobs", 0, "exit_code", "signal", "id", "number"), False),
+        (("jobs", 0, "derived_exit_code", "return_code", "number"), False),
+        (("jobs", 0, "derived_exit_code", "signal", "id", "number"), False),
         (("last_update", "number"), False),
     ],
 )
@@ -692,6 +740,58 @@ def test_terminal_parser_rejects_integer_boolean_aliases(
     )
 
     with pytest.raises(COLLECTOR.TerminalCollectionError):
+        COLLECTOR.normalize_scontrol_terminal(raw, context)
+
+
+def test_terminal_parser_requires_derived_exit_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    value = json.loads(_scontrol_raw(fixture, "off"))
+    del value["jobs"][0]["derived_exit_code"]
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+    context = COLLECTOR._submission_context(
+        fixture.pair,
+        fixture.submission,
+        expected_pair_sha256=fixture.pair.sha256,
+        expected_submission_sha256=fixture.submission.sha256,
+        arm="off",
+    )
+
+    with pytest.raises(COLLECTOR.TerminalCollectionError, match="derived_exit_code"):
+        COLLECTOR.normalize_scontrol_terminal(raw, context)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("status", ["FAILED"]),
+        (
+            "signal",
+            {
+                "id": {"set": True, "infinite": False, "number": 9},
+                "name": "SIGKILL",
+            },
+        ),
+    ],
+)
+def test_terminal_parser_rejects_failed_or_signaled_derived_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: Any,
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    scheduler = json.loads(_scontrol_raw(fixture, "off"))
+    scheduler["jobs"][0]["derived_exit_code"][field] = value
+    raw = json.dumps(scheduler, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+    context = COLLECTOR._submission_context(
+        fixture.pair,
+        fixture.submission,
+        expected_pair_sha256=fixture.pair.sha256,
+        expected_submission_sha256=fixture.submission.sha256,
+        arm="off",
+    )
+
+    with pytest.raises(COLLECTOR.TerminalCollectionError, match="derived_exit_code"):
         COLLECTOR.normalize_scontrol_terminal(raw, context)
 
 

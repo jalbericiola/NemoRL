@@ -655,24 +655,24 @@ def _validate_scontrol_meta(value: Any) -> dict[str, Any]:
     return meta
 
 
-def _typed_exit_success(value: Any) -> None:
-    exit_code = _mapping(value, "terminal exit_code")
-    _exact_keys(exit_code, {"status", "return_code", "signal"}, "terminal exit_code")
+def _typed_exit_success(value: Any, label: str) -> None:
+    exit_code = _mapping(value, label)
+    _exact_keys(exit_code, {"status", "return_code", "signal"}, label)
     if exit_code["status"] != ["SUCCESS"]:
-        raise TerminalCollectionError("terminal exit status is not exact SUCCESS")
-    returned = _mapping(exit_code["return_code"], "terminal return_code")
-    _exact_keys(returned, {"set", "infinite", "number"}, "terminal return_code")
+        raise TerminalCollectionError(f"{label} status is not exact SUCCESS")
+    returned = _mapping(exit_code["return_code"], f"{label} return_code")
+    _exact_keys(returned, {"set", "infinite", "number"}, f"{label} return_code")
     if (
         returned["set"] is not True
         or returned["infinite"] is not False
         or type(returned["number"]) is not int
         or returned["number"] != 0
     ):
-        raise TerminalCollectionError("terminal return_code is not exact finite zero")
-    signal_record = _mapping(exit_code["signal"], "terminal signal")
-    _exact_keys(signal_record, {"id", "name"}, "terminal signal")
-    signal_id = _mapping(signal_record["id"], "terminal signal ID")
-    _exact_keys(signal_id, {"set", "infinite", "number"}, "terminal signal ID")
+        raise TerminalCollectionError(f"{label} return_code is not exact finite zero")
+    signal_record = _mapping(exit_code["signal"], f"{label} signal")
+    _exact_keys(signal_record, {"id", "name"}, f"{label} signal")
+    signal_id = _mapping(signal_record["id"], f"{label} signal ID")
+    _exact_keys(signal_id, {"set", "infinite", "number"}, f"{label} signal ID")
     if (
         signal_id["set"] is not False
         or signal_id["infinite"] is not False
@@ -680,7 +680,7 @@ def _typed_exit_success(value: Any) -> None:
         or signal_id["number"] != 0
         or signal_record["name"] != ""
     ):
-        raise TerminalCollectionError("terminal signal is not exact unset zero/empty")
+        raise TerminalCollectionError(f"{label} signal is not exact unset zero/empty")
 
 
 def normalize_scontrol_terminal(raw: bytes, expected: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -705,6 +705,7 @@ def normalize_scontrol_terminal(raw: bytes, expected: Mapping[str, Any]) -> dict
     required = {
         "comment",
         "current_working_directory",
+        "derived_exit_code",
         "end_time",
         "exit_code",
         "hold",
@@ -744,7 +745,12 @@ def normalize_scontrol_terminal(raw: bytes, expected: Mapping[str, Any]) -> dict
     end_time = _typed_time(job["end_time"], "terminal end_time")
     if end_time < start_time:
         raise TerminalCollectionError("terminal end_time precedes start_time")
-    _typed_exit_success(job["exit_code"])
+    _typed_exit_success(job["exit_code"], "terminal exit_code")
+    _typed_exit_success(job["derived_exit_code"], "terminal derived_exit_code")
+    # The normalized record is intentionally compact. Its existence certifies
+    # that both the parent exit_code and the raw highest-step derived_exit_code
+    # passed the exact success/finite-zero/unset-signal contract above. The raw
+    # scheduler bytes remain digest-bound and are replayed during composition.
     return {
         "job_id": expected["job_id"],
         "job_name": expected["job_name"],

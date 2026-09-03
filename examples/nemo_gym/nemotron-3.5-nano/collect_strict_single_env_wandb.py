@@ -146,6 +146,7 @@ COMMON_PROVENANCE_KEYS = frozenset(
         "strict_pair_contract_sha256",
         "strict_pair_parent_wrapper_sha256",
         "submission_contract_sha256",
+        "terminal_scheduler_collector_sha256",
         "training_container_sha256",
         "verifier_source_sha256",
         "wandb_exporter_sha256",
