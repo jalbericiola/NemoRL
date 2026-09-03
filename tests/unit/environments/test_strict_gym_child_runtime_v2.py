@@ -530,6 +530,19 @@ def _score_finalizer_fixture(monkeypatch, tmp_path: Path) -> tuple[
     return session, expected_calls, documents, run_helper
 
 
+def _reasoning_payload_roster(root: Path) -> tuple[tuple[str, bytes], ...]:
+    prefix = "strict_gym_child_runtime/"
+    relative_names = (
+        f"{prefix}index.json",
+        *(f"{prefix}reasoning-score-call-{sequence:08d}.json" for sequence in range(1, 5)),
+        f"{prefix}reasoning-score-call-index.json",
+        f"{prefix}reasoning-score-closed.json",
+        f"{prefix}resource.json",
+        f"{prefix}spec.json",
+    )
+    return tuple((relative, (root / relative.removeprefix(prefix)).read_bytes()) for relative in relative_names)
+
+
 def _format_finalizer_fixture(monkeypatch, tmp_path: Path) -> tuple[
     runtime.StrictGymChildRuntimeSession,
     list[dict[str, Any]],
@@ -2527,6 +2540,183 @@ def test_scorer_only_k4_finalizer_publishes_terminal_index(monkeypatch, tmp_path
     )
     assert reloaded == terminal
     assert reloaded_digest == digest
+
+
+def test_reasoning_owned_payload_validator_matches_path_loader(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    session, expected, _, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
+    terminal, digest = session.finalize_score_calls(expected, run_helper=run_helper)
+
+    from_path = runtime.load_finalized_reasoning_score_call_index(
+        tmp_path / "reasoning-score-call-index.json",
+        expected_sha256=digest,
+        expected_receipt_root=tmp_path,
+        expected_pair_id="strict-pair-1",
+        expected_job_id="12345",
+    )
+    from_payloads = runtime.validate_finalized_reasoning_score_call_index_payloads(
+        _reasoning_payload_roster(tmp_path),
+        expected_sha256=digest,
+        expected_receipt_root=tmp_path,
+        expected_bootstrap_root=session.bootstrap_root,
+        expected_bootstrap_sha256=session.bootstrap_sha256,
+        expected_pair_id="strict-pair-1",
+        expected_job_id="12345",
+    )
+
+    assert from_path == from_payloads == (terminal, digest)
+
+
+def test_reasoning_owned_payload_validator_performs_no_filesystem_io(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    session, expected, _, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
+    terminal, digest = session.finalize_score_calls(expected, run_helper=run_helper)
+    payload_roster = _reasoning_payload_roster(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("owned-payload validation attempted filesystem I/O")
+
+    monkeypatch.setattr(runtime, "_load_canonical_document", forbidden)
+    monkeypatch.setattr(runtime, "_require_private_canonical_directory", forbidden)
+    monkeypatch.setattr(runtime, "_require_sealed_bootstrap_root", forbidden)
+    monkeypatch.setattr(Path, "iterdir", forbidden)
+    monkeypatch.setattr(Path, "lstat", forbidden)
+    monkeypatch.setattr(Path, "resolve", forbidden)
+    monkeypatch.setattr(runtime.os, "open", forbidden)
+    monkeypatch.setattr(runtime.os, "stat", forbidden)
+
+    admitted = runtime.validate_finalized_reasoning_score_call_index_payloads(
+        payload_roster,
+        expected_sha256=digest,
+        expected_receipt_root=tmp_path,
+        expected_bootstrap_root=session.bootstrap_root,
+        expected_bootstrap_sha256=session.bootstrap_sha256,
+        expected_pair_id="strict-pair-1",
+        expected_job_id="12345",
+    )
+
+    assert admitted == (terminal, digest)
+
+
+def test_reasoning_path_loader_delegates_owned_payload_roster(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    session, expected, _, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
+    terminal, digest = session.finalize_score_calls(expected, run_helper=run_helper)
+    validator = runtime.validate_finalized_reasoning_score_call_index_payloads
+    observed: list[tuple[tuple[tuple[str, bytes], ...], dict[str, Any]]] = []
+
+    def spy(payload_roster, **kwargs):
+        observed.append((payload_roster, kwargs))
+        return validator(payload_roster, **kwargs)
+
+    monkeypatch.setattr(
+        runtime,
+        "validate_finalized_reasoning_score_call_index_payloads",
+        spy,
+    )
+
+    admitted = runtime.load_finalized_reasoning_score_call_index(
+        tmp_path / "reasoning-score-call-index.json",
+        expected_sha256=digest,
+        expected_receipt_root=tmp_path,
+        expected_pair_id="strict-pair-1",
+        expected_job_id="12345",
+    )
+
+    assert admitted == (terminal, digest)
+    assert len(observed) == 1
+    payload_roster, arguments = observed[0]
+    assert payload_roster == _reasoning_payload_roster(tmp_path)
+    assert arguments["expected_bootstrap_root"] == session.bootstrap_root
+    assert arguments["expected_bootstrap_sha256"] == session.bootstrap_sha256
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        ("roster_order", "payload roster differs"),
+        ("payload_type", "payload roster differs"),
+        ("bootstrap_digest", "spec differs"),
+        ("relocated_resolved_prefix", "caller-carried SHA256"),
+        ("resolved_prefix_nul", "scorer paths differ"),
+        ("negative_zero", "record 1 differs"),
+    ],
+)
+def test_reasoning_owned_payload_validator_rejects_tamper(
+    monkeypatch,
+    tmp_path: Path,
+    mutation: str,
+    match: str,
+) -> None:
+    session, expected, _, run_helper = _score_finalizer_fixture(monkeypatch, tmp_path)
+    _, digest = session.finalize_score_calls(expected, run_helper=run_helper)
+    payload_roster = _reasoning_payload_roster(tmp_path)
+    bootstrap_sha256 = session.bootstrap_sha256
+    if mutation == "roster_order":
+        payload_roster = (payload_roster[1], payload_roster[0], *payload_roster[2:])
+    elif mutation == "payload_type":
+        first = payload_roster[0]
+        payload_roster = ((first[0], bytearray(first[1])), *payload_roster[1:])
+    elif mutation == "bootstrap_digest":
+        bootstrap_sha256 = "b" * 64
+    elif mutation in {"relocated_resolved_prefix", "resolved_prefix_nul"}:
+        prefix = "strict_gym_child_runtime/"
+        payloads = dict(payload_roster)
+        resource_name = f"{prefix}resource.json"
+        resource = json.loads(payloads[resource_name])
+        relocated_purelib = Path(
+            "/untrusted/venv/lib/python3.13/site-packages"
+            if mutation == "relocated_resolved_prefix"
+            else "/untrusted\x00/venv/lib/python3.13/site-packages"
+        )
+        scorer = resource["scorer"]
+        scorer["package_resolved_root"] = str(relocated_purelib / "reasoning_gym")
+        scorer["module_resolved_origin"] = str(relocated_purelib / scorer["module_origin_relative_to_purelib"])
+        scorer["resolver_resolved_origin"] = str(relocated_purelib / scorer["resolver_origin_relative_to_purelib"])
+        scorer["resolved_origin"] = str(relocated_purelib / scorer["origin_relative_to_purelib"])
+        resource_raw = runtime.canonical_ascii_json(resource)
+        payloads[resource_name] = resource_raw
+
+        index_name = f"{prefix}index.json"
+        index = json.loads(payloads[index_name])
+        index["children"][0]["receipt"]["sha256"] = runtime._sha256_bytes(resource_raw)
+        index_raw = runtime.canonical_ascii_json(index)
+        payloads[index_name] = index_raw
+
+        terminal_name = f"{prefix}reasoning-score-call-index.json"
+        terminal = json.loads(payloads[terminal_name])
+        terminal["resource_receipt"]["sha256"] = runtime._sha256_bytes(resource_raw)
+        terminal["child_index"]["sha256"] = runtime._sha256_bytes(index_raw)
+        terminal_raw = runtime.canonical_ascii_json(terminal)
+        payloads[terminal_name] = terminal_raw
+        payload_roster = tuple((name, payloads[name]) for name, _ in payload_roster)
+        if mutation == "resolved_prefix_nul":
+            digest = runtime._sha256_bytes(terminal_raw)
+    else:
+        relative, raw = payload_roster[5]
+        terminal = json.loads(raw)
+        terminal["calls"][0]["float_result"] = -0.0
+        raw = runtime.canonical_ascii_json(terminal)
+        payload_roster = (*payload_roster[:5], (relative, raw), *payload_roster[6:])
+        digest = runtime._sha256_bytes(raw)
+
+    with pytest.raises(ValueError, match=match):
+        runtime.validate_finalized_reasoning_score_call_index_payloads(
+            payload_roster,
+            expected_sha256=digest,
+            expected_receipt_root=tmp_path,
+            expected_bootstrap_root=session.bootstrap_root,
+            expected_bootstrap_sha256=bootstrap_sha256,
+            expected_pair_id="strict-pair-1",
+            expected_job_id="12345",
+        )
 
 
 def test_finalized_score_loader_requires_external_digest_and_exact_inventory(monkeypatch, tmp_path: Path) -> None:

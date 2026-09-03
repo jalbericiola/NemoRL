@@ -2574,21 +2574,24 @@ class StrictGymChildRuntimeSession:
         return terminal, digest
 
 
-def load_finalized_reasoning_score_call_index(
-    path: Path,
+def validate_finalized_reasoning_score_call_index_payloads(
+    payload_roster: tuple[tuple[str, bytes], ...],
     *,
     expected_sha256: str,
     expected_receipt_root: Path,
+    expected_bootstrap_root: Path,
+    expected_bootstrap_sha256: str,
     expected_pair_id: str,
     expected_job_id: str,
 ) -> tuple[dict[str, Any], str]:
-    """Load a terminal K=4 scorer graph from an externally anchored digest.
+    """Validate one owned K=4 reasoning-scorer payload graph without I/O.
 
-    This is the post-shutdown admission boundary used by replay EXIT.  It is
-    deliberately independent of :class:`StrictGymChildRuntimeSession`: every
-    artifact is loaded again from the caller-authenticated receipt root, all
-    paths and references are exact, and the complete graph is stable-read a
-    second time before returning.
+    ``payload_roster`` uses result-relative names so it can be projected
+    directly from the verified sealed-result capability.  ``expected_sha256``
+    must be the externally authenticated terminal digest; the terminal closes
+    every retained member through its exact references.  The receipt root is
+    lexical authority only; filesystem ownership and quiescence are established
+    by the caller before it snapshots these bytes.
     """
     if type(expected_sha256) is not str or _SHA256_RE.fullmatch(expected_sha256) is None or expected_sha256 == "0" * 64:
         raise ValueError("expected score-call index SHA256 is invalid")
@@ -2596,28 +2599,56 @@ def load_finalized_reasoning_score_call_index(
         raise ValueError("expected score-call pair ID is invalid")
     if type(expected_job_id) is not str or _JOB_ID_RE.fullmatch(expected_job_id) is None:
         raise ValueError("expected score-call job ID is invalid")
-    root = _require_private_canonical_directory(Path(expected_receipt_root), name="finalized score-call receipt root")
-    terminal_path = root / "reasoning-score-call-index.json"
-    if not isinstance(path, Path) or path != terminal_path:
-        raise ValueError("score-call index path is not the exact expected path")
-
-    filenames = {
-        "spec.json",
-        "resource.json",
-        "index.json",
-        "reasoning-score-closed.json",
-        "reasoning-score-call-index.json",
-    } | {f"reasoning-score-call-{sequence:08d}.json" for sequence in range(1, 5)}
-    root_before = root.lstat()
-    if {item.name for item in root.iterdir()} != filenames:
-        raise ValueError("finalized score-call receipt inventory differs")
+    if not isinstance(expected_receipt_root, Path):
+        raise ValueError("finalized score-call receipt root must be one pathlib.Path")
+    root = expected_receipt_root
+    if not root.is_absolute() or ".." in root.parts or str(root) == "/":
+        raise ValueError("finalized score-call receipt root must be lexical-canonical")
+    if not isinstance(expected_bootstrap_root, Path):
+        raise ValueError("expected score-call bootstrap root must be one pathlib.Path")
+    if (
+        not expected_bootstrap_root.is_absolute()
+        or ".." in expected_bootstrap_root.parts
+        or str(expected_bootstrap_root) == "/"
+        or type(expected_bootstrap_sha256) is not str
+        or _SHA256_RE.fullmatch(expected_bootstrap_sha256) is None
+        or expected_bootstrap_sha256 == "0" * 64
+    ):
+        raise ValueError("expected score-call bootstrap identity is invalid")
+    prefix = "strict_gym_child_runtime/"
+    relative_names = (
+        f"{prefix}index.json",
+        *(f"{prefix}reasoning-score-call-{sequence:08d}.json" for sequence in range(1, 5)),
+        f"{prefix}reasoning-score-call-index.json",
+        f"{prefix}reasoning-score-closed.json",
+        f"{prefix}resource.json",
+        f"{prefix}spec.json",
+    )
+    if (
+        type(payload_roster) is not tuple
+        or len(payload_roster) != len(relative_names)
+        or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or item[0] != relative
+            or type(item[1]) is not bytes
+            for item, relative in zip(payload_roster, relative_names, strict=True)
+        )
+    ):
+        raise ValueError("finalized score-call payload roster differs")
     documents: dict[str, dict[str, Any]] = {}
     payloads: dict[str, bytes] = {}
-    for filename in sorted(filenames):
-        document, payload = _load_canonical_document(root / filename)
+    for relative, payload in payload_roster:
+        filename = relative.removeprefix(prefix)
+        document, payload = _load_canonical_payload(
+            payload,
+            name=f"finalized score-call payload {relative}",
+        )
         documents[filename] = document
         payloads[filename] = payload
-    if _sha256_bytes(payloads[terminal_path.name]) != expected_sha256:
+    terminal_filename = "reasoning-score-call-index.json"
+    if _sha256_bytes(payloads[terminal_filename]) != expected_sha256:
         raise ValueError("score-call index differs from caller-carried SHA256")
 
     def exact_ref(value: Any, *, filename: str, schema: str, name: str) -> Mapping[str, Any]:
@@ -2657,8 +2688,6 @@ def load_finalized_reasoning_score_call_index(
     }
     expected_targets = _target_matrix("reasoning_gym", STRICT_GYM_ROOT, scope="scorer-only")
     bootstrap = _require_exact_keys(spec["bootstrap"], {"root", "filename", "sha256"}, name="score-call bootstrap")
-    bootstrap_root = bootstrap.get("root")
-    sealed_bootstrap_root, sealed_bootstrap_sha256 = _require_sealed_bootstrap_root()
     if (
         spec["schema"] != STRICT_GYM_CHILD_SPEC_SCHEMA
         or spec["hash_domain"] != STRICT_GYM_CHILD_HASH_DOMAIN
@@ -2670,12 +2699,9 @@ def load_finalized_reasoning_score_call_index(
         or spec["results_dir"] != str(root.parent)
         or spec["receipt_root"] != str(root)
         or not _exact_json_equal(spec["targets"], expected_targets)
-        or type(bootstrap_root) is not str
-        or bootstrap_root != str(sealed_bootstrap_root)
+        or bootstrap["root"] != str(expected_bootstrap_root)
         or bootstrap["filename"] != "sitecustomize.py"
-        or type(bootstrap["sha256"]) is not str
-        or _SHA256_RE.fullmatch(bootstrap["sha256"]) is None
-        or bootstrap["sha256"] != sealed_bootstrap_sha256
+        or bootstrap["sha256"] != expected_bootstrap_sha256
     ):
         raise ValueError("finalized score-call spec differs")
     spec_sha256 = _sha256_bytes(payloads["spec.json"])
@@ -2827,7 +2853,23 @@ def load_finalized_reasoning_score_call_index(
         },
         name="score-call resource process",
     )
-    bootstrap_source = str(Path(bootstrap_root) / "sitecustomize.py")
+    sys_base_prefix = process["sys_base_prefix"]
+    proc_exe = process["proc_exe"]
+    if type(sys_base_prefix) is not str or type(proc_exe) is not str:
+        raise ValueError("finalized score-call resource receipt differs")
+    for value, path in (
+        (sys_base_prefix, Path(sys_base_prefix)),
+        (proc_exe, Path(proc_exe)),
+    ):
+        if (
+            not value
+            or "\x00" in value
+            or not path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts[1:])
+            or str(path) != value
+        ):
+            raise ValueError("finalized score-call resource receipt differs")
+    bootstrap_source = str(expected_bootstrap_root / "sitecustomize.py")
     expected_sys_argv = [bootstrap_source, target["source_path"]]
     expected_proc_argv = [
         target["interpreter"],
@@ -2871,13 +2913,8 @@ def load_finalized_reasoning_score_call_index(
         or process["cwd"] != target["component_dir"]
         or process["sys_executable"] != target["interpreter"]
         or process["sys_prefix"] != target["venv"]
-        or type(process["sys_base_prefix"]) is not str
-        or not Path(process["sys_base_prefix"]).is_absolute()
-        or ".." in Path(process["sys_base_prefix"]).parts
-        or Path(process["sys_base_prefix"]).resolve(strict=True) != Path(process["sys_base_prefix"])
-        or process["sys_base_prefix"] == process["sys_prefix"]
-        or type(process["proc_exe"]) is not str
-        or not process["proc_exe"].startswith("/")
+        or sys_base_prefix == process["sys_prefix"]
+        or sys_base_prefix == target["venv"]
         or process["sys_argv"] != expected_sys_argv
         or process["proc_argv"] != expected_proc_argv
         or type(process["boot_id"]) is not str
@@ -2915,11 +2952,30 @@ def load_finalized_reasoning_score_call_index(
         "resolver_origin": str(purelib / expected_scorer["resolver_origin_relative_to_purelib"]),
         "origin": str(purelib / expected_scorer["origin_relative_to_purelib"]),
     }
+    # Resolved scorer paths are retained observations, not fresh path
+    # authorities at this no-I/O boundary.  The live path loader below binds
+    # them with resolve(strict=True); here their exact bytes are transitively
+    # bound by the externally authenticated terminal digest, and their relative
+    # topology must remain internally consistent.
+    resolved_package_root_value = scorer["package_resolved_root"]
+    if type(resolved_package_root_value) is not str:
+        raise ValueError("finalized score-call scorer paths differ")
+    resolved_package_root = Path(resolved_package_root_value)
+    if (
+        not resolved_package_root_value
+        or "\x00" in resolved_package_root_value
+        or not resolved_package_root.is_absolute()
+        or any(part in {"", ".", ".."} for part in resolved_package_root.parts[1:])
+        or str(resolved_package_root) != resolved_package_root_value
+        or resolved_package_root.name != "reasoning_gym"
+    ):
+        raise ValueError("finalized score-call scorer paths differ")
+    resolved_purelib = resolved_package_root.parent
     expected_resolved_scorer_paths = {
-        "package_resolved_root": str(Path(expected_scorer_paths["package_root"]).resolve(strict=True)),
-        "module_resolved_origin": str(Path(expected_scorer_paths["module_origin"]).resolve(strict=True)),
-        "resolver_resolved_origin": str(Path(expected_scorer_paths["resolver_origin"]).resolve(strict=True)),
-        "resolved_origin": str(Path(expected_scorer_paths["origin"]).resolve(strict=True)),
+        "package_resolved_root": str(resolved_purelib / "reasoning_gym"),
+        "module_resolved_origin": str(resolved_purelib / expected_scorer["module_origin_relative_to_purelib"]),
+        "resolver_resolved_origin": str(resolved_purelib / expected_scorer["resolver_origin_relative_to_purelib"]),
+        "resolved_origin": str(resolved_purelib / expected_scorer["origin_relative_to_purelib"]),
     }
     if any(scorer[name] != value for name, value in expected_scorer_paths.items()) or any(
         scorer[name] != value for name, value in expected_resolved_scorer_paths.items()
@@ -2963,7 +3019,7 @@ def load_finalized_reasoning_score_call_index(
         raise ValueError("finalized score-call closed receipt differs")
 
     terminal = _require_exact_keys(
-        documents[terminal_path.name],
+        documents[terminal_filename],
         {
             "schema",
             "hash_domain",
@@ -3108,9 +3164,108 @@ def load_finalized_reasoning_score_call_index(
     ):
         raise ValueError("finalized score-call quiescence differs")
 
+    return dict(terminal), expected_sha256
+
+
+def load_finalized_reasoning_score_call_index(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_receipt_root: Path,
+    expected_pair_id: str,
+    expected_job_id: str,
+) -> tuple[dict[str, Any], str]:
+    """Strictly snapshot and validate one stopped K=4 reasoning-scorer graph."""
+    if type(expected_sha256) is not str or _SHA256_RE.fullmatch(expected_sha256) is None or expected_sha256 == "0" * 64:
+        raise ValueError("expected score-call index SHA256 is invalid")
+    if type(expected_pair_id) is not str or _PAIR_ID_RE.fullmatch(expected_pair_id) is None:
+        raise ValueError("expected score-call pair ID is invalid")
+    if type(expected_job_id) is not str or _JOB_ID_RE.fullmatch(expected_job_id) is None:
+        raise ValueError("expected score-call job ID is invalid")
+    root = _require_private_canonical_directory(
+        Path(expected_receipt_root),
+        name="finalized score-call receipt root",
+    )
+    terminal_path = root / "reasoning-score-call-index.json"
+    if not isinstance(path, Path) or path != terminal_path:
+        raise ValueError("score-call index path is not the exact expected path")
+    filenames = {
+        "spec.json",
+        "resource.json",
+        "index.json",
+        "reasoning-score-closed.json",
+        "reasoning-score-call-index.json",
+    } | {f"reasoning-score-call-{sequence:08d}.json" for sequence in range(1, 5)}
+    root_before = root.lstat()
+    if {item.name for item in root.iterdir()} != filenames:
+        raise ValueError("finalized score-call receipt inventory differs")
+    relative_names = (
+        "index.json",
+        *(f"reasoning-score-call-{sequence:08d}.json" for sequence in range(1, 5)),
+        "reasoning-score-call-index.json",
+        "reasoning-score-closed.json",
+        "resource.json",
+        "spec.json",
+    )
+    documents: dict[str, dict[str, Any]] = {}
+    payloads: dict[str, bytes] = {}
+    for filename in relative_names:
+        document, payload = _load_canonical_document(root / filename)
+        documents[filename] = document
+        payloads[filename] = payload
+
+    # The path loader retains the external runtime checks that an owned-byte
+    # consumer cannot repeat after the scorer has stopped.  The pure validator
+    # below closes the retained graph itself without reopening these paths.
+    sealed_bootstrap_root, sealed_bootstrap_sha256 = _require_sealed_bootstrap_root()
+    bootstrap = documents["spec.json"].get("bootstrap")
+    if (
+        type(bootstrap) is not dict
+        or bootstrap.get("root") != str(sealed_bootstrap_root)
+        or bootstrap.get("sha256") != sealed_bootstrap_sha256
+    ):
+        raise ValueError("finalized score-call spec differs")
+
+    admitted = validate_finalized_reasoning_score_call_index_payloads(
+        tuple((f"strict_gym_child_runtime/{filename}", payloads[filename]) for filename in relative_names),
+        expected_sha256=expected_sha256,
+        expected_receipt_root=root,
+        expected_bootstrap_root=sealed_bootstrap_root,
+        expected_bootstrap_sha256=sealed_bootstrap_sha256,
+        expected_pair_id=expected_pair_id,
+        expected_job_id=expected_job_id,
+    )
+
+    resource = documents["resource.json"]
+    process = resource["process"]
+    if Path(process["sys_base_prefix"]).resolve(strict=True) != Path(process["sys_base_prefix"]):
+        raise ValueError("finalized score-call resource receipt differs")
+    target = _target_matrix(
+        "reasoning_gym",
+        STRICT_GYM_ROOT,
+        scope="scorer-only",
+    )[0]
+    expected_scorer = target["scorer"]
+    purelib = Path(target["venv"]) / "lib/python3.13/site-packages"
+    expected_scorer_paths = {
+        "package_root": str(purelib / "reasoning_gym"),
+        "module_origin": str(purelib / expected_scorer["module_origin_relative_to_purelib"]),
+        "resolver_origin": str(purelib / expected_scorer["resolver_origin_relative_to_purelib"]),
+        "origin": str(purelib / expected_scorer["origin_relative_to_purelib"]),
+    }
+    expected_resolved_scorer_paths = {
+        "package_resolved_root": str(Path(expected_scorer_paths["package_root"]).resolve(strict=True)),
+        "module_resolved_origin": str(Path(expected_scorer_paths["module_origin"]).resolve(strict=True)),
+        "resolver_resolved_origin": str(Path(expected_scorer_paths["resolver_origin"]).resolve(strict=True)),
+        "resolved_origin": str(Path(expected_scorer_paths["origin"]).resolve(strict=True)),
+    }
+    scorer = resource["scorer"]
+    if any(scorer[name] != value for name, value in expected_resolved_scorer_paths.items()):
+        raise ValueError("finalized score-call scorer paths differ")
+
     if {item.name for item in root.iterdir()} != filenames:
         raise RuntimeError("finalized score-call inventory changed during validation")
-    for filename in sorted(filenames):
+    for filename in relative_names:
         second_document, second_payload = _load_canonical_document(root / filename)
         if second_document != documents[filename] or second_payload != payloads[filename]:
             raise RuntimeError(f"finalized score-call artifact changed: {filename}")
@@ -3120,7 +3275,7 @@ def load_finalized_reasoning_score_call_index(
         or {item.name for item in root.iterdir()} != filenames
     ):
         raise RuntimeError("finalized score-call receipt root changed during validation")
-    return dict(terminal), expected_sha256
+    return admitted
 
 
 def validate_finalized_format_verification_call_index_payloads(
